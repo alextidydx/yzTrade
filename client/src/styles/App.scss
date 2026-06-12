@@ -1,0 +1,120 @@
+//////vars
+$works-margin: 40px;
+
+
+input:focus,
+select:focus,
+textarea:focus,
+button:focus {
+    outline: none;
+}
+body, at__body {
+	margin: 0;
+	display: flex;
+	min-width: 320px;
+	min-height: 100vh;
+	background-color: #000105;
+	font-size: 0.9em;
+	color: #f2f6f8;
+	-ms-overflow-style:none;
+	position: relative;
+	//transition: 1.2s linear background;
+	//background: linear-gradient(180deg, rgba(249,242,255,1) 0%, rgba(255,255,255,1) 1024px);
+	&.at__body--locked {
+		overflow: hidden;
+		pointer-events: none;
+		//background: linear-gradient(180deg, rgba(255,255,255,1) 0%, rgba(255,255,255,1) 1024px);
+		&::before {
+			opacity: 0.0;
+		}
+	}
+	&.at__body--no-loading {
+		
+	}
+	&::before {
+		content: '';
+		width: 100%;
+		height: 500px;z-index: 0;
+		position: absolute;
+		opacity: 1.0;
+		transition: 1.2s linear opacity;
+		//background: linear-gradient(180deg, rgba(249,242,255,1) 0%, rgba(255,255,255,1) 500px);
+	}
+	
+}
+
+::-webkit-scrollbar {
+	display: none;
+}
+
+::-webkit-scrollbar-button {
+	display: none;
+}
+
+#root {
+	min-height: 100%;
+	position: relative;
+	font-family: 'Inter', sans-serif, Helvetica, Tahoma, Arial, Verdana;
+	display: flex;
+	width: 100%;
+	justify-content: center;
+	//color: rgba(242, 246, 248, 0.87);
+
+}
+
+a {
+	color: #f2f6f8;
+	text-decoration: none;
+	transition: 0.2s linear background-color;
+	background-color: transparent;
+	//background-color: #f2f6f8;
+	&:hover {
+		//background-color: #ffd800;
+		color: #f2f6f8;
+		
+	}
+}
+
+
+button, .button, .e__button {
+	background-color: #20b28f; /* Green */
+	border: none;
+	color: white;
+	padding: 10px 16px;
+	text-align: center;
+	text-decoration: none;
+	display: inline-block;
+	font-size: 14px;
+	line-height: 11px;
+	border-radius: 8px;
+	transition: box-shadow 200ms linear, background-color 200ms linear, line-height 200ms linear;
+	cursor: pointer;
+
+
+	&:hover {
+		background-color: #000408;
+		box-shadow: none;
+	}
+	&:active {
+		background-color: #20b28f;
+	}
+	&.secondary {
+		background-color: #000408;
+		color: #7e8b98;
+		&:hover {
+			background-color: #000408;
+			box-shadow: none;
+		}
+		&:active {
+			background-color: #000408;
+		}
+	}
+}
+
+
+input {
+	border: 1px solid #39414a;
+	padding: 10px 10px;
+	font-size: 14px;
+	border-radius: 8px;
+}
