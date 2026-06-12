@@ -1,0 +1,52 @@
+.e__dropdown-icon {
+	width: 4px;
+	height: 4px;
+	display: inline-block;
+	border-right: 2px solid currentColor;
+	border-bottom: 2px solid currentColor;
+	color: inherit;
+	transform: rotate(45deg);
+	transform-origin: 50% 50%;
+	transition: transform 140ms ease;
+}
+
+.e__toolbar .e__dropdown-icon {
+	color: inherit;
+}
+
+.e__currency-picker__menu,
+.e__orders-menu,
+.e__profile-menu {
+	&.is-open {
+		animation: e-dropdown-fade-in 160ms ease both;
+	}
+
+	&.is-closing {
+		pointer-events: none;
+		animation: e-dropdown-fade-out 160ms ease both;
+	}
+}
+
+@keyframes e-dropdown-fade-in {
+	from {
+		opacity: 0;
+		transform: translateY(-10px);
+	}
+
+	to {
+		opacity: 1;
+		transform: translateY(0);
+	}
+}
+
+@keyframes e-dropdown-fade-out {
+	from {
+		opacity: 1;
+		transform: translateY(0);
+	}
+
+	to {
+		opacity: 0;
+		transform: translateY(-10px);
+	}
+}

@@ -1,0 +1,152 @@
+.e__currency-picker {
+	position: relative;
+	box-sizing: border-box;
+	height: 30px;
+	display: flex;
+	align-items: center;
+	border: 1px solid rgba(242, 246, 248, 0.08);
+	border-radius: 6px;
+	background: rgba(242, 246, 248, 0.04);
+	color: #7e8b98;
+	cursor: text;
+	transition: color 140ms ease, border-color 140ms ease, background-color 140ms ease, box-shadow 140ms ease;
+
+	&:hover,
+	&:focus-within,
+	&.is-hovered,
+	&:has(input:hover),
+	&:has(.e__currency-picker__button:hover) {
+		border-color: rgba(242, 246, 248, 0.28);
+		background: rgba(242, 246, 248, 0.1);
+		box-shadow: none;
+		color: #f2f6f8;
+	}
+
+	&:not(:hover) {
+		border-color: rgba(242, 246, 248, 0.08);
+		background: rgba(242, 246, 248, 0.04);
+		color: #7e8b98;
+		box-shadow: none;
+	}
+
+	input {
+		width: 72px;
+		height: 28px;
+		box-sizing: border-box;
+		border: 0;
+		border-radius: 6px 0 0 6px;
+		background: #000105;
+		color: inherit;
+		padding: 0 8px;
+	}
+}
+
+.e__currency-picker__button {
+	width: 30px;
+	height: 30px;
+	box-sizing: border-box;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	padding: 0;
+	border: 0;
+	border-left: 0;
+	border-radius: 0 6px 6px 0;
+	background: transparent;
+	color: inherit;
+	font-size: 11px;
+	font-weight: 850;
+	line-height: 30px;
+	cursor: pointer;
+	box-shadow: none;
+
+	&:hover:not(:disabled),
+	&:focus,
+	&:focus-visible,
+	&:active {
+		background: transparent;
+		color: inherit;
+		box-shadow: none;
+	}
+}
+
+.e__currency-picker.is-hovered .e__currency-picker__button,
+.e__currency-picker:hover .e__currency-picker__button,
+.e__currency-picker:focus-within .e__currency-picker__button,
+.e__currency-picker:hover input,
+.e__currency-picker:focus-within input,
+.e__currency-picker.is-hovered input {
+	color: #f2f6f8;
+}
+
+.e__currency-picker__button--open .e__dropdown-icon {
+	transform: rotate(225deg);
+}
+
+.e__currency-picker__menu {
+	position: absolute;
+	left: 0;
+	top: calc(100% + 6px);
+	width: 234px;
+	max-height: min(460px, calc(100vh - 90px));
+	z-index: 24;
+	display: flex;
+	flex-direction: column;
+	border: 1px solid rgba(57, 65, 74, 0.82);
+	border-radius: 12px;
+	background: rgba(0, 1, 5, 0.96);
+	box-shadow: 0 18px 50px rgba(0, 0, 0, 0.34);
+	overflow: hidden auto;
+}
+
+.e__currency-picker__option {
+	width: 100%;
+	height: 30px;
+	box-sizing: border-box;
+	display: grid;
+	grid-template-columns: 52px minmax(0, 1fr) 62px;
+	align-items: center;
+	gap: 10px;
+	padding: 4px 10px;
+	border: 0;
+	border-bottom: 1px solid rgba(57, 65, 74, 0.36);
+	border-radius: 0;
+	background: transparent;
+	color: #f2f6f8;
+	text-align: left;
+	text-decoration: none;
+
+	&:hover {
+		background: rgba(242, 246, 248, 0.07);
+	}
+
+	span {
+		color: #f2f6f8;
+		font-size: 12px;
+		font-weight: 850;
+	}
+
+	strong {
+		font-size: 12px;
+		font-weight: 800;
+		text-align: right;
+	}
+}
+
+.e__currency-picker__price {
+	overflow: hidden;
+	color: #7e8b98;
+	font-size: 12px;
+	font-weight: 700;
+	text-align: right;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.e__currency-picker__change--up {
+	color: #20b28f;
+}
+
+.e__currency-picker__change--down {
+	color: #ee5858;
+}

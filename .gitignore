@@ -1,0 +1,12 @@
+.env
+__pycache__/
+*.py[cod]
+.venv/
+uvicorn*.log
+data/app_state.json
+
+client/node_modules/
+client/dist/
+client/.vite/
+
+.DS_Store
