@@ -76,6 +76,8 @@ export default (props) => (
 	<Home {...props} payload={useParams()} history={useLocation()} navigate={useNavigate()} />
 );
 
+const APP_STATE_STALE_TIMEOUT_MS = 15000;
+const LIVE_STALE_TIMEOUT_MS = 40000;
 
 class Home extends React.Component {
 	container = React.createRef();
@@ -169,9 +171,13 @@ class Home extends React.Component {
 	liveReconnectTimer = null;
 	liveReconnectAttempt = 0;
 	liveReconnectConfig = null;
+	liveWatchdogTimer = null;
+	lastLiveMessageAt = 0;
 	appStateSocket = null;
 	appStateReconnectTimer = null;
 	appStateReconnectAttempt = 0;
+	appStateWatchdogTimer = null;
+	lastAppStateMessageAt = 0;
 	isDisconnectingAppState = false;
 	profileRefreshTimer = null;
 	monitorRefreshTimer = null;
@@ -1195,6 +1201,7 @@ class Home extends React.Component {
 
 	disconnectAppStateSocket = () => {
 		this.isDisconnectingAppState = true;
+		this.clearAppStateWatchdog();
 
 		if (this.appStateReconnectTimer) {
 			window.clearTimeout(this.appStateReconnectTimer);
@@ -1211,6 +1218,37 @@ class Home extends React.Component {
 		}
 
 		this.isDisconnectingAppState = false;
+	};
+
+	clearAppStateWatchdog = () => {
+		if (this.appStateWatchdogTimer) {
+			window.clearTimeout(this.appStateWatchdogTimer);
+			this.appStateWatchdogTimer = null;
+		}
+	};
+
+	markAppStateMessage = () => {
+		this.lastAppStateMessageAt = Date.now();
+		this.scheduleAppStateWatchdog();
+	};
+
+	scheduleAppStateWatchdog = () => {
+		if (this.isDisconnectingAppState || !this.appStateSocket) return;
+
+		this.clearAppStateWatchdog();
+		this.appStateWatchdogTimer = window.setTimeout(() => {
+			const socket = this.appStateSocket;
+			const elapsed = Date.now() - this.lastAppStateMessageAt;
+
+			if (!socket || this.isDisconnectingAppState) return;
+
+			if (elapsed < APP_STATE_STALE_TIMEOUT_MS) {
+				this.scheduleAppStateWatchdog();
+				return;
+			}
+
+			socket.close();
+		}, APP_STATE_STALE_TIMEOUT_MS);
 	};
 
 	scheduleAppStateReconnect = () => {
@@ -1231,10 +1269,13 @@ class Home extends React.Component {
 
 		const socket = new WebSocket(`${getWebSocketBase()}/api/app-state/live`);
 		this.appStateSocket = socket;
+		this.lastAppStateMessageAt = Date.now();
+		this.scheduleAppStateWatchdog();
 
 		socket.onopen = () => {
 			if (socket === this.appStateSocket) {
 				this.appStateReconnectAttempt = 0;
+				this.markAppStateMessage();
 			}
 		};
 
@@ -1247,7 +1288,12 @@ class Home extends React.Component {
 				return;
 			}
 
-			if (socket !== this.appStateSocket || message.type !== "app_state") return;
+			if (socket !== this.appStateSocket) return;
+
+			this.markAppStateMessage();
+
+			if (message.type === "heartbeat") return;
+			if (message.type !== "app_state") return;
 
 			this.applyAppState(message.state);
 		};
@@ -1260,6 +1306,7 @@ class Home extends React.Component {
 
 		socket.onclose = () => {
 			if (socket === this.appStateSocket) {
+				this.clearAppStateWatchdog();
 				this.appStateSocket = null;
 				this.scheduleAppStateReconnect();
 			}
@@ -1269,6 +1316,7 @@ class Home extends React.Component {
 	disconnectLiveMarket = () => {
 		this.isDisconnectingLive = true;
 		this.clearTdRefreshTimers();
+		this.clearLiveWatchdog();
 
 		if (this.liveReconnectTimer) {
 			window.clearTimeout(this.liveReconnectTimer);
@@ -1292,6 +1340,37 @@ class Home extends React.Component {
 		this.liveProductId = null;
 		this.setState({ isLive: false });
 		this.isDisconnectingLive = false;
+	};
+
+	clearLiveWatchdog = () => {
+		if (this.liveWatchdogTimer) {
+			window.clearTimeout(this.liveWatchdogTimer);
+			this.liveWatchdogTimer = null;
+		}
+	};
+
+	markLiveMessage = () => {
+		this.lastLiveMessageAt = Date.now();
+		this.scheduleLiveWatchdog();
+	};
+
+	scheduleLiveWatchdog = () => {
+		if (this.isDisconnectingLive || !this.liveSocket) return;
+
+		this.clearLiveWatchdog();
+		this.liveWatchdogTimer = window.setTimeout(() => {
+			const socket = this.liveSocket;
+			const elapsed = Date.now() - this.lastLiveMessageAt;
+
+			if (!socket || this.isDisconnectingLive) return;
+
+			if (elapsed < LIVE_STALE_TIMEOUT_MS) {
+				this.scheduleLiveWatchdog();
+				return;
+			}
+
+			socket.close();
+		}, LIVE_STALE_TIMEOUT_MS);
 	};
 
 	scheduleLiveReconnect = () => {
@@ -1340,11 +1419,14 @@ class Home extends React.Component {
 		const socket = new WebSocket(url.toString());
 		this.liveSocket = socket;
 		this.liveProductId = productId;
+		this.lastLiveMessageAt = Date.now();
+		this.scheduleLiveWatchdog();
 		this.setState({ isLive: false });
 
 		socket.onopen = () => {
 			if (socket === this.liveSocket) {
 				this.liveReconnectAttempt = 0;
+				this.markLiveMessage();
 			}
 		};
 
@@ -1358,6 +1440,8 @@ class Home extends React.Component {
 			}
 
 			if (socket !== this.liveSocket || message.product_id !== this.liveProductId) return;
+
+			this.markLiveMessage();
 
 			if (message.type === "subscribed") {
 				if (message.stream === "market") {
@@ -1375,6 +1459,10 @@ class Home extends React.Component {
 				this.applyLiveOrders(message);
 			} else if (message.type === "depth_update") {
 				this.applyLiveDepth(message);
+			} else if (message.type === "heartbeat") {
+				if (!this.state.isLive) {
+					this.setState({ isLive: true });
+				}
 			} else if (message.type === "order_stream_error") {
 				this.setState({
 					orderError: message.message || "Live order stream failed.",
@@ -1396,6 +1484,7 @@ class Home extends React.Component {
 
 		socket.onclose = () => {
 			if (socket === this.liveSocket) {
+				this.clearLiveWatchdog();
 				this.liveSocket = null;
 				this.setState({ isLive: false });
 				this.scheduleLiveReconnect();
@@ -3467,6 +3556,7 @@ class Home extends React.Component {
 		const profileLeft = 12;
 		const priceScaleWidth = Math.max(this.chart?.priceScale("right")?.width?.() || 0, 76);
 		const priceScaleLeft = Math.max(120, chartSize.width - priceScaleWidth);
+		const timelineTicks = this.buildTimelineTicks(priceScaleLeft - 4);
 		const orderLabelOffset = 34;
 		const orderCancelOffset = 16;
 		const maxProfileWidth = Math.min(178, chartSize.width * 0.18);
@@ -3777,6 +3867,18 @@ class Home extends React.Component {
 
 		return (
 			<svg className="e__market-overlay" width={chartSize.width} height={chartSize.height}>
+				<g className="e__timeline-labels">
+					{timelineTicks.map(tick => (
+						<text
+							key={`${tick.time}-${tick.label}`}
+							x={tick.x}
+							y={chartSize.height - 8}
+							textAnchor="middle"
+						>
+							{tick.label}
+						</text>
+					))}
+				</g>
 				{freeCrosshairX !== null && (
 					<line
 						className="e__free-crosshair"
@@ -3995,13 +4097,55 @@ class Home extends React.Component {
 	};
 
 	formatChartTick = (time, tickMarkType) => {
-		const formatter = tickMarkType === TickMarkType.Day
-			|| tickMarkType === TickMarkType.Month
-			|| tickMarkType === TickMarkType.Year
-			? chartDayFormatter
-			: chartTimeFormatter;
+		return "";
+	};
 
-		return formatChartEasternTime(time, formatter);
+	buildTimelineTicks = (rightLimit) => {
+		if (!this.chart || !this.state.candles.length) return [];
+
+		const visibleLogicalRange = this.chart.timeScale().getVisibleLogicalRange?.();
+		const loadedRange = this.getLoadedTimeRange();
+		const from = visibleLogicalRange
+			? this.logicalToTime(visibleLogicalRange.from)
+			: loadedRange?.from;
+		const to = visibleLogicalRange
+			? this.logicalToTime(visibleLogicalRange.to)
+			: loadedRange?.to;
+
+		if (!Number.isFinite(from) || !Number.isFinite(to)) return [];
+
+		const labels = new Set(["00:00", "06:00", "12:00", "18:00"]);
+		const start = Math.floor((Math.min(from, to) - 3600) / 3600) * 3600;
+		const end = Math.ceil((Math.max(from, to) + 3600) / 3600) * 3600;
+		const ticks = [];
+
+		for (let time = start; time <= end; time += 3600) {
+			const timeLabel = formatChartEasternTime(time, chartTimeFormatter).replace(/^24:/, "00:");
+
+			if (!labels.has(timeLabel)) continue;
+
+			const x = this.timeToX(time);
+
+			if (!Number.isFinite(x) || x < 0 || x > rightLimit) continue;
+
+			ticks.push({
+				time,
+				x,
+				label: timeLabel === "00:00"
+					? formatChartEasternTime(time, chartDayFormatter)
+					: timeLabel.replace(/^0(?=\d:)/, ""),
+			});
+		}
+
+		return ticks.reduce((visibleTicks, tick) => {
+			const previous = visibleTicks[visibleTicks.length - 1];
+
+			if (!previous || tick.x - previous.x >= 34) {
+				visibleTicks.push(tick);
+			}
+
+			return visibleTicks;
+		}, []);
 	};
 
 	initChart = () => {
