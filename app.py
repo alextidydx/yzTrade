@@ -221,6 +221,9 @@ app = FastAPI()
 live_client_count = 0
 app_state_clients = set()
 app_state_lock = asyncio.Lock()
+APP_STATE_HEARTBEAT_SECONDS = 10
+COINBASE_LIVE_STALE_SECONDS = 25
+COINBASE_DEPTH_WS_MAX_SIZE = 16 * 1024 * 1024
 
 app.add_middleware(
     CORSMiddleware,
@@ -1472,12 +1475,23 @@ async def live_app_state(websocket: WebSocket):
         "change": {"type": "initial"},
     })
 
+    async def send_heartbeat():
+        while True:
+            await asyncio.sleep(APP_STATE_HEARTBEAT_SECONDS)
+            await websocket.send_json({
+                "type": "heartbeat",
+            })
+
+    heartbeat_task = asyncio.create_task(send_heartbeat())
+
     try:
         while True:
             await websocket.receive_text()
     except WebSocketDisconnect:
         pass
     finally:
+        heartbeat_task.cancel()
+        await asyncio.gather(heartbeat_task, return_exceptions=True)
         app_state_clients.discard(websocket)
 
 
@@ -1590,15 +1604,8 @@ async def live_market(
                 "product_ids": [product_id],
                 "channel": "market_trades",
             },
-            {
-                "type": "subscribe",
-                "product_ids": [product_id],
-                "channel": "level2",
-            },
         ]
-        bids = {}
-        asks = {}
-        last_depth_send = 0
+        last_heartbeat_send = 0
 
         async with websockets.connect(
             COINBASE_WS_API,
@@ -1618,10 +1625,34 @@ async def live_market(
             })
             print(f"COINBASE LIVE MARKET OK product={product_id}", flush=True)
 
-            async for raw_message in coinbase_ws:
+            while True:
+                try:
+                    raw_message = await asyncio.wait_for(
+                        coinbase_ws.recv(),
+                        timeout=COINBASE_LIVE_STALE_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    await send_to_client({
+                        "type": "error",
+                        "stream": "market",
+                        "product_id": product_id,
+                        "message": f"Live Coinbase market stream stale for {COINBASE_LIVE_STALE_SECONDS}s.",
+                    })
+                    raise RuntimeError(f"Coinbase market stream stale for {COINBASE_LIVE_STALE_SECONDS}s")
+
                 data = json.loads(raw_message)
 
-                if data.get("channel") == "market_trades":
+                if data.get("channel") == "heartbeats":
+                    now = time.monotonic()
+
+                    if now - last_heartbeat_send >= 10:
+                        await send_to_client({
+                            "type": "heartbeat",
+                            "stream": "market",
+                            "product_id": product_id,
+                        })
+                        last_heartbeat_send = now
+                elif data.get("channel") == "market_trades":
                     for event in data.get("events", []):
                         for trade in event.get("trades", []):
                             if str(trade.get("product_id", "")).upper() != product_id:
@@ -1648,56 +1679,123 @@ async def live_market(
                                 "side": trade.get("side"),
                                 "trade_time": trade.get("time"),
                             })
-                elif data.get("channel") in ("level2", "l2_data"):
-                    should_send_depth = False
-                    last_event_type = ""
 
-                    for event in data.get("events", []):
-                        event_type = str(event.get("type", "")).lower()
-                        event_product_id = str(event.get("product_id", product_id)).upper()
-                        last_event_type = event_type
-                        updates = event.get("updates", [])
+    async def stream_depth_data():
+        subscribe_messages = [
+            {
+                "type": "subscribe",
+                "channel": "heartbeats",
+            },
+            {
+                "type": "subscribe",
+                "product_ids": [product_id],
+                "channel": "level2",
+            },
+        ]
+        bids = {}
+        asks = {}
+        last_depth_send = 0
+        last_heartbeat_send = 0
 
-                        if event_product_id != product_id:
-                            continue
+        async with websockets.connect(
+            COINBASE_WS_API,
+            ssl=get_ssl_context(),
+            ping_interval=20,
+            ping_timeout=20,
+            close_timeout=5,
+            max_size=COINBASE_DEPTH_WS_MAX_SIZE,
+        ) as coinbase_ws:
+            for message in subscribe_messages:
+                await coinbase_ws.send(json.dumps(message))
 
-                        if event_type == "snapshot":
-                            bids.clear()
-                            asks.clear()
+            await send_to_client({
+                "type": "subscribed",
+                "stream": "depth",
+                "product_id": product_id,
+            })
+            print(f"COINBASE LIVE DEPTH OK product={product_id}", flush=True)
 
-                        for update in updates:
-                            update_product_id = str(update.get("product_id", event_product_id)).upper()
+            while True:
+                try:
+                    raw_message = await asyncio.wait_for(
+                        coinbase_ws.recv(),
+                        timeout=COINBASE_LIVE_STALE_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    await send_to_client({
+                        "type": "error",
+                        "stream": "depth",
+                        "product_id": product_id,
+                        "message": f"Live Coinbase depth stream stale for {COINBASE_LIVE_STALE_SECONDS}s.",
+                    })
+                    raise RuntimeError(f"Coinbase depth stream stale for {COINBASE_LIVE_STALE_SECONDS}s")
 
-                            if update_product_id != product_id:
-                                continue
+                data = json.loads(raw_message)
 
-                            try:
-                                price = float(update["price_level"])
-                                quantity = float(update["new_quantity"])
-                            except (TypeError, ValueError, KeyError):
-                                continue
-
-                            side = normalize_level_side(update.get("side"))
-                            book_side = bids if side == "bid" else asks if side == "ask" else None
-
-                            if book_side is None:
-                                continue
-
-                            if quantity <= 0:
-                                book_side.pop(price, None)
-                            else:
-                                book_side[price] = quantity
-
-                            should_send_depth = True
-
-                        if event_type == "snapshot":
-                            should_send_depth = True
-
+                if data.get("channel") == "heartbeats":
                     now = time.monotonic()
 
-                    if should_send_depth and (last_event_type == "snapshot" or now - last_depth_send >= 0.25):
-                        await send_depth_update(bids, asks)
-                        last_depth_send = now
+                    if now - last_heartbeat_send >= 10:
+                        await send_to_client({
+                            "type": "heartbeat",
+                            "stream": "depth",
+                            "product_id": product_id,
+                        })
+                        last_heartbeat_send = now
+                    continue
+
+                if data.get("channel") not in ("level2", "l2_data"):
+                    continue
+
+                should_send_depth = False
+                last_event_type = ""
+
+                for event in data.get("events", []):
+                    event_type = str(event.get("type", "")).lower()
+                    event_product_id = str(event.get("product_id", product_id)).upper()
+                    last_event_type = event_type
+                    updates = event.get("updates", [])
+
+                    if event_product_id != product_id:
+                        continue
+
+                    if event_type == "snapshot":
+                        bids.clear()
+                        asks.clear()
+
+                    for update in updates:
+                        update_product_id = str(update.get("product_id", event_product_id)).upper()
+
+                        if update_product_id != product_id:
+                            continue
+
+                        try:
+                            price = float(update["price_level"])
+                            quantity = float(update["new_quantity"])
+                        except (TypeError, ValueError, KeyError):
+                            continue
+
+                        side = normalize_level_side(update.get("side"))
+                        book_side = bids if side == "bid" else asks if side == "ask" else None
+
+                        if book_side is None:
+                            continue
+
+                        if quantity <= 0:
+                            book_side.pop(price, None)
+                        else:
+                            book_side[price] = quantity
+
+                        should_send_depth = True
+
+                    if event_type == "snapshot":
+                        should_send_depth = True
+
+                now = time.monotonic()
+
+                if should_send_depth and (last_event_type == "snapshot" or now - last_depth_send >= 0.25):
+                    await send_depth_update(bids, asks)
+                    last_depth_send = now
 
     async def stream_user_orders():
         try:
@@ -1810,7 +1908,7 @@ async def live_market(
                     flush=True,
                 )
                 await send_to_client({
-                    "type": "error" if name == "market" else "order_stream_error",
+                    "type": "order_stream_error" if name == "orders" else "error",
                     "stream": name,
                     "product_id": product_id,
                     "message": f"Live Coinbase {name} stream failed: {exc}. Reconnecting in {delay}s.",
@@ -1819,18 +1917,20 @@ async def live_market(
                 await asyncio.sleep(delay)
 
     market_task = asyncio.create_task(guarded_stream("market", stream_market_data))
+    depth_task = asyncio.create_task(guarded_stream("depth", stream_depth_data))
     orders_task = asyncio.create_task(guarded_stream("orders", stream_user_orders))
 
     try:
-        await asyncio.gather(market_task, orders_task)
+        await asyncio.gather(market_task, depth_task, orders_task)
     except WebSocketDisconnect:
         pass
     except Exception:
         pass
     finally:
         market_task.cancel()
+        depth_task.cancel()
         orders_task.cancel()
-        await asyncio.gather(market_task, orders_task, return_exceptions=True)
+        await asyncio.gather(market_task, depth_task, orders_task, return_exceptions=True)
         live_client_count = max(0, live_client_count - 1)
         print(
             "LIVE CLIENT DISCONNECTED "
