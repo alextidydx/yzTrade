@@ -43,11 +43,18 @@ export const getProduct = (productId) => get("/api/product", {
 	_: Date.now(),
 });
 
+export const getProductStats = (productId) => get("/api/product-stats", {
+	product_id: productId,
+	_: Date.now(),
+});
+
 export const getTdSequential = (params) => get("/api/td-sequential", params);
 
 export const getMonitorTickers = () => get("/api/monitor-tickers", { _: Date.now() });
 
 export const getBalances = () => get("/api/balances", { _: Date.now() });
+
+export const getBalanceHistory = (params) => get("/api/balance-history", params);
 
 export const getOrders = (params) => get("/api/orders", params);
 
@@ -57,6 +64,10 @@ export const setBookmark = (currency, price) => (
 
 export const deleteBookmark = (currency) => (
 	del(`/api/app-state/bookmarks/${encodeURIComponent(currency)}`)
+);
+
+export const updateAppSettings = (settings) => (
+	put("/api/app-state/settings", settings)
 );
 
 export const previewOrder = (body) => post("/api/orders/preview", body);

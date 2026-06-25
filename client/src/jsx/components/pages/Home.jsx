@@ -98,6 +98,9 @@ class Home extends React.Component {
 		profile: null,
 		profileError: "",
 		isProfileLoading: false,
+		balanceHistory: [],
+		balanceHistoryPeriod: "week",
+		balanceHistoryError: "",
 		isProfileOpen: false,
 		isOrdersOpen: false,
 		isOrderTypeMenuOpen: false,
@@ -114,6 +117,9 @@ class Home extends React.Component {
 		})),
 		monitorError: "",
 		appBookmarks: null,
+		appSettings: {
+			balanceHistoryExpanded: false,
+		},
 		isMonitorOpen: false,
 		isCurrencyPickerHovered: false,
 		isAccountRefreshing: false,
@@ -134,6 +140,7 @@ class Home extends React.Component {
 		loadedPeriodDays: 7,
 		loadedPeriodGranularity: 300,
 		product: null,
+		productStats: null,
 		chartSize: {
 			width: 0,
 			height: 0,
@@ -173,6 +180,9 @@ class Home extends React.Component {
 	liveReconnectConfig = null;
 	liveWatchdogTimer = null;
 	lastLiveMessageAt = 0;
+	liveFlushTimer = null;
+	pendingLiveTrades = [];
+	pendingLiveDepth = null;
 	appStateSocket = null;
 	appStateReconnectTimer = null;
 	appStateReconnectAttempt = 0;
@@ -180,7 +190,10 @@ class Home extends React.Component {
 	lastAppStateMessageAt = 0;
 	isDisconnectingAppState = false;
 	profileRefreshTimer = null;
+	allOrdersRefreshTimer = null;
+	balanceHistoryRefreshTimer = null;
 	monitorRefreshTimer = null;
+	productStatsRefreshTimer = null;
 	tdRefreshTimers = [];
 	lastTdRefreshBoundary = null;
 	tdRefreshInFlight = false;
@@ -203,10 +216,14 @@ class Home extends React.Component {
 		this.connectAppStateSocket();
 		this.loadMarket();
 		this.loadProfile();
+		this.loadBalanceHistory();
 		this.loadAllOrders();
 		this.loadMonitorTickers();
 		this.profileRefreshTimer = window.setInterval(this.loadProfile, 5000);
+		this.allOrdersRefreshTimer = window.setInterval(this.loadAllOrders, 5000);
+		this.balanceHistoryRefreshTimer = window.setInterval(this.loadBalanceHistory, 60000);
 		this.monitorRefreshTimer = window.setInterval(this.loadMonitorTickers, 60000);
+		this.productStatsRefreshTimer = window.setInterval(this.loadProductStats, 30000);
 	}
 
 	componentDidUpdate(prevProps, prevState) {
@@ -283,9 +300,23 @@ class Home extends React.Component {
 			window.clearInterval(this.profileRefreshTimer);
 		}
 
+		if (this.allOrdersRefreshTimer) {
+			window.clearInterval(this.allOrdersRefreshTimer);
+		}
+
+		if (this.balanceHistoryRefreshTimer) {
+			window.clearInterval(this.balanceHistoryRefreshTimer);
+		}
+
 		if (this.monitorRefreshTimer) {
 			window.clearInterval(this.monitorRefreshTimer);
 		}
+
+		if (this.productStatsRefreshTimer) {
+			window.clearInterval(this.productStatsRefreshTimer);
+		}
+
+		this.clearLiveFlushTimer();
 
 		Object.values(this.dropdownCloseTimers).forEach(timer => window.clearTimeout(timer));
 		if (this.orderTicketCloseTimer) {
@@ -655,6 +686,9 @@ class Home extends React.Component {
 		event.stopPropagation();
 		event.stopImmediatePropagation?.();
 
+		// Log-mode Y wheel is unreliable; use price-axis drag instead.
+		if (this.state.isLogPriceScale) return;
+
 		const y = event.clientY - rect.top;
 		this.priceScaleWheelState = {
 			deltaY: (this.priceScaleWheelState?.deltaY || 0) + event.deltaY,
@@ -687,15 +721,6 @@ class Home extends React.Component {
 		const zoomFactor = Math.exp(Math.sign(deltaY) * Math.min(Math.abs(deltaY), 180) / 1600);
 		let nextFrom = anchorPrice - (anchorPrice - lower) * zoomFactor;
 		let nextTo = anchorPrice + (upper - anchorPrice) * zoomFactor;
-
-		if (this.state.isLogPriceScale && lower > 0 && upper > 0 && anchorPrice > 0) {
-			const logLower = Math.log(lower);
-			const logUpper = Math.log(upper);
-			const logAnchor = Math.log(anchorPrice);
-
-			nextFrom = Math.exp(logAnchor - (logAnchor - logLower) * zoomFactor);
-			nextTo = Math.exp(logAnchor + (logUpper - logAnchor) * zoomFactor);
-		}
 
 		if (!Number.isFinite(nextFrom) || !Number.isFinite(nextTo) || nextFrom === nextTo) return;
 
@@ -1184,11 +1209,31 @@ class Home extends React.Component {
 			: {};
 		const currency = this.state.loadedBaseCurrency || this.state.baseCurrency;
 		const bookmarkedPrice = Number(appBookmarks[String(currency || "").toUpperCase()]);
+		const settings = appState?.yzTrade?.settings;
+		const appSettings = settings && typeof settings === "object" && !Array.isArray(settings)
+			? {
+				balanceHistoryExpanded: Boolean(settings.balanceHistoryExpanded),
+			}
+			: this.state.appSettings;
 
 		this.setState({
 			appBookmarks,
+			appSettings,
 			bookmarkedPrice: Number.isFinite(bookmarkedPrice) ? bookmarkedPrice : null,
 		}, this.scheduleOverlayUpdate);
+	};
+
+	updateAppSettings = (settings) => {
+		this.setState(prev => ({
+			appSettings: {
+				...prev.appSettings,
+				...settings,
+			},
+		}));
+
+		api.updateAppSettings(settings).catch(() => {
+			this.loadAppState();
+		});
 	};
 
 	loadAppState = () => (
@@ -1317,6 +1362,9 @@ class Home extends React.Component {
 		this.isDisconnectingLive = true;
 		this.clearTdRefreshTimers();
 		this.clearLiveWatchdog();
+		this.clearLiveFlushTimer();
+		this.pendingLiveTrades = [];
+		this.pendingLiveDepth = null;
 
 		if (this.liveReconnectTimer) {
 			window.clearTimeout(this.liveReconnectTimer);
@@ -1354,6 +1402,8 @@ class Home extends React.Component {
 		this.scheduleLiveWatchdog();
 	};
 
+	getLiveLogTimestamp = () => new Date().toISOString();
+
 	scheduleLiveWatchdog = () => {
 		if (this.isDisconnectingLive || !this.liveSocket) return;
 
@@ -1369,6 +1419,12 @@ class Home extends React.Component {
 				return;
 			}
 
+			console.warn("[live] market watchdog stale; closing socket to reconnect", {
+				timestamp: this.getLiveLogTimestamp(),
+				productId: this.liveProductId,
+				elapsed,
+				timeout: LIVE_STALE_TIMEOUT_MS,
+			});
 			socket.close();
 		}, LIVE_STALE_TIMEOUT_MS);
 	};
@@ -1381,6 +1437,12 @@ class Home extends React.Component {
 		const jitter = Math.floor(Math.random() * 500);
 		const delay = baseDelay + jitter;
 
+		console.warn("[live] reconnect scheduled", {
+			timestamp: this.getLiveLogTimestamp(),
+			productId: this.liveReconnectConfig?.productId,
+			attempt: this.liveReconnectAttempt + 1,
+			delay,
+		});
 		this.liveReconnectAttempt += 1;
 		this.liveReconnectTimer = window.setTimeout(() => {
 			const config = this.liveReconnectConfig;
@@ -1389,6 +1451,11 @@ class Home extends React.Component {
 
 			if (!config) return;
 
+			console.warn("[live] reconnecting", {
+				timestamp: this.getLiveLogTimestamp(),
+				productId: config.productId,
+				attempt: this.liveReconnectAttempt,
+			});
 			this.openLiveSocket(config);
 		}, delay);
 	};
@@ -1425,8 +1492,12 @@ class Home extends React.Component {
 
 		socket.onopen = () => {
 			if (socket === this.liveSocket) {
+				console.info("[live] socket open", {
+					timestamp: this.getLiveLogTimestamp(),
+					productId,
+				});
 				this.liveReconnectAttempt = 0;
-				this.markLiveMessage();
+				this.scheduleLiveWatchdog();
 			}
 		};
 
@@ -1441,39 +1512,67 @@ class Home extends React.Component {
 
 			if (socket !== this.liveSocket || message.product_id !== this.liveProductId) return;
 
-			this.markLiveMessage();
-
 			if (message.type === "subscribed") {
 				if (message.stream === "market") {
+					console.info("[live] market subscribed", {
+						timestamp: this.getLiveLogTimestamp(),
+						productId: message.product_id,
+					});
+					this.markLiveMessage();
 					this.liveReconnectAttempt = 0;
 					this.setState({ isLive: true });
 				} else if (message.stream === "orders") {
+					console.info("[live] orders subscribed", {
+						timestamp: this.getLiveLogTimestamp(),
+						productId: message.product_id,
+					});
 					this.setState({ orderError: "" });
+				} else if (message.stream === "depth") {
+					console.info("[live] depth subscribed", {
+						timestamp: this.getLiveLogTimestamp(),
+						productId: message.product_id,
+					});
 				}
 			} else if (message.type === "trade") {
+				this.markLiveMessage();
 				if (!this.state.isLive) {
 					this.setState({ isLive: true });
 				}
-				this.applyLiveTrade(message);
+				this.queueLiveTrade(message);
 			} else if (message.type === "orders_update") {
 				this.applyLiveOrders(message);
 			} else if (message.type === "depth_update") {
-				this.applyLiveDepth(message);
+				this.queueLiveDepth(message);
 			} else if (message.type === "heartbeat") {
-				if (!this.state.isLive) {
-					this.setState({ isLive: true });
+				if (message.stream === "market") {
+					this.markLiveMessage();
+
+					if (!this.state.isLive) {
+						this.setState({ isLive: true });
+					}
 				}
 			} else if (message.type === "order_stream_error") {
 				this.setState({
 					orderError: message.message || "Live order stream failed.",
 				});
 			} else if (message.type === "error") {
+				console.error("[live] backend stream error", {
+					timestamp: message.timestamp || this.getLiveLogTimestamp(),
+					productId: message.product_id,
+					stream: message.stream,
+					message: message.message,
+					reconnectIn: message.reconnect_in,
+				});
 				this.setState({ isLive: false });
 			}
 		};
 
 		socket.onerror = () => {
 			if (socket === this.liveSocket) {
+				console.error("[live] socket error", {
+					timestamp: this.getLiveLogTimestamp(),
+					productId,
+				});
 				this.setState({
 					error: "Live stream connection failed.",
 					isLive: false,
@@ -1484,12 +1583,58 @@ class Home extends React.Component {
 
 		socket.onclose = () => {
 			if (socket === this.liveSocket) {
+				console.warn("[live] socket closed", {
+					timestamp: this.getLiveLogTimestamp(),
+					productId,
+				});
 				this.clearLiveWatchdog();
 				this.liveSocket = null;
 				this.setState({ isLive: false });
 				this.scheduleLiveReconnect();
 			}
 		};
+	};
+
+	clearLiveFlushTimer = () => {
+		if (this.liveFlushTimer) {
+			window.clearTimeout(this.liveFlushTimer);
+			this.liveFlushTimer = null;
+		}
+	};
+
+	queueLiveTrade = (message) => {
+		this.pendingLiveTrades.push(message);
+		this.scheduleLiveFlush();
+	};
+
+	queueLiveDepth = (message) => {
+		this.pendingLiveDepth = message;
+		this.scheduleLiveFlush();
+	};
+
+	scheduleLiveFlush = () => {
+		if (this.liveFlushTimer) return;
+
+		this.liveFlushTimer = window.setTimeout(this.flushLiveUpdates, 1000);
+	};
+
+	flushLiveUpdates = () => {
+		this.liveFlushTimer = null;
+
+		const trades = this.pendingLiveTrades;
+		const depth = this.pendingLiveDepth;
+		this.pendingLiveTrades = [];
+		this.pendingLiveDepth = null;
+
+		if (trades.length) {
+			this.applyLiveTrades(trades, depth);
+		} else if (depth) {
+			this.applyLiveDepth(depth);
+		}
+
+		if (this.pendingLiveTrades.length || this.pendingLiveDepth) {
+			this.scheduleLiveFlush();
+		}
 	};
 
 	applyLiveDepth = (message) => {
@@ -1500,6 +1645,7 @@ class Home extends React.Component {
 		this.setState(prev => {
 			if (!prev.depth) return null;
 
+			const currentPrice = Number(depth.current_price);
 			const minPrice = Number(prev.depth.min_price);
 			const maxPrice = Number(prev.depth.max_price);
 			const isInRange = level => {
@@ -1514,17 +1660,39 @@ class Home extends React.Component {
 
 			if (!bids.length && !asks.length) return null;
 
+			const candles = [...prev.candles];
+			const lastCandle = candles[candles.length - 1];
+
+			if (lastCandle && Number.isFinite(currentPrice)) {
+				candles[candles.length - 1] = {
+					...lastCandle,
+					high: Math.max(lastCandle.high, currentPrice),
+					low: Math.min(lastCandle.low, currentPrice),
+					close: currentPrice,
+				};
+			}
+
 			return {
+				candles,
 				depth: {
 					...prev.depth,
-					current_price: Number.isFinite(Number(depth.current_price))
-						? Number(depth.current_price)
+					current_price: Number.isFinite(currentPrice)
+						? currentPrice
 						: prev.depth.current_price,
 					bids,
 					asks,
 				},
 			};
-		}, this.scheduleOverlayUpdate);
+		}, () => {
+			const candle = this.state.candles[this.state.candles.length - 1];
+
+			if (candle) {
+				this.candleSeries?.update(candle);
+				this.syncVwapSeries(this.state.candles);
+			}
+
+			this.scheduleOverlayUpdate();
+		});
 	};
 
 	applyLiveOrders = (message) => {
@@ -1532,80 +1700,146 @@ class Home extends React.Component {
 		const removedOrderIds = new Set(Array.isArray(message.removed_order_ids) ? message.removed_order_ids : []);
 
 		this.setState(prev => {
-			const ordersById = new Map();
-
-			(Array.isArray(prev.orders) ? prev.orders : []).forEach(order => {
-				if (order?.id && !removedOrderIds.has(order.id)) {
-					ordersById.set(order.id, order);
-				}
-			});
-
-			updatedOrders.forEach(order => {
-				if (order?.id) {
-					const existing = ordersById.get(order.id);
-					const nextOrder = { ...existing, ...order };
-
-					if (
-						(!Array.isArray(nextOrder.bracket_legs) || !nextOrder.bracket_legs.length)
-						&& Array.isArray(existing?.bracket_legs)
-						&& existing.bracket_legs.length
-					) {
-						nextOrder.bracket_legs = existing.bracket_legs;
-					}
-
-					ordersById.set(order.id, nextOrder);
-				}
-			});
-
 			return {
-				orders: Array.from(ordersById.values()),
+				orders: this.mergeOrderUpdates(prev.orders, updatedOrders, removedOrderIds),
+				allOrders: this.mergeOrderUpdates(prev.allOrders, updatedOrders, removedOrderIds),
 				orderError: "",
+				allOrdersError: "",
 			};
 		}, this.scheduleOverlayUpdate);
 	};
 
-	applyLiveTrade = (trade) => {
-		const price = Number(trade.price);
-		const size = Number(trade.size) || 0;
-		const time = Number(trade.time);
-		let didStartNewCandle = false;
+	mergeOrderUpdates = (orders, updatedOrders, removedOrderIds) => {
+		const ordersById = new Map();
 
-		if (!Number.isFinite(price) || !Number.isFinite(time)) return;
+		(Array.isArray(orders) ? orders : []).forEach(order => {
+			if (order?.id && !removedOrderIds.has(order.id)) {
+				ordersById.set(order.id, order);
+			}
+		});
+
+		updatedOrders.forEach(order => {
+			if (order?.id) {
+				const existing = ordersById.get(order.id);
+				const nextOrder = { ...existing, ...order };
+
+				if (
+					(!Array.isArray(nextOrder.bracket_legs) || !nextOrder.bracket_legs.length)
+					&& Array.isArray(existing?.bracket_legs)
+					&& existing.bracket_legs.length
+				) {
+					nextOrder.bracket_legs = existing.bracket_legs;
+				}
+
+				ordersById.set(order.id, nextOrder);
+			}
+		});
+
+		return Array.from(ordersById.values());
+	};
+
+	applyLiveTrade = (trade, depthMessage = null) => {
+		this.applyLiveTrades([trade], depthMessage);
+	};
+
+	applyLiveTrades = (trades, depthMessage = null) => {
+		let didStartNewCandle = false;
+		let latestCandleTime = null;
+		let latestPrice = null;
+
+		if (!Array.isArray(trades) || !trades.length) return;
 
 		this.setState(prev => {
 			const candles = [...prev.candles];
-			const last = candles[candles.length - 1];
+			let depth = prev.depth;
+			let didUpdateCandles = false;
 
-			if (!last || time > last.time) {
-				didStartNewCandle = true;
-				candles.push({
-					time,
-					open: price,
-					high: price,
-					low: price,
-					close: price,
-					volume: size,
-				});
-			} else if (time === last.time) {
-				candles[candles.length - 1] = {
-					...last,
-					high: Math.max(last.high, price),
-					low: Math.min(last.low, price),
-					close: price,
-					volume: (last.volume || 0) + size,
+			trades.forEach(trade => {
+				const price = Number(trade.price);
+				const size = Number(trade.size) || 0;
+				const time = Number(trade.time);
+				const source = String(trade.source || "");
+				const isTickerUpdate = source === "ticker" || source === "ticker_batch";
+
+				if (!Number.isFinite(price) || !Number.isFinite(time)) return;
+
+				const last = candles[candles.length - 1];
+
+				if (!last || time > last.time) {
+					if (isTickerUpdate) return;
+
+					didStartNewCandle = true;
+					latestCandleTime = time;
+					latestPrice = price;
+					didUpdateCandles = true;
+					candles.push({
+						time,
+						open: price,
+						high: price,
+						low: price,
+						close: price,
+						volume: size,
+					});
+				} else if (time === last.time) {
+					latestCandleTime = time;
+					latestPrice = price;
+					didUpdateCandles = true;
+					candles[candles.length - 1] = {
+						...last,
+						high: Math.max(last.high, price),
+						low: Math.min(last.low, price),
+						close: price,
+						volume: isTickerUpdate
+							? last.volume
+							: (last.volume || 0) + size,
+					};
+				}
+			});
+
+			if (!didUpdateCandles && !depthMessage?.depth) return null;
+
+			if (
+				depthMessage?.depth
+				&& Array.isArray(depthMessage.depth.bids)
+				&& Array.isArray(depthMessage.depth.asks)
+				&& prev.depth
+			) {
+				const minPrice = Number(prev.depth.min_price);
+				const maxPrice = Number(prev.depth.max_price);
+				const isInRange = level => {
+					const levelPrice = Number(level.price);
+
+					return Number.isFinite(levelPrice)
+						&& (!Number.isFinite(minPrice) || levelPrice >= minPrice)
+						&& (!Number.isFinite(maxPrice) || levelPrice <= maxPrice);
 				};
-			} else {
-				return null;
+				const bids = depthMessage.depth.bids.filter(isInRange);
+				const asks = depthMessage.depth.asks.filter(isInRange);
+
+				if (bids.length || asks.length) {
+					depth = {
+						...prev.depth,
+						current_price: Number.isFinite(Number(depthMessage.depth.current_price))
+							? Number(depthMessage.depth.current_price)
+							: Number.isFinite(latestPrice)
+								? latestPrice
+								: prev.depth.current_price,
+						bids,
+						asks,
+					};
+				}
 			}
 
 			return {
 				candles,
-				depth: prev.depth
+				depth: depth
 					? {
-						...prev.depth,
-						current_price: price,
+						...depth,
+						current_price: Number.isFinite(latestPrice)
+							? latestPrice
+							: depth.current_price,
 					}
-					: prev.depth,
+					: depth,
 			};
 		}, () => {
 			const candle = this.state.candles[this.state.candles.length - 1];
@@ -1623,7 +1857,7 @@ class Home extends React.Component {
 			});
 			this.syncVwapSeries(this.state.candles);
 			if (didStartNewCandle) {
-				this.refreshTdSequentialAfterClosedCandle(time);
+				this.refreshTdSequentialAfterClosedCandle(latestCandleTime);
 			}
 			this.scheduleOverlayUpdate();
 		});
@@ -1718,6 +1952,7 @@ class Home extends React.Component {
 			candles: [],
 			depth: null,
 			product: null,
+			productStats: null,
 			orderStats: null,
 			tdSequential: null,
 			tdSequentialError: "",
@@ -1794,6 +2029,7 @@ class Home extends React.Component {
 					}
 
 					this.syncCurrencyPath(baseCurrency);
+					this.loadProductStats(productId);
 					this.connectLiveMarket(productId, periodDays, periodGranularity, depthRange);
 					this.isMarketTransitioning = false;
 					this.scheduleOverlayUpdate();
@@ -1926,6 +2162,21 @@ class Home extends React.Component {
 		});
 	};
 
+	loadProductStats = (productId = null) => {
+		const loadedBaseCurrency = String(this.state.loadedBaseCurrency || "").trim().toUpperCase();
+		const activeProductId = productId || (loadedBaseCurrency ? `${loadedBaseCurrency}-USD` : "");
+
+		if (!activeProductId || this.state.isLoading) return;
+
+		api.getProductStats(activeProductId).then(response => {
+			if (String(response.data?.product_id || "").toUpperCase() !== activeProductId.toUpperCase()) return;
+
+			this.setState({
+				productStats: response.data,
+			});
+		}).catch(() => {});
+	};
+
 	handleMonitorTickerClick = (baseCurrency) => {
 		const normalizedBaseCurrency = String(baseCurrency || "").toUpperCase();
 
@@ -1935,6 +2186,12 @@ class Home extends React.Component {
 			baseCurrency: normalizedBaseCurrency,
 			isMonitorOpen: false,
 		}, this.loadMarket);
+	};
+
+	openMonitorDropdown = () => {
+		if (!this.state.isMonitorOpen) {
+			this.setAnimatedDropdown("monitor", true);
+		}
 	};
 
 	handleMonitorTickerLinkClick = (event, baseCurrency) => {
@@ -2259,11 +2516,10 @@ class Home extends React.Component {
 		const saved = this.state.savedOrderTickets[normalizedSide] || {};
 		const priceValue = Number.isFinite(numericPrice) ? this.getOrderPriceInputValue(numericPrice) : "0";
 		const stopLossValue = Number.isFinite(numericPrice) ? this.getOrderPriceInputValue(numericPrice * 0.98) : "0";
-		const savedOrderType = this.normalizeOrderTypeForSide(normalizedSide, saved.orderType);
 		const ticket = {
 			...saved,
 			side: normalizedSide,
-			orderType: savedOrderType,
+			orderType: "LIMIT",
 			amountMode: this.getSavedAmountModeForSide(normalizedSide, saved),
 			activePriceField: "price",
 			anchorPrice: Number.isFinite(numericPrice) ? numericPrice : null,
@@ -2278,10 +2534,10 @@ class Home extends React.Component {
 			isSubmitting: false,
 		};
 
-		return this.clampOrderTicketAmount({
+		return {
 			...ticket,
 			fraction: this.getOrderFractionFromAmount(ticket),
-		});
+		};
 	};
 
 	getSavedOrderSnapshot = (ticket) => (
@@ -2340,10 +2596,10 @@ class Home extends React.Component {
 			isSubmitting: false,
 		};
 
-		return this.clampOrderTicketAmount({
+		return {
 			...ticket,
 			fraction: this.getOrderFractionFromAmount(ticket),
-		});
+		};
 	};
 
 	switchOrderSide = (side) => {
@@ -2776,13 +3032,39 @@ class Home extends React.Component {
 		const ticket = this.state.orderTicket;
 		if (!ticket) return;
 
+		const safeFraction = Number.isFinite(Number(fraction))
+			? Math.max(0, Math.min(1, Number(fraction)))
+			: 0;
 		const maxAmount = this.getOrderMaxAmount(ticket);
 
 		this.updateOrderTicket({
-			fraction,
+			fraction: safeFraction,
 			amount: maxAmount > 0
-				? this.getOrderAmountInputValue(ticket, maxAmount * fraction)
+				? this.getOrderAmountInputValue(ticket, maxAmount * safeFraction)
 				: "0",
+		});
+	};
+
+	loadBalanceHistory = (period = this.state.balanceHistoryPeriod) => (
+		api.getBalanceHistory({
+			period,
+			_: Date.now(),
+		}).then(response => {
+			this.setState({
+				balanceHistory: Array.isArray(response.data?.points) ? response.data.points : [],
+				balanceHistoryPeriod: period,
+				balanceHistoryError: "",
+			});
+		}).catch(error => {
+			this.setState({
+				balanceHistoryError: error.response?.data?.detail || error.message || "Unable to load balance history.",
+			});
+		})
+	);
+
+	setBalanceHistoryPeriod = (period) => {
+		this.setState({ balanceHistoryPeriod: period }, () => {
+			this.loadBalanceHistory(period);
 		});
 	};
 
@@ -3304,6 +3586,31 @@ class Home extends React.Component {
 			value,
 			percent: (value / referencePrice) * 100,
 		};
+	};
+
+	getOverlayPriceChange24h = (currentPrice) => {
+		const productStats = this.state.productStats;
+		const productId = `${this.state.loadedBaseCurrency || this.state.baseCurrency}-USD`.toUpperCase();
+		const statsProductId = String(productStats?.product_id || "").toUpperCase();
+		const statsPercent = Number(productStats?.change_24h);
+		const statsOpen = Number(productStats?.open_24h);
+		const price = Number(currentPrice);
+
+		if (
+			statsProductId === productId
+			&& Number.isFinite(statsOpen)
+			&& statsOpen !== 0
+			&& Number.isFinite(price)
+		) {
+			const value = price - statsOpen;
+
+			return {
+				value,
+				percent: (value / statsOpen) * 100,
+			};
+		}
+
+		return this.getPriceChange24h(currentPrice);
 	};
 
 	getVolume24h = () => {
@@ -3864,9 +4171,24 @@ class Home extends React.Component {
 				text: formatUsdValue(hoveredVolumeValue),
 			}
 			: null;
+		const timelineHoverLabel = (
+			hoveredVolumeCandle
+			&& Number.isFinite(hoveredVolumeX)
+		)
+			? {
+				x: Math.min(chartSize.width - 18, Math.max(18, hoveredVolumeX)),
+				y: chartSize.height - 24,
+				text: formatChartEasternTime(hoveredVolumeCandle.time, chartTimeFormatter).replace(/\b24:/, "00:"),
+			}
+			: null;
 
 		return (
-			<svg className="e__market-overlay" width={chartSize.width} height={chartSize.height}>
+			<svg
+				className="e__market-overlay"
+				width={priceScaleLeft}
+				height={chartSize.height}
+				style={{ width: priceScaleLeft }}
+			>
 				<g className="e__timeline-labels">
 					{timelineTicks.map(tick => (
 						<text
@@ -3879,6 +4201,17 @@ class Home extends React.Component {
 						</text>
 					))}
 				</g>
+				{timelineHoverLabel && (
+					<g className="e__timeline-hover-label">
+						<text
+							x={timelineHoverLabel.x}
+							y={timelineHoverLabel.y}
+							textAnchor="middle"
+						>
+							{timelineHoverLabel.text}
+						</text>
+					</g>
+				)}
 				{freeCrosshairX !== null && (
 					<line
 						className="e__free-crosshair"
@@ -3981,17 +4314,16 @@ class Home extends React.Component {
 							<text x={bookmarkedLineRight - orderLabelOffset} y={bookmarkedLabelY} textAnchor="end">
 								{this.formatOverlayPriceForProduct(bookmarkedPriceValue)}
 							</text>
-							<text
+							<g
 								className="e__price-bookmark__delete"
-								x={bookmarkedLineRight - orderCancelOffset}
-								y={bookmarkedLabelY}
-								textAnchor="middle"
+								transform={`translate(${bookmarkedLineRight - orderCancelOffset}, ${bookmarkedLabelY - 4})`}
 								role="button"
 								tabIndex={0}
 								onClick={this.clearBookmarkedPrice}
 							>
-								x
-							</text>
+								<circle r={7} />
+								<path d="M -2.24 -2.24 L 2.24 2.24 M 2.24 -2.24 L -2.24 2.24" />
+							</g>
 						</g>
 					)}
 					{orderTicketY !== null && (
@@ -4027,17 +4359,16 @@ class Home extends React.Component {
 							<text x={orderLineRight - orderLabelOffset} y={orderLabelYById.get(order.id) ?? Math.max(12, order.y - 5)} textAnchor="end">
 								{order.label}
 							</text>
-							<text
+							<g
 								className="e__order-cancel"
-								x={orderLineRight - orderCancelOffset}
-								y={orderLabelYById.get(order.id) ?? Math.max(12, order.y - 5)}
-								textAnchor="middle"
+								transform={`translate(${orderLineRight - orderCancelOffset}, ${(orderLabelYById.get(order.id) ?? Math.max(12, order.y - 5)) - 4})`}
 								role="button"
 								tabIndex={0}
 								onClick={event => this.cancelOrder(order, event)}
 							>
-								(x)
-							</text>
+								<circle r={7} />
+								<path d="M -2.24 -2.24 L 2.24 2.24 M 2.24 -2.24 L -2.24 2.24" />
+							</g>
 						</g>
 					))}
 				</g>
@@ -4291,7 +4622,7 @@ class Home extends React.Component {
 		);
 		const hasOverlayPricePrecision = hasPriceIncrement(this.state.product?.quote_increment);
 		const currentPrice = isOverlayMarketLoaded ? Number(lastCandle?.close) : NaN;
-		const change24h = isOverlayMarketLoaded ? this.getPriceChange24h(currentPrice) : null;
+		const change24h = isOverlayMarketLoaded ? this.getOverlayPriceChange24h(currentPrice) : null;
 		const volume24h = isOverlayMarketLoaded ? this.getVolume24h() : null;
 		const changeClass = !change24h
 			? ""
@@ -4379,6 +4710,14 @@ class Home extends React.Component {
 		return (
 			<div className={classnames} ref={this.container}>
 				<header className="e__toolbar">
+					<svg
+						className="e__toolbar-logo"
+						viewBox="0 0 512 512"
+						aria-hidden="true"
+						focusable="false"
+					>
+						<path d="M205.2,81.9L33.1,380c-22.6,39,5.5,87,49.8,87c42.5,0,64.4-69.7,172.1-69.7c117.7,0,129.5,69.7,172.1,69.7c44.3,0,72.5-48,49.8-87L305.6,81.9C283.2,43,227.8,43,205.2,81.9z" />
+					</svg>
 					<form className="e__market-form" onSubmit={this.handleProductSubmit}>
 						<div className="e__market-form__row">
 							<CoinsDropdown
@@ -4390,6 +4729,7 @@ class Home extends React.Component {
 								monitorError={this.state.monitorError}
 								onBaseCurrencyChange={baseCurrency => this.setState({ baseCurrency })}
 								onHoverChange={isCurrencyPickerHovered => this.setState({ isCurrencyPickerHovered })}
+								onOpen={this.openMonitorDropdown}
 								onTickerClick={this.handleMonitorTickerLinkClick}
 								onToggle={() => this.setAnimatedDropdown("monitor", !this.state.isMonitorOpen)}
 								tickers={this.state.monitorTickers}
@@ -4427,15 +4767,22 @@ class Home extends React.Component {
 							orders={this.state.allOrders}
 						/>
 						<BalanceDropdown
+							balanceHistory={this.state.balanceHistory}
+							balanceHistoryError={this.state.balanceHistoryError}
+							balanceHistoryPeriod={this.state.balanceHistoryPeriod}
 							balances={profileBalances}
 							error={this.state.profileError}
 							getBookmarkDelta={this.getBalanceBookmarkDelta}
 							isClosing={this.state.closingDropdowns.profile}
 							isLoading={this.state.isProfileLoading}
 							isOpen={this.state.isProfileOpen}
+							isTotalExpanded={Boolean(this.state.appSettings.balanceHistoryExpanded)}
 							onCurrencyClick={(event, currency) => this.handleCurrencyNavigationLinkClick(event, currency, "profile")}
+							onHistoryPeriodChange={this.setBalanceHistoryPeriod}
+							onTotalExpandedChange={balanceHistoryExpanded => this.updateAppSettings({ balanceHistoryExpanded })}
 							onToggle={() => this.setAnimatedDropdown("profile", !this.state.isProfileOpen, {
 								close: ["orders"],
+								onOpen: this.loadBalanceHistory,
 							})}
 							total={profileTotal}
 						/>

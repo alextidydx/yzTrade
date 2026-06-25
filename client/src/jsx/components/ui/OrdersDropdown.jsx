@@ -4,6 +4,7 @@ import "../../../styles/ui/dropdownShared.scss";
 import "../../../styles/ui/ordersDropdown.scss";
 
 import {
+	formatBalanceAmount,
 	formatOrderValue,
 	getCurrencyFromProductId,
 } from "../../../utils/homeUtils";
@@ -106,6 +107,14 @@ const OrdersDropdown = ({
 								const side = String(order.side).toLowerCase() === "sell" ? "sell" : "buy";
 								const price = Number(order.price);
 								const totalValue = formatOrderValue(order.total_value, order.amount, price, order.quote_size);
+								const amount = Number(order.amount);
+								const amountLabel = Number.isFinite(amount)
+									? `${formatBalanceAmount(amount)} ${group.currency}`
+									: "";
+								const filledPercent = Number(order.filled_percent);
+								const filledLabel = Number.isFinite(filledPercent)
+									? `${Math.round(filledPercent)}%`
+									: "";
 
 								return (
 									<div className="e__orders-row" key={order.id || `${order.product_id}-${order.side}-${order.price}`}>
@@ -113,7 +122,13 @@ const OrdersDropdown = ({
 											{side.toUpperCase()}
 										</span>
 										<span className="e__orders-row__price">
-											{totalValue}
+											<strong>{totalValue}</strong>
+											{amountLabel && (
+												<small>{amountLabel}</small>
+											)}
+										</span>
+										<span className="e__orders-row__filled">
+											{filledLabel}
 										</span>
 										<button
 											className="e__orders-row__cancel"
@@ -121,7 +136,10 @@ const OrdersDropdown = ({
 											onClick={event => onCancelOrder(order, event)}
 											aria-label={`Cancel ${side} order`}
 										>
-											<span aria-hidden="true" />
+											<svg viewBox="-8 -8 16 16" aria-hidden="true">
+												<circle r={7} />
+												<path d="M -2.24 -2.24 L 2.24 2.24 M 2.24 -2.24 L -2.24 2.24" />
+											</svg>
 										</button>
 									</div>
 								);

@@ -42,6 +42,15 @@
 	}
 }
 
+.e__toolbar-logo {
+	width: 22px;
+	height: 22px;
+	display: block;
+	flex: 0 0 auto;
+	color: rgb(242, 246, 248);
+	fill: currentColor;
+}
+
 .e__market-form {
 	display: flex;
 	align-items: center;
@@ -115,7 +124,10 @@
 
 .e__market-overlay {
 	position: absolute;
-	inset: 0;
+	left: 0;
+	top: 0;
+	height: 100%;
+	overflow: hidden;
 	pointer-events: none;
 	z-index: 5;
 }
@@ -153,7 +165,7 @@
 	transform: translate(-50%, -50%);
 	border: 1px solid rgba(57, 65, 74, 0.72);
 	border-radius: 999px;
-	background: rgba(0, 1, 5, 0.82);
+	background: rgba(0, 1, 5, 0.22);
 	backdrop-filter: blur(2px);
 	color: #f2f6f8;
 	pointer-events: auto;
@@ -379,6 +391,19 @@
 		fill: #f2f6f8;
 		font-size: 11px;
 		font-weight: 750;
+		paint-order: stroke;
+		stroke: #000105;
+		stroke-width: 4px;
+	}
+}
+
+.e__timeline-hover-label {
+	pointer-events: none;
+
+	text {
+		fill: #f2f6f8;
+		font-size: 11px;
+		font-weight: 800;
 		paint-order: stroke;
 		stroke: #000105;
 		stroke-width: 4px;
@@ -657,6 +682,45 @@
 		pointer-events: all;
 		cursor: pointer;
 		font-weight: 850;
+
+		circle {
+			fill: transparent;
+			stroke: rgba(242, 246, 248, 0.95);
+			stroke-width: 1.5;
+			transition: fill 140ms ease, stroke-color 140ms ease;
+		}
+
+		text {
+			fill: #f2f6f8;
+			font-size: 11px;
+			font-weight: 850;
+			paint-order: normal;
+			stroke: none;
+			transition: fill 140ms ease;
+		}
+
+		path {
+			stroke: #f2f6f8;
+			stroke-width: 1.8;
+			stroke-linecap: round;
+			transition: stroke 140ms ease;
+		}
+
+		&:hover,
+		&:focus-visible {
+			circle {
+				fill: #f2f6f8;
+				stroke: #f2f6f8;
+			}
+
+			text {
+				fill: #000105;
+			}
+
+			path {
+				stroke: #000105;
+			}
+		}
 	}
 }
 
@@ -728,6 +792,44 @@
 		pointer-events: all;
 		cursor: pointer;
 		font-weight: 850;
+
+		circle {
+			fill: transparent;
+			stroke: currentColor;
+			stroke-width: 1.5;
+			transition: fill 140ms ease, stroke-color 140ms ease;
+		}
+
+		text {
+			font-size: 11px;
+			font-weight: 850;
+			paint-order: normal;
+			stroke: none;
+			transition: fill 140ms ease;
+		}
+
+		path {
+			stroke: #f2f6f8;
+			stroke-width: 1.8;
+			stroke-linecap: round;
+			transition: stroke 140ms ease;
+		}
+
+		&:hover,
+		&:focus-visible {
+			circle {
+				fill: #f2f6f8;
+				stroke: #f2f6f8;
+			}
+
+			text {
+				fill: #000105;
+			}
+
+			path {
+				stroke: #000105;
+			}
+		}
 	}
 }
 

@@ -158,7 +158,7 @@
 .e__orders-row {
 	min-height: 42px;
 	display: grid;
-	grid-template-columns: 58px minmax(0, 1fr) 30px;
+	grid-template-columns: 58px minmax(0, 1fr) 44px 30px;
 	align-items: center;
 	gap: 10px;
 	padding: 7px 10px 7px 14px;
@@ -176,12 +176,12 @@
 	line-height: 20px;
 }
 
-.e__orders-row__badge--buy {
-	background: rgba(32, 178, 143, 0.22);
-	color: #20b28f;
+.e__orders-row .e__orders-row__badge--buy {
+	background: rgba(166, 109, 255, 0.22);
+	color: #a66dff;
 }
 
-.e__orders-row__badge--sell {
+.e__orders-row .e__orders-row__badge--sell {
 	background: rgba(32, 178, 143, 0.2);
 	color: #20b28f;
 }
@@ -192,7 +192,33 @@
 	color: #f2f6f8;
 	font-size: 13px;
 	font-weight: 800;
-	text-overflow: ellipsis;
+
+	strong,
+	small {
+		display: block;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+
+	strong {
+		font-size: 13px;
+		font-weight: 800;
+	}
+
+	small {
+		margin-top: 2px;
+		color: #7e8b98;
+		font-size: 10px;
+		font-weight: 750;
+	}
+}
+
+.e__orders-row__filled {
+	color: #7e8b98;
+	font-size: 11px;
+	font-weight: 800;
+	text-align: right;
 	white-space: nowrap;
 }
 
@@ -208,38 +234,41 @@
 	color: #7e8b98;
 	box-shadow: none;
 
-	span {
-		position: relative;
-		width: 11px;
-		height: 11px;
+	svg {
+		width: 16px;
+		height: 16px;
 		display: block;
+	}
 
-		&::before,
-		&::after {
-			content: "";
-			position: absolute;
-			left: 5px;
-			top: 0;
-			width: 1px;
-			height: 11px;
-			border-radius: 999px;
-			background: currentColor;
-		}
+	circle {
+		fill: transparent;
+		stroke: currentColor;
+		stroke-width: 1.5;
+		transition: fill 140ms ease, stroke 140ms ease;
+	}
 
-		&::before {
-			transform: rotate(45deg);
-		}
-
-		&::after {
-			transform: rotate(-45deg);
-		}
+	path {
+		stroke: #f2f6f8;
+		stroke-width: 1.8;
+		stroke-linecap: round;
+		transition: stroke 140ms ease;
 	}
 }
 
-.e__orders-row__cancel:hover {
+.e__orders-row__cancel:hover,
+.e__orders-row__cancel:focus-visible {
 	background: transparent;
 	box-shadow: none;
-	color: #ee5858;
+	color: #f2f6f8;
+
+	circle {
+		fill: #f2f6f8;
+		stroke: #f2f6f8;
+	}
+
+	path {
+		stroke: #000105;
+	}
 }
 
 .e__orders-menu__error,
