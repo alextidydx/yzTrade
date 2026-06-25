@@ -4,6 +4,7 @@ __pycache__/
 .venv/
 uvicorn*.log
 data/app_state.json
+data/balance_history.json
 
 client/node_modules/
 client/dist/

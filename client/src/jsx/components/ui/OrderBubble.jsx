@@ -193,7 +193,8 @@ const OrderBubble = ({
 				<span>Amount</span>
 				<div className="e__order-ticket__input-wrap">
 					<input
-						value={orderTicket.amount}
+						value={Number(orderTicket.amount) === 0 ? "" : orderTicket.amount}
+						placeholder="0"
 						inputMode="decimal"
 						pattern="[0-9]*[.,]?[0-9]*"
 						onChange={event => onAmountChange(event.target.value)}
@@ -217,7 +218,7 @@ const OrderBubble = ({
 				min="0"
 				max="1"
 				step="0.01"
-				value={orderTicket.fraction}
+				value={Number.isFinite(Number(orderTicket.fraction)) ? orderTicket.fraction : 0}
 				onChange={event => onFractionChange(Number(event.target.value))}
 			/>
 

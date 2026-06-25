@@ -34,10 +34,16 @@ PUBLIC_DIR = os.path.join(os.path.dirname(__file__), "public")
 INDEX_HTML = os.path.join(PUBLIC_DIR, "index.html")
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 APP_STATE_FILE = os.getenv("APP_STATE_FILE", os.path.join(DATA_DIR, "app_state.json"))
+BALANCE_HISTORY_FILE = os.getenv("BALANCE_HISTORY_FILE", os.path.join(DATA_DIR, "balance_history.json"))
+BALANCE_HISTORY_BUCKET_SECONDS = 60 * 60
+BALANCE_HISTORY_RETENTION_SECONDS = 5 * 365 * 24 * 60 * 60
 DEFAULT_APP_STATE = {
     "version": 1,
     "yzTrade": {
         "bookmarks": {},
+        "settings": {
+            "balanceHistoryExpanded": False,
+        },
     },
 }
 USD_PEGGED_CURRENCIES = {"USD", "USDC", "USDT", "DAI", "PYUSD"}
@@ -99,6 +105,10 @@ def normalize_app_state(raw_state):
     if not isinstance(bookmarks, dict):
         bookmarks = {}
 
+    settings = normalized["yzTrade"].get("settings")
+    if not isinstance(settings, dict):
+        settings = {}
+
     normalized_bookmarks = {}
     for currency, price in bookmarks.items():
         normalized_currency = str(currency or "").strip().upper()
@@ -113,6 +123,13 @@ def normalize_app_state(raw_state):
 
     normalized["version"] = int(normalized.get("version") or DEFAULT_APP_STATE["version"])
     normalized["yzTrade"]["bookmarks"] = normalized_bookmarks
+    normalized["yzTrade"]["settings"] = {
+        **DEFAULT_APP_STATE["yzTrade"]["settings"],
+        **settings,
+    }
+    normalized["yzTrade"]["settings"]["balanceHistoryExpanded"] = bool(
+        normalized["yzTrade"]["settings"].get("balanceHistoryExpanded")
+    )
 
     return normalized
 
@@ -187,6 +204,129 @@ def delete_app_state_bookmark(currency):
     state.setdefault("yzTrade", {}).setdefault("bookmarks", {}).pop(normalized_currency, None)
 
     return write_app_state(state)
+
+
+def set_app_state_settings(settings):
+    if not isinstance(settings, dict):
+        raise HTTPException(status_code=400, detail="Invalid app settings.")
+
+    state = read_app_state()
+    yztrade = state.setdefault("yzTrade", {})
+    current_settings = yztrade.setdefault("settings", {})
+
+    if "balanceHistoryExpanded" in settings:
+        current_settings["balanceHistoryExpanded"] = bool(settings.get("balanceHistoryExpanded"))
+
+    return write_app_state(state)
+
+
+def normalize_balance_history(raw_history, now=None):
+    rows = raw_history if isinstance(raw_history, list) else []
+    normalized = []
+    reference_time = int(now or time.time())
+    cutoff_time = reference_time - BALANCE_HISTORY_RETENTION_SECONDS
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+
+        try:
+            point_time = int(row.get("time"))
+            total_usd = float(row.get("total_usd"))
+        except (TypeError, ValueError):
+            continue
+
+        if point_time >= cutoff_time and math.isfinite(total_usd) and total_usd >= 0:
+            normalized.append({
+                "time": point_time,
+                "total_usd": round(total_usd, 2),
+            })
+
+    normalized.sort(key=lambda point: point["time"])
+
+    return normalized
+
+
+def read_balance_history():
+    if not os.path.exists(BALANCE_HISTORY_FILE):
+        return []
+
+    try:
+        with open(BALANCE_HISTORY_FILE, "r", encoding="utf-8") as history_file:
+            return normalize_balance_history(json.load(history_file))
+    except (OSError, json.JSONDecodeError):
+        return []
+
+
+def write_balance_history(history):
+    normalized = normalize_balance_history(history)
+    history_dir = os.path.dirname(BALANCE_HISTORY_FILE)
+
+    if history_dir:
+        os.makedirs(history_dir, exist_ok=True)
+
+    fd, temp_path = tempfile.mkstemp(
+        prefix=".balance_history.",
+        suffix=".json",
+        dir=history_dir or None,
+        text=True,
+    )
+
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as temp_file:
+            json.dump(normalized, temp_file, indent=2, sort_keys=True)
+            temp_file.write("\n")
+
+        os.replace(temp_path, BALANCE_HISTORY_FILE)
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+    return normalized
+
+
+def record_balance_history_point(total_usd):
+    try:
+        numeric_total = float(total_usd)
+    except (TypeError, ValueError):
+        return read_balance_history()
+
+    if not math.isfinite(numeric_total) or numeric_total < 0:
+        return read_balance_history()
+
+    now = int(time.time())
+    bucket_time = (now // BALANCE_HISTORY_BUCKET_SECONDS) * BALANCE_HISTORY_BUCKET_SECONDS
+    history = read_balance_history()
+
+    if any(point["time"] == bucket_time for point in history):
+        return history
+
+    history.append({
+        "time": bucket_time,
+        "total_usd": round(numeric_total, 2),
+    })
+
+    return write_balance_history(history)
+
+
+def filter_balance_history(period):
+    history = read_balance_history()
+    normalized_period = str(period or "all").lower()
+
+    period_seconds = {
+        "day": 24 * 60 * 60,
+        "week": 7 * 24 * 60 * 60,
+        "30d": 30 * 24 * 60 * 60,
+        "all": None,
+    }.get(normalized_period, None)
+
+    if period_seconds is None or not history:
+        return history
+
+    cutoff = int(time.time()) - period_seconds
+    filtered = [point for point in history if point["time"] >= cutoff]
+
+    return filtered or history[:1]
 
 
 def load_env_file():
@@ -675,7 +815,15 @@ def normalize_order(order):
             else None
         )
     except (TypeError, ValueError):
+        numeric_base_size = None
+        numeric_filled_size = None
         remaining_size = None
+
+    filled_percent = (
+        max(0, min(100, (numeric_filled_size / numeric_base_size) * 100))
+        if numeric_base_size and numeric_filled_size is not None
+        else None
+    )
 
     numeric_price = parse_order_price(price)
 
@@ -733,6 +881,9 @@ def normalize_order(order):
                 "price": take_profit_price,
                 "amount": remaining_size,
                 "total_value": take_profit_price * remaining_size if remaining_size is not None else None,
+                "base_size": numeric_base_size,
+                "filled_size": numeric_filled_size,
+                "filled_percent": filled_percent,
             })
 
         if stop_loss_price is not None:
@@ -744,6 +895,9 @@ def normalize_order(order):
                 "price": stop_loss_price,
                 "amount": remaining_size,
                 "total_value": stop_loss_price * remaining_size if remaining_size is not None else None,
+                "base_size": numeric_base_size,
+                "filled_size": numeric_filled_size,
+                "filled_percent": filled_percent,
             })
 
     return {
@@ -754,6 +908,9 @@ def normalize_order(order):
         "price": numeric_price,
         "amount": remaining_size,
         "total_value": numeric_total_value,
+        "base_size": numeric_base_size,
+        "filled_size": numeric_filled_size,
+        "filled_percent": filled_percent,
         "quote_size": config.get("quote_size"),
         "order_type": order_type,
         "bracket_legs": bracket_legs,
@@ -968,6 +1125,28 @@ def get_product(
         "base_increment": metadata.get("base_increment"),
         "quote_currency_id": metadata.get("quote_currency_id"),
         "base_currency_id": metadata.get("base_currency_id"),
+    }
+
+
+@app.get("/api/product-stats")
+def get_product_stats(
+    product_id: Annotated[str, Query()] = PRODUCT_ID,
+):
+    normalized_product_id = product_id.upper()
+    stats = coinbase_get(f"/products/{normalized_product_id}/stats")
+    open_price = parse_float(stats.get("open"))
+    last_price = parse_float(stats.get("last"))
+    change_24h = (
+        ((last_price - open_price) / open_price) * 100
+        if open_price and last_price is not None
+        else None
+    )
+
+    return {
+        "product_id": normalized_product_id,
+        "price": last_price,
+        "open_24h": open_price,
+        "change_24h": change_24h,
     }
 
 
@@ -1394,11 +1573,22 @@ def get_balances():
         flush=True,
     )
 
+    record_balance_history_point(total_usd)
+
     return {
         "total_usd": total_usd,
         "priced_total": priced_total,
         "unpriced_total": unpriced_total,
         "balances": balances,
+    }
+
+
+@app.get("/api/balance-history")
+def get_balance_history(
+    period: Annotated[str, Query()] = "all",
+):
+    return {
+        "points": filter_balance_history(period),
     }
 
 
@@ -1456,6 +1646,19 @@ async def remove_app_state_bookmark(currency: str):
     await broadcast_app_state(state, {
         "type": "bookmark_deleted",
         "currency": normalized_currency,
+    })
+
+    return state
+
+
+@app.put("/api/app-state/settings")
+async def put_app_state_settings(body: Annotated[dict, Body()]):
+    async with app_state_lock:
+        state = set_app_state_settings(body)
+
+    await broadcast_app_state(state, {
+        "type": "settings_updated",
+        "settings": state["yzTrade"]["settings"],
     })
 
     return state
@@ -1593,6 +1796,12 @@ async def live_market(
         depth_message = build_depth_message(bids, asks)
         await send_to_client(depth_message)
 
+    def live_timestamp():
+        return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    def log_live(message):
+        print(f"LIVE_TRACE ts={live_timestamp()} {message}", flush=True)
+
     async def stream_market_data():
         subscribe_messages = [
             {
@@ -1604,8 +1813,35 @@ async def live_market(
                 "product_ids": [product_id],
                 "channel": "market_trades",
             },
+            {
+                "type": "subscribe",
+                "product_ids": [product_id],
+                "channel": "ticker",
+            },
         ]
         last_heartbeat_send = 0
+        last_price_message = time.monotonic()
+
+        async def send_price_update(price, size=0, side=None, price_time=None, source="ticker"):
+            nonlocal last_price_message
+
+            if price_time is None:
+                price_time = datetime.now(timezone.utc)
+
+            bucket_time = int(price_time.timestamp()) // candle_granularity * candle_granularity
+            last_price_message = time.monotonic()
+
+            await send_to_client({
+                "type": "trade",
+                "product_id": product_id,
+                "granularity": candle_granularity,
+                "time": bucket_time,
+                "price": price,
+                "size": size,
+                "side": side,
+                "trade_time": price_time.isoformat(),
+                "source": source,
+            })
 
         async with websockets.connect(
             COINBASE_WS_API,
@@ -1623,7 +1859,7 @@ async def live_market(
                 "product_id": product_id,
                 "granularity": candle_granularity,
             })
-            print(f"COINBASE LIVE MARKET OK product={product_id}", flush=True)
+            log_live(f"PRICE_CONNECTED product={product_id} channels=market_trades,ticker")
 
             while True:
                 try:
@@ -1632,15 +1868,54 @@ async def live_market(
                         timeout=COINBASE_LIVE_STALE_SECONDS,
                     )
                 except asyncio.TimeoutError:
+                    age = time.monotonic() - last_price_message
+                    log_live(
+                        "PRICE_STALLED "
+                        f"product={product_id} "
+                        f"age={age:.1f}s "
+                        f"limit={COINBASE_LIVE_STALE_SECONDS}s "
+                        "action=reconnect"
+                    )
                     await send_to_client({
                         "type": "error",
                         "stream": "market",
                         "product_id": product_id,
-                        "message": f"Live Coinbase market stream stale for {COINBASE_LIVE_STALE_SECONDS}s.",
+                        "timestamp": live_timestamp(),
+                        "message": (
+                            f"PRICE_STALLED product={product_id} "
+                            f"age={age:.1f}s limit={COINBASE_LIVE_STALE_SECONDS}s action=reconnect"
+                        ),
                     })
-                    raise RuntimeError(f"Coinbase market stream stale for {COINBASE_LIVE_STALE_SECONDS}s")
+                    raise RuntimeError(
+                        f"PRICE_STALLED product={product_id} "
+                        f"age={age:.1f}s limit={COINBASE_LIVE_STALE_SECONDS}s"
+                    )
 
                 data = json.loads(raw_message)
+                price_age = time.monotonic() - last_price_message
+
+                if price_age > COINBASE_LIVE_STALE_SECONDS:
+                    log_live(
+                        "PRICE_STALLED "
+                        f"product={product_id} "
+                        f"age={price_age:.1f}s "
+                        f"limit={COINBASE_LIVE_STALE_SECONDS}s "
+                        "action=reconnect"
+                    )
+                    await send_to_client({
+                        "type": "error",
+                        "stream": "market",
+                        "product_id": product_id,
+                        "timestamp": live_timestamp(),
+                        "message": (
+                            f"PRICE_STALLED product={product_id} "
+                            f"age={price_age:.1f}s limit={COINBASE_LIVE_STALE_SECONDS}s action=reconnect"
+                        ),
+                    })
+                    raise RuntimeError(
+                        f"PRICE_STALLED product={product_id} "
+                        f"age={price_age:.1f}s limit={COINBASE_LIVE_STALE_SECONDS}s"
+                    )
 
                 if data.get("channel") == "heartbeats":
                     now = time.monotonic()
@@ -1667,18 +1942,40 @@ async def live_market(
                             except (TypeError, ValueError, KeyError):
                                 continue
 
-                            bucket_time = int(traded_at.timestamp()) // candle_granularity * candle_granularity
+                            await send_price_update(
+                                price,
+                                size=size,
+                                side=trade.get("side"),
+                                price_time=traded_at,
+                                source="market_trades",
+                            )
+                elif data.get("channel") in ("ticker", "ticker_batch"):
+                    for event in data.get("events", []):
+                        tickers = event.get("tickers", [])
 
-                            await send_to_client({
-                                "type": "trade",
-                                "product_id": product_id,
-                                "granularity": candle_granularity,
-                                "time": bucket_time,
-                                "price": price,
-                                "size": size,
-                                "side": trade.get("side"),
-                                "trade_time": trade.get("time"),
-                            })
+                        for ticker in tickers:
+                            if str(ticker.get("product_id", "")).upper() != product_id:
+                                continue
+
+                            try:
+                                price = float(ticker["price"])
+                            except (TypeError, ValueError, KeyError):
+                                continue
+
+                            ticker_time = None
+                            raw_time = ticker.get("time") or event.get("time") or data.get("timestamp")
+
+                            if raw_time:
+                                try:
+                                    ticker_time = datetime.fromisoformat(str(raw_time).replace("Z", "+00:00"))
+                                except ValueError:
+                                    ticker_time = None
+
+                            await send_price_update(
+                                price,
+                                price_time=ticker_time,
+                                source=str(data.get("channel")),
+                            )
 
     async def stream_depth_data():
         subscribe_messages = [
@@ -1722,13 +2019,26 @@ async def live_market(
                         timeout=COINBASE_LIVE_STALE_SECONDS,
                     )
                 except asyncio.TimeoutError:
+                    log_live(
+                        "DEPTH_STALLED "
+                        f"product={product_id} "
+                        f"limit={COINBASE_LIVE_STALE_SECONDS}s "
+                        "action=reconnect"
+                    )
                     await send_to_client({
                         "type": "error",
                         "stream": "depth",
                         "product_id": product_id,
-                        "message": f"Live Coinbase depth stream stale for {COINBASE_LIVE_STALE_SECONDS}s.",
+                        "timestamp": live_timestamp(),
+                        "message": (
+                            f"DEPTH_STALLED product={product_id} "
+                            f"limit={COINBASE_LIVE_STALE_SECONDS}s action=reconnect"
+                        ),
                     })
-                    raise RuntimeError(f"Coinbase depth stream stale for {COINBASE_LIVE_STALE_SECONDS}s")
+                    raise RuntimeError(
+                        f"DEPTH_STALLED product={product_id} "
+                        f"limit={COINBASE_LIVE_STALE_SECONDS}s"
+                    )
 
                 data = json.loads(raw_message)
 
@@ -1872,12 +2182,7 @@ async def live_market(
         while True:
             try:
                 if retry_index:
-                    print(
-                        "COINBASE LIVE STREAM RECONNECTING "
-                        f"stream={name} "
-                        f"product={product_id}",
-                        flush=True,
-                    )
+                    log_live(f"RECONNECTING stream={name} product={product_id}")
 
                 await stream()
                 await send_to_client({
@@ -1899,18 +2204,18 @@ async def live_market(
             except Exception as exc:
                 delay = retry_delays[min(retry_index, len(retry_delays) - 1)]
                 retry_index += 1
-                print(
-                    "COINBASE LIVE STREAM DISCONNECTED "
+                log_live(
+                    "STREAM_ERROR "
                     f"stream={name} "
                     f"product={product_id} "
                     f"error={exc} "
-                    f"reconnect_in={delay}s",
-                    flush=True,
+                    f"reconnect_in={delay}s"
                 )
                 await send_to_client({
                     "type": "order_stream_error" if name == "orders" else "error",
                     "stream": name,
                     "product_id": product_id,
+                    "timestamp": live_timestamp(),
                     "message": f"Live Coinbase {name} stream failed: {exc}. Reconnecting in {delay}s.",
                     "reconnect_in": delay,
                 })
