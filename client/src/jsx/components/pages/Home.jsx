@@ -22,13 +22,11 @@ import {
 
 import {
 	BUY_FEE_ESTIMATE_RATE,
-	DEFAULT_BASE_CURRENCY,
 	DEPTH_RANGE_PADDING,
 	DISTRIBUTION_BINS,
 	DROPDOWN_TRANSITION_MS,
 	INDICATOR_COOKIES,
 	MIN_DEPTH_WIDTH_RATIO,
-	MONITOR_TICKERS,
 	ORDER_TICKET_ANCHOR_OFFSET_Y,
 	ORDER_TICKET_FALLBACK_HEIGHT,
 	ORDER_TICKET_RIGHT_OFFSET,
@@ -40,11 +38,11 @@ import {
 } from "../../../utils/homeConstants";
 
 import {
-	chartDayFormatter,
 	chartFullTimeFormatter,
 	chartTimeFormatter,
 	deleteBookmarkedPrice,
 	estimateBuyQuoteSizeFromTotal,
+	buildEasternTimelineTimes,
 	formatAmountWithIncrementFloor,
 	formatBalanceAmount,
 	formatChartEasternTime,
@@ -56,13 +54,17 @@ import {
 	formatPriceWithIncrement,
 	formatSignedPercent,
 	formatSignedUsdCents,
+	formatTimelineTickLabel,
 	formatUsdAmountInput,
 	formatUsdCents,
 	formatUsdValue,
 	getBaseCurrencyFromPath,
 	getBookmarkedPrice,
 	getCookieBoolean,
+	buildOptimisticOrderFromPlacement,
+	enrichOrderForDisplay,
 	getOrderErrorLabel,
+	mergeOrderFields,
 	getPrecisionFromIncrement,
 	getRoutePrefix,
 	getVwapSessionKey,
@@ -77,7 +79,8 @@ export default (props) => (
 );
 
 const APP_STATE_STALE_TIMEOUT_MS = 15000;
-const LIVE_STALE_TIMEOUT_MS = 40000;
+const LIVE_STALE_TIMEOUT_MS = 60000;
+const LIVE_CONNECT_TIMEOUT_MS = 15000;
 
 class Home extends React.Component {
 	container = React.createRef();
@@ -88,6 +91,8 @@ class Home extends React.Component {
 
 	state = {
 		candles: [],
+		historicalCandles: [],
+		currentCandle: null,
 		depth: null,
 		orders: [],
 		allOrders: [],
@@ -111,11 +116,9 @@ class Home extends React.Component {
 		},
 		isOrdersLoading: false,
 		allOrdersError: "",
-		monitorTickers: MONITOR_TICKERS.map(currency => ({
-			currency,
-			change_24h: null,
-		})),
+		monitorTickers: [],
 		monitorError: "",
+		defaultBaseCurrency: "",
 		appBookmarks: null,
 		appSettings: {
 			balanceHistoryExpanded: false,
@@ -178,6 +181,7 @@ class Home extends React.Component {
 	liveReconnectTimer = null;
 	liveReconnectAttempt = 0;
 	liveReconnectConfig = null;
+	liveConnectTimeout = null;
 	liveWatchdogTimer = null;
 	lastLiveMessageAt = 0;
 	liveFlushTimer = null;
@@ -198,6 +202,7 @@ class Home extends React.Component {
 	lastTdRefreshBoundary = null;
 	tdRefreshInFlight = false;
 	marketRequestId = 0;
+	candleRollRequestId = 0;
 	isMarketTransitioning = false;
 	isDisconnectingLive = false;
 	suppressMeasurementClick = false;
@@ -214,17 +219,58 @@ class Home extends React.Component {
 		this.initChart();
 		this.loadAppState();
 		this.connectAppStateSocket();
-		this.loadMarket();
-		this.loadProfile();
+		this.bootstrapFromConfig();
 		this.loadBalanceHistory();
-		this.loadAllOrders();
-		this.loadMonitorTickers();
 		this.profileRefreshTimer = window.setInterval(this.loadProfile, 5000);
 		this.allOrdersRefreshTimer = window.setInterval(this.loadAllOrders, 5000);
 		this.balanceHistoryRefreshTimer = window.setInterval(this.loadBalanceHistory, 60000);
 		this.monitorRefreshTimer = window.setInterval(this.loadMonitorTickers, 60000);
 		this.productStatsRefreshTimer = window.setInterval(this.loadProductStats, 30000);
 	}
+
+	bootstrapFromConfig = () => {
+		const pathCurrency = getBaseCurrencyFromPath(this.props.history.pathname);
+
+		api.getMonitorConfig().then(response => {
+			const tickers = Array.isArray(response.data?.tickers) ? response.data.tickers : [];
+			const defaultBaseCurrency = String(
+				response.data?.default_base_currency || tickers[0] || "",
+			).trim().toUpperCase();
+			const baseCurrency = pathCurrency || defaultBaseCurrency;
+			const monitorTickers = tickers.map(currency => ({
+				currency: String(currency).trim().toUpperCase(),
+				change_24h: null,
+			}));
+
+			this.setState({
+				defaultBaseCurrency,
+				monitorTickers,
+				baseCurrency,
+				loadedBaseCurrency: pathCurrency,
+			}, () => {
+				this.loadMarket();
+				this.loadProfile();
+				this.loadAllOrders();
+				this.loadMonitorTickers();
+			});
+		}).catch(error => {
+			if (pathCurrency) {
+				this.setState({ baseCurrency: pathCurrency }, () => {
+					this.loadMarket();
+					this.loadProfile();
+					this.loadAllOrders();
+					this.loadMonitorTickers();
+				});
+				return;
+			}
+
+			this.setState({
+				monitorError: error.response?.data?.detail || error.message || "Unable to load monitor config.",
+				error: "Unable to load monitor config.",
+				isLoading: false,
+			});
+		});
+	};
 
 	componentDidUpdate(prevProps, prevState) {
 		if (
@@ -245,7 +291,10 @@ class Home extends React.Component {
 
 		if (prevProps.history.pathname === this.props.history.pathname) return;
 
-		const baseCurrency = getBaseCurrencyFromPath(this.props.history.pathname);
+		const baseCurrency = getBaseCurrencyFromPath(
+			this.props.history.pathname,
+			this.state.defaultBaseCurrency,
+		);
 
 		if (baseCurrency === this.state.baseCurrency) return;
 
@@ -1054,6 +1103,273 @@ class Home extends React.Component {
 		return Number(this.state.loadedPeriodDays) <= 7 ? 3600 : 21600;
 	};
 
+	findCandleIndexByTime = (candles, time) => {
+		const targetTime = Number(time);
+
+		if (!Array.isArray(candles) || !Number.isFinite(targetTime)) return -1;
+
+		let low = 0;
+		let high = candles.length - 1;
+
+		while (low <= high) {
+			const middle = Math.floor((low + high) / 2);
+			const candleTime = Number(candles[middle].time);
+
+			if (candleTime === targetTime) return middle;
+			if (candleTime < targetTime) low = middle + 1;
+			else high = middle - 1;
+		}
+
+		return -1;
+	};
+
+	buildDisplayCandles = (historicalCandles, currentCandle) => {
+		const historical = Array.isArray(historicalCandles) ? historicalCandles : [];
+
+		if (!currentCandle) return historical;
+
+		const lastHistorical = historical[historical.length - 1];
+
+		if (lastHistorical && Number(lastHistorical.time) === Number(currentCandle.time)) {
+			return [...historical.slice(0, -1), currentCandle];
+		}
+
+		return [...historical, currentCandle];
+	};
+
+	splitCandlesFromApi = (candles) => {
+		if (!Array.isArray(candles) || !candles.length) {
+			return { historicalCandles: [], currentCandle: null };
+		}
+
+		return {
+			historicalCandles: candles.slice(0, -1),
+			currentCandle: { ...candles[candles.length - 1] },
+		};
+	};
+
+	setCandleData = (historicalCandles, currentCandle, extraState = null, callback) => {
+		this.setState({
+			historicalCandles,
+			currentCandle,
+			candles: this.buildDisplayCandles(historicalCandles, currentCandle),
+			...(extraState || {}),
+		}, callback);
+	};
+
+	fetchOfficialRecentCandles = (endTime, limit = 3) => {
+		const baseCurrency = (this.state.loadedBaseCurrency || this.state.baseCurrency).trim().toUpperCase();
+		const granularity = this.getLoadedCandleGranularity();
+
+		if (!baseCurrency || !Number.isFinite(Number(endTime))) {
+			return Promise.resolve([]);
+		}
+
+		return api.getCandles({
+			product_id: `${baseCurrency}-USD`,
+			days: Number(this.state.loadedPeriodDays) || 7,
+			granularity,
+			end_time: Math.max(0, Math.floor(Number(endTime))),
+			limit: Math.max(1, Math.min(300, limit)),
+			_: Date.now(),
+		}).then(response => this.normalizeCandles(response.data))
+			.catch(() => []);
+	};
+
+	mergeOfficialIntoHistorical = (historicalCandles, officialCandles, beforeTime) => {
+		const byTime = new Map();
+
+		(Array.isArray(historicalCandles) ? historicalCandles : []).forEach(candle => {
+			byTime.set(Number(candle.time), candle);
+		});
+
+		(Array.isArray(officialCandles) ? officialCandles : []).forEach(candle => {
+			const time = Number(candle.time);
+
+			if (Number.isFinite(time) && time < beforeTime) {
+				byTime.set(time, candle);
+			}
+		});
+
+		return [...byTime.values()].sort((left, right) => Number(left.time) - Number(right.time));
+	};
+
+	finalizeBucketRolls = (historicalCandles, rolls) => {
+		if (!Array.isArray(rolls) || !rolls.length) {
+			return Promise.resolve(historicalCandles);
+		}
+
+		const rollRequestId = ++this.candleRollRequestId;
+		const newestOpenBucket = Number(rolls[rolls.length - 1].openBucketTime);
+		const endTime = newestOpenBucket - 1;
+
+		return this.fetchOfficialRecentCandles(endTime, rolls.length + 5).then(officialCandles => {
+			if (rollRequestId !== this.candleRollRequestId) {
+				return historicalCandles;
+			}
+
+			return this.mergeOfficialIntoHistorical(
+				historicalCandles,
+				officialCandles,
+				newestOpenBucket,
+			);
+		});
+	};
+
+	mergeTradeIntoCurrentCandle = (currentCandle, trade) => {
+		const price = Number(trade.price);
+		const size = Number(trade.size) || 0;
+		const source = String(trade.source || "");
+		const isTickerUpdate = source === "ticker" || source === "ticker_batch";
+
+		return {
+			...currentCandle,
+			high: Math.max(currentCandle.high, price),
+			low: Math.min(currentCandle.low, price),
+			close: price,
+			volume: isTickerUpdate
+				? currentCandle.volume
+				: (currentCandle.volume || 0) + size,
+		};
+	};
+
+	createCurrentCandleFromTrade = (trade, priorClose) => {
+		const price = Number(trade.price);
+		const size = Number(trade.size) || 0;
+		const time = Number(trade.time);
+		const source = String(trade.source || "");
+		const isTickerUpdate = source === "ticker" || source === "ticker_batch";
+		const openPrice = isTickerUpdate
+			? (Number.isFinite(Number(priorClose)) ? Number(priorClose) : price)
+			: price;
+
+		return {
+			time,
+			open: openPrice,
+			high: Math.max(openPrice, price),
+			low: Math.min(openPrice, price),
+			close: price,
+			volume: isTickerUpdate ? 0 : size,
+		};
+	};
+
+	processLiveTradeBatch = (historicalCandles, currentCandle, trades) => {
+		let current = currentCandle ? { ...currentCandle } : null;
+		const rolls = [];
+		let changed = false;
+		let didStartNewCandle = false;
+		let latestCandleTime = null;
+		let latestPrice = null;
+
+		trades.forEach(trade => {
+			const price = Number(trade.price);
+			const time = Number(trade.time);
+			const source = String(trade.source || "");
+			const isTickerUpdate = source === "ticker" || source === "ticker_batch";
+
+			if (!Number.isFinite(price) || !Number.isFinite(time)) return;
+
+			latestPrice = price;
+
+			if (!current) {
+				if (isTickerUpdate) return;
+
+				current = this.createCurrentCandleFromTrade(trade, null);
+				changed = true;
+				latestCandleTime = time;
+				return;
+			}
+
+			if (time < current.time) return;
+
+			if (time === current.time) {
+				current = this.mergeTradeIntoCurrentCandle(current, trade);
+				changed = true;
+				latestCandleTime = time;
+				return;
+			}
+
+			rolls.push({
+				closedBucketTime: current.time,
+				openBucketTime: time,
+			});
+			didStartNewCandle = true;
+			changed = true;
+			latestCandleTime = time;
+			current = this.createCurrentCandleFromTrade(trade, current.close);
+		});
+
+		return {
+			historicalCandles,
+			currentCandle: current,
+			rolls,
+			changed,
+			didStartNewCandle,
+			latestCandleTime,
+			latestPrice,
+		};
+	};
+
+	buildDepthStateFromMessage = (prev, depthMessage, latestPrice) => {
+		if (
+			!depthMessage?.depth
+			|| !Array.isArray(depthMessage.depth.bids)
+			|| !Array.isArray(depthMessage.depth.asks)
+			|| !prev.depth
+		) {
+			return prev.depth;
+		}
+
+		const minPrice = Number(prev.depth.min_price);
+		const maxPrice = Number(prev.depth.max_price);
+		const isInRange = level => {
+			const levelPrice = Number(level.price);
+
+			return Number.isFinite(levelPrice)
+				&& (!Number.isFinite(minPrice) || levelPrice >= minPrice)
+				&& (!Number.isFinite(maxPrice) || levelPrice <= maxPrice);
+		};
+		const bids = depthMessage.depth.bids.filter(isInRange);
+		const asks = depthMessage.depth.asks.filter(isInRange);
+
+		if (!bids.length && !asks.length) return prev.depth;
+
+		return {
+			...prev.depth,
+			current_price: Number.isFinite(Number(depthMessage.depth.current_price))
+				? Number(depthMessage.depth.current_price)
+				: Number.isFinite(latestPrice)
+					? latestPrice
+					: prev.depth.current_price,
+			bids,
+			asks,
+		};
+	};
+
+	updateCurrentCandleOnChart = (currentCandle, highlightedIndex = this.state.hoveredVolumeIndex) => {
+		if (!currentCandle || !this.candleSeries) return;
+
+		this.candleSeries.update(currentCandle);
+
+		if (!this.volumeSeries) return;
+
+		this.volumeSeries.update({
+			time: currentCandle.time,
+			value: this.getCandleVolumeUsd(currentCandle),
+			color: this.getVolumeBarColor(
+				currentCandle,
+				highlightedIndex === this.state.candles.length - 1,
+			),
+		});
+	};
+
+	syncCandleSeries = (candles = this.state.candles) => {
+		if (!Array.isArray(candles) || !candles.length) return;
+
+		this.candleSeries?.setData(candles);
+		this.syncVolumeSeries(candles);
+	};
+
 	loadOlderCandles = () => {
 		if (
 			this.isMarketTransitioning
@@ -1065,7 +1381,7 @@ class Home extends React.Component {
 			return;
 		}
 
-		const oldestCandle = this.state.candles[0];
+		const oldestCandle = this.state.historicalCandles[0] || this.state.candles[0];
 		const oldestTime = Number(oldestCandle?.time);
 		const baseCurrency = (this.state.loadedBaseCurrency || this.state.baseCurrency).trim().toUpperCase();
 		const granularity = this.getLoadedCandleGranularity();
@@ -1098,20 +1414,17 @@ class Home extends React.Component {
 
 			const candlesByTime = new Map();
 
-			[...olderCandles, ...this.state.candles].forEach(candle => {
+			[...olderCandles, ...this.state.historicalCandles].forEach(candle => {
 				candlesByTime.set(Number(candle.time), candle);
 			});
 
-			const candles = [...candlesByTime.values()]
+			const historicalCandles = [...candlesByTime.values()]
 				.sort((a, b) => Number(a.time) - Number(b.time));
 
-			this.setState({
-				candles,
-			}, () => {
-				this.candleSeries?.setData(candles);
-				this.syncVolumeSeries(candles);
-				this.syncVwapSeries(candles);
-				this.syncTdSequentialSeries(this.state.tdSequential, candles);
+			this.setCandleData(historicalCandles, this.state.currentCandle, null, () => {
+				this.syncCandleSeries(this.state.candles);
+				this.syncVwapSeries(this.state.candles);
+				this.syncTdSequentialSeries(this.state.tdSequential, this.state.candles);
 
 				window.requestAnimationFrame(() => {
 					this.setState({
@@ -1361,10 +1674,6 @@ class Home extends React.Component {
 	disconnectLiveMarket = () => {
 		this.isDisconnectingLive = true;
 		this.clearTdRefreshTimers();
-		this.clearLiveWatchdog();
-		this.clearLiveFlushTimer();
-		this.pendingLiveTrades = [];
-		this.pendingLiveDepth = null;
 
 		if (this.liveReconnectTimer) {
 			window.clearTimeout(this.liveReconnectTimer);
@@ -1373,21 +1682,39 @@ class Home extends React.Component {
 
 		this.liveReconnectAttempt = 0;
 		this.liveReconnectConfig = null;
+		this.closeLiveSocketOnly();
+		this.setState({ isLive: false });
+		this.isDisconnectingLive = false;
+	};
+
+	closeLiveSocketOnly = () => {
+		this.clearLiveWatchdog();
+		this.clearLiveFlushTimer();
+		this.pendingLiveTrades = [];
+		this.pendingLiveDepth = null;
+
+		if (this.liveConnectTimeout) {
+			window.clearTimeout(this.liveConnectTimeout);
+			this.liveConnectTimeout = null;
+		}
 
 		if (!this.liveSocket) {
-			this.isDisconnectingLive = false;
 			return;
 		}
 
-		this.liveSocket.onopen = null;
-		this.liveSocket.onmessage = null;
-		this.liveSocket.onerror = null;
-		this.liveSocket.onclose = null;
-		this.liveSocket.close();
+		const socket = this.liveSocket;
 		this.liveSocket = null;
 		this.liveProductId = null;
-		this.setState({ isLive: false });
-		this.isDisconnectingLive = false;
+		socket.onopen = null;
+		socket.onmessage = null;
+		socket.onerror = null;
+		socket.onclose = null;
+
+		try {
+			socket.close();
+		} catch {
+			// ignore close errors on dead sockets
+		}
 	};
 
 	clearLiveWatchdog = () => {
@@ -1430,7 +1757,11 @@ class Home extends React.Component {
 	};
 
 	scheduleLiveReconnect = () => {
-		if (this.isDisconnectingLive || !this.liveReconnectConfig || this.liveReconnectTimer) return;
+		if (this.isDisconnectingLive || !this.liveReconnectConfig) return;
+
+		if (this.liveReconnectTimer) {
+			return;
+		}
 
 		const delays = [1000, 2000, 5000, 10000];
 		const baseDelay = delays[Math.min(this.liveReconnectAttempt, delays.length - 1)];
@@ -1467,7 +1798,17 @@ class Home extends React.Component {
 		this.openLiveSocket(this.liveReconnectConfig);
 	};
 
+	markLiveConnected = () => {
+		this.liveReconnectAttempt = 0;
+		this.setState(prev => ({
+			isLive: true,
+			error: prev.error === "Live stream connection failed." ? "" : prev.error,
+		}));
+	};
+
 	openLiveSocket = ({ productId, periodDays, periodGranularity, depth }) => {
+		this.closeLiveSocketOnly();
+
 		const url = new URL(`${getWebSocketBase()}/api/live`);
 		url.searchParams.set("product_id", productId);
 		url.searchParams.set("days", String(periodDays));
@@ -1490,8 +1831,26 @@ class Home extends React.Component {
 		this.scheduleLiveWatchdog();
 		this.setState({ isLive: false });
 
+		this.liveConnectTimeout = window.setTimeout(() => {
+			if (socket !== this.liveSocket || socket.readyState === WebSocket.OPEN) {
+				return;
+			}
+
+			console.warn("[live] connect timeout; closing socket to reconnect", {
+				timestamp: this.getLiveLogTimestamp(),
+				productId,
+				readyState: socket.readyState,
+			});
+			socket.close();
+		}, LIVE_CONNECT_TIMEOUT_MS);
+
 		socket.onopen = () => {
 			if (socket === this.liveSocket) {
+				if (this.liveConnectTimeout) {
+					window.clearTimeout(this.liveConnectTimeout);
+					this.liveConnectTimeout = null;
+				}
+
 				console.info("[live] socket open", {
 					timestamp: this.getLiveLogTimestamp(),
 					productId,
@@ -1510,7 +1869,13 @@ class Home extends React.Component {
 				return;
 			}
 
-			if (socket !== this.liveSocket || message.product_id !== this.liveProductId) return;
+			if (socket !== this.liveSocket) return;
+
+			if (message.product_id && message.product_id !== this.liveProductId) return;
+
+			if (message.type !== "orders_update") {
+				this.markLiveMessage();
+			}
 
 			if (message.type === "subscribed") {
 				if (message.stream === "market") {
@@ -1518,9 +1883,7 @@ class Home extends React.Component {
 						timestamp: this.getLiveLogTimestamp(),
 						productId: message.product_id,
 					});
-					this.markLiveMessage();
-					this.liveReconnectAttempt = 0;
-					this.setState({ isLive: true });
+					this.markLiveConnected();
 				} else if (message.stream === "orders") {
 					console.info("[live] orders subscribed", {
 						timestamp: this.getLiveLogTimestamp(),
@@ -1534,22 +1897,15 @@ class Home extends React.Component {
 					});
 				}
 			} else if (message.type === "trade") {
-				this.markLiveMessage();
-				if (!this.state.isLive) {
-					this.setState({ isLive: true });
-				}
+				this.markLiveConnected();
 				this.queueLiveTrade(message);
 			} else if (message.type === "orders_update") {
 				this.applyLiveOrders(message);
 			} else if (message.type === "depth_update") {
 				this.queueLiveDepth(message);
 			} else if (message.type === "heartbeat") {
-				if (message.stream === "market") {
-					this.markLiveMessage();
-
-					if (!this.state.isLive) {
-						this.setState({ isLive: true });
-					}
+				if (message.stream === "market" || message.stream === "connection") {
+					this.markLiveConnected();
 				}
 			} else if (message.type === "order_stream_error") {
 				this.setState({
@@ -1568,28 +1924,39 @@ class Home extends React.Component {
 		};
 
 		socket.onerror = () => {
-			if (socket === this.liveSocket) {
-				console.error("[live] socket error", {
-					timestamp: this.getLiveLogTimestamp(),
-					productId,
-				});
-				this.setState({
-					error: "Live stream connection failed.",
-					isLive: false,
-				});
+			if (socket !== this.liveSocket) return;
+
+			console.error("[live] socket error", {
+				timestamp: this.getLiveLogTimestamp(),
+				productId,
+			});
+			this.setState({
+				error: "Live stream connection failed.",
+				isLive: false,
+			});
+
+			if (!this.isDisconnectingLive) {
 				this.scheduleLiveReconnect();
 			}
 		};
 
 		socket.onclose = () => {
-			if (socket === this.liveSocket) {
-				console.warn("[live] socket closed", {
-					timestamp: this.getLiveLogTimestamp(),
-					productId,
-				});
-				this.clearLiveWatchdog();
-				this.liveSocket = null;
-				this.setState({ isLive: false });
+			if (socket !== this.liveSocket) return;
+
+			if (this.liveConnectTimeout) {
+				window.clearTimeout(this.liveConnectTimeout);
+				this.liveConnectTimeout = null;
+			}
+
+			console.warn("[live] socket closed", {
+				timestamp: this.getLiveLogTimestamp(),
+				productId,
+			});
+			this.clearLiveWatchdog();
+			this.liveSocket = null;
+			this.setState({ isLive: false });
+
+			if (!this.isDisconnectingLive) {
 				this.scheduleLiveReconnect();
 			}
 		};
@@ -1621,7 +1988,8 @@ class Home extends React.Component {
 	flushLiveUpdates = () => {
 		this.liveFlushTimer = null;
 
-		const trades = this.pendingLiveTrades;
+		const trades = [...this.pendingLiveTrades]
+			.sort((left, right) => Number(left.time) - Number(right.time));
 		const depth = this.pendingLiveDepth;
 		this.pendingLiveTrades = [];
 		this.pendingLiveDepth = null;
@@ -1660,20 +2028,20 @@ class Home extends React.Component {
 
 			if (!bids.length && !asks.length) return null;
 
-			const candles = [...prev.candles];
-			const lastCandle = candles[candles.length - 1];
+			let currentCandle = prev.currentCandle;
 
-			if (lastCandle && Number.isFinite(currentPrice)) {
-				candles[candles.length - 1] = {
-					...lastCandle,
-					high: Math.max(lastCandle.high, currentPrice),
-					low: Math.min(lastCandle.low, currentPrice),
+			if (currentCandle && Number.isFinite(currentPrice)) {
+				currentCandle = {
+					...currentCandle,
+					high: Math.max(currentCandle.high, currentPrice),
+					low: Math.min(currentCandle.low, currentPrice),
 					close: currentPrice,
 				};
 			}
 
 			return {
-				candles,
+				currentCandle,
+				candles: this.buildDisplayCandles(prev.historicalCandles, currentCandle),
 				depth: {
 					...prev.depth,
 					current_price: Number.isFinite(currentPrice)
@@ -1684,10 +2052,8 @@ class Home extends React.Component {
 				},
 			};
 		}, () => {
-			const candle = this.state.candles[this.state.candles.length - 1];
-
-			if (candle) {
-				this.candleSeries?.update(candle);
+			if (this.state.currentCandle) {
+				this.updateCurrentCandleOnChart(this.state.currentCandle);
 				this.syncVwapSeries(this.state.candles);
 			}
 
@@ -1714,24 +2080,14 @@ class Home extends React.Component {
 
 		(Array.isArray(orders) ? orders : []).forEach(order => {
 			if (order?.id && !removedOrderIds.has(order.id)) {
-				ordersById.set(order.id, order);
+				ordersById.set(order.id, enrichOrderForDisplay(order));
 			}
 		});
 
 		updatedOrders.forEach(order => {
 			if (order?.id) {
 				const existing = ordersById.get(order.id);
-				const nextOrder = { ...existing, ...order };
-
-				if (
-					(!Array.isArray(nextOrder.bracket_legs) || !nextOrder.bracket_legs.length)
-					&& Array.isArray(existing?.bracket_legs)
-					&& existing.bracket_legs.length
-				) {
-					nextOrder.bracket_legs = existing.bracket_legs;
-				}
-
-				ordersById.set(order.id, nextOrder);
+				ordersById.set(order.id, mergeOrderFields(existing, order));
 			}
 		});
 
@@ -1743,123 +2099,71 @@ class Home extends React.Component {
 	};
 
 	applyLiveTrades = (trades, depthMessage = null) => {
-		let didStartNewCandle = false;
-		let latestCandleTime = null;
-		let latestPrice = null;
-
 		if (!Array.isArray(trades) || !trades.length) return;
 
-		this.setState(prev => {
-			const candles = [...prev.candles];
-			let depth = prev.depth;
-			let didUpdateCandles = false;
+		const sortedTrades = [...trades].sort((left, right) => Number(left.time) - Number(right.time));
+		const processed = this.processLiveTradeBatch(
+			this.state.historicalCandles,
+			this.state.currentCandle,
+			sortedTrades,
+		);
+		const depth = this.buildDepthStateFromMessage(this.state, depthMessage, processed.latestPrice);
+		const depthChanged = depth !== this.state.depth;
 
-			trades.forEach(trade => {
-				const price = Number(trade.price);
-				const size = Number(trade.size) || 0;
-				const time = Number(trade.time);
-				const source = String(trade.source || "");
-				const isTickerUpdate = source === "ticker" || source === "ticker_batch";
+		if (!processed.changed && !depthChanged) return;
 
-				if (!Number.isFinite(price) || !Number.isFinite(time)) return;
-
-				const last = candles[candles.length - 1];
-
-				if (!last || time > last.time) {
-					if (isTickerUpdate) return;
-
-					didStartNewCandle = true;
-					latestCandleTime = time;
-					latestPrice = price;
-					didUpdateCandles = true;
-					candles.push({
-						time,
-						open: price,
-						high: price,
-						low: price,
-						close: price,
-						volume: size,
-					});
-				} else if (time === last.time) {
-					latestCandleTime = time;
-					latestPrice = price;
-					didUpdateCandles = true;
-					candles[candles.length - 1] = {
-						...last,
-						high: Math.max(last.high, price),
-						low: Math.min(last.low, price),
-						close: price,
-						volume: isTickerUpdate
-							? last.volume
-							: (last.volume || 0) + size,
-					};
-				}
-			});
-
-			if (!didUpdateCandles && !depthMessage?.depth) return null;
-
-			if (
-				depthMessage?.depth
-				&& Array.isArray(depthMessage.depth.bids)
-				&& Array.isArray(depthMessage.depth.asks)
-				&& prev.depth
-			) {
-				const minPrice = Number(prev.depth.min_price);
-				const maxPrice = Number(prev.depth.max_price);
-				const isInRange = level => {
-					const levelPrice = Number(level.price);
-
-					return Number.isFinite(levelPrice)
-						&& (!Number.isFinite(minPrice) || levelPrice >= minPrice)
-						&& (!Number.isFinite(maxPrice) || levelPrice <= maxPrice);
-				};
-				const bids = depthMessage.depth.bids.filter(isInRange);
-				const asks = depthMessage.depth.asks.filter(isInRange);
-
-				if (bids.length || asks.length) {
-					depth = {
-						...prev.depth,
-						current_price: Number.isFinite(Number(depthMessage.depth.current_price))
-							? Number(depthMessage.depth.current_price)
-							: Number.isFinite(latestPrice)
-								? latestPrice
-								: prev.depth.current_price,
-						bids,
-						asks,
-					};
-				}
-			}
-
-			return {
-				candles,
-				depth: depth
-					? {
+		const finishUpdate = (historicalCandles, currentCandle, didStartNewCandle, latestCandleTime, chartChanged) => {
+			const depthState = depthChanged
+				? {
+					depth: {
 						...depth,
-						current_price: Number.isFinite(latestPrice)
-							? latestPrice
+						current_price: Number.isFinite(processed.latestPrice)
+							? processed.latestPrice
 							: depth.current_price,
+					},
+				}
+				: null;
+
+			this.setCandleData(historicalCandles, currentCandle, depthState, () => {
+				if (currentCandle && chartChanged) {
+					if (didStartNewCandle) {
+						this.syncCandleSeries(this.state.candles);
+					} else {
+						this.updateCurrentCandleOnChart(currentCandle);
 					}
-					: depth,
-			};
-		}, () => {
-			const candle = this.state.candles[this.state.candles.length - 1];
 
-			if (!candle) return;
+					this.syncVwapSeries(this.state.candles);
 
-			this.candleSeries.update(candle);
-			this.volumeSeries.update({
-				time: candle.time,
-				value: this.getCandleVolumeUsd(candle),
-				color: this.getVolumeBarColor(
-					candle,
-					this.state.hoveredVolumeIndex === this.state.candles.length - 1
-				),
+					if (didStartNewCandle) {
+						this.refreshTdSequentialAfterClosedCandle(latestCandleTime);
+					}
+				} else if (depthChanged) {
+					this.syncVwapSeries(this.state.candles);
+				}
+
+				this.scheduleOverlayUpdate();
 			});
-			this.syncVwapSeries(this.state.candles);
-			if (didStartNewCandle) {
-				this.refreshTdSequentialAfterClosedCandle(latestCandleTime);
-			}
-			this.scheduleOverlayUpdate();
+		};
+
+		if (!processed.rolls.length) {
+			finishUpdate(
+				processed.historicalCandles,
+				processed.currentCandle,
+				false,
+				processed.latestCandleTime,
+				processed.changed,
+			);
+			return;
+		}
+
+		this.finalizeBucketRolls(processed.historicalCandles, processed.rolls).then(historicalCandles => {
+			finishUpdate(
+				historicalCandles,
+				processed.currentCandle,
+				processed.didStartNewCandle,
+				processed.latestCandleTime,
+				true,
+			);
 		});
 	};
 
@@ -1925,7 +2229,7 @@ class Home extends React.Component {
 
 		if (!baseCurrency) {
 			this.setState({
-				error: "Enter a base currency, for example GFI.",
+				error: "Enter a base currency, for example BTC.",
 				isLoading: false,
 			});
 			return;
@@ -1935,6 +2239,7 @@ class Home extends React.Component {
 		this.syncCurrencyPath(baseCurrency);
 
 		const requestId = ++this.marketRequestId;
+		this.candleRollRequestId += 1;
 		this.isMarketTransitioning = true;
 		const shouldPreserveRange =
 			baseCurrency === this.state.loadedBaseCurrency
@@ -1950,6 +2255,8 @@ class Home extends React.Component {
 			isLive: false,
 			orderError: "",
 			candles: [],
+			historicalCandles: [],
+			currentCandle: null,
 			depth: null,
 			product: null,
 			productStats: null,
@@ -1977,12 +2284,14 @@ class Home extends React.Component {
 			.then((candlesResponse) => {
 				if (requestId !== this.marketRequestId) return;
 
-				const candles = this.normalizeCandles(candlesResponse.data);
+				const normalizedCandles = this.normalizeCandles(candlesResponse.data);
 
-				if (!candles.length) {
+				if (!normalizedCandles.length) {
 					throw new Error(`Coinbase returned no candle data for ${productId}.`);
 				}
 
+				const { historicalCandles, currentCandle } = this.splitCandlesFromApi(normalizedCandles);
+				const candles = this.buildDisplayCandles(historicalCandles, currentCandle);
 				const timeframeMin = Math.min(...candles.map(candle => candle.low));
 				const timeframeMax = Math.max(...candles.map(candle => candle.high));
 				const latestPrice = candles[candles.length - 1].close;
@@ -1998,6 +2307,8 @@ class Home extends React.Component {
 
 				this.setState({
 					candles,
+					historicalCandles,
+					currentCandle,
 					baseCurrency,
 					periodDays,
 					periodGranularity,
@@ -2053,6 +2364,8 @@ class Home extends React.Component {
 				this.setState({
 					error: errorText,
 					candles: [],
+					historicalCandles: [],
+					currentCandle: null,
 					depth: null,
 					orders: [],
 					orderStats: null,
@@ -2189,9 +2502,21 @@ class Home extends React.Component {
 	};
 
 	openMonitorDropdown = () => {
+		this.loadMonitorTickers();
+
 		if (!this.state.isMonitorOpen) {
 			this.setAnimatedDropdown("monitor", true);
 		}
+	};
+
+	toggleMonitorDropdown = () => {
+		const willOpen = !this.state.isMonitorOpen;
+
+		if (willOpen) {
+			this.loadMonitorTickers();
+		}
+
+		this.setAnimatedDropdown("monitor", willOpen);
 	};
 
 	handleMonitorTickerLinkClick = (event, baseCurrency) => {
@@ -2267,8 +2592,12 @@ class Home extends React.Component {
 			product_id: productId,
 			_: Date.now(),
 		}).then(response => {
+			const orders = Array.isArray(response.data?.orders)
+				? response.data.orders.map(enrichOrderForDisplay)
+				: [];
+
 			this.setState({
-				orders: Array.isArray(response.data?.orders) ? response.data.orders : [],
+				orders,
 				orderStats: {
 					openTotal: response.data?.open_total,
 					applicableTotal: response.data?.applicable_total,
@@ -2296,7 +2625,9 @@ class Home extends React.Component {
 			_: Date.now(),
 		}).then(response => {
 			this.setState({
-				allOrders: Array.isArray(response.data?.orders) ? response.data.orders : [],
+				allOrders: Array.isArray(response.data?.orders)
+					? response.data.orders.map(enrichOrderForDisplay)
+					: [],
 				allOrdersError: "",
 				isOrdersLoading: false,
 			});
@@ -3203,8 +3534,21 @@ class Home extends React.Component {
 		api.placeOrder({
 			...body,
 			preview_id: previewId,
+			preview_base_size: preview?.base_size,
+			preview_order_total: preview?.order_total,
+			preview_commission_total: preview?.commission_total,
+			preview_quote_size: preview?.quote_size,
 		})
-			.then(() => {
+			.then((response) => {
+				const optimisticOrder = buildOptimisticOrderFromPlacement({ body, preview, response });
+
+				if (optimisticOrder) {
+					this.setState(prev => ({
+						allOrders: this.mergeOrderUpdates(prev.allOrders, [optimisticOrder], new Set()),
+						orders: this.mergeOrderUpdates(prev.orders, [optimisticOrder], new Set()),
+					}));
+				}
+
 				this.closeOrderTicket();
 				this.loadOrders();
 				this.loadAllOrders();
@@ -3471,9 +3815,8 @@ class Home extends React.Component {
 
 		if (upperIndex === -1) {
 			const lastIndex = candles.length - 1;
-			const previous = candles[lastIndex - 1];
 			const last = candles[lastIndex];
-			const step = previous ? last.time - previous.time : 1;
+			const step = this.getCandleIntervalStep(candles, lastIndex);
 			const logical = lastIndex + (numericTime - last.time) / step;
 			const fallbackCoordinate = this.chart.timeScale().logicalToCoordinate?.(logical);
 
@@ -3482,8 +3825,7 @@ class Home extends React.Component {
 
 		if (upperIndex === 0) {
 			const first = candles[0];
-			const next = candles[1];
-			const step = next ? next.time - first.time : 1;
+			const step = this.getCandleIntervalStep(candles, 1);
 			const logical = (numericTime - first.time) / step;
 			const fallbackCoordinate = this.chart.timeScale().logicalToCoordinate?.(logical);
 
@@ -3501,6 +3843,15 @@ class Home extends React.Component {
 		return Number.isFinite(fallbackCoordinate) ? fallbackCoordinate : null;
 	};
 
+	getCandleIntervalStep = (candles = this.state.candles, index = candles.length - 1) => {
+		if (!Array.isArray(candles) || candles.length < 2) return 60;
+
+		const clampedIndex = Math.min(candles.length - 1, Math.max(1, index));
+		const step = Number(candles[clampedIndex].time) - Number(candles[clampedIndex - 1].time);
+
+		return Number.isFinite(step) && step > 0 ? step : 60;
+	};
+
 	logicalToTime = (logical) => {
 		const { candles } = this.state;
 
@@ -3509,12 +3860,18 @@ class Home extends React.Component {
 
 		const lowerIndex = Math.floor(logical);
 		const upperIndex = Math.ceil(logical);
-		const fallbackStep = candles[1].time - candles[0].time;
 		const getTimeAtIndex = (index) => {
 			if (candles[index]) return candles[index].time;
-			if (index < 0) return candles[0].time + index * fallbackStep;
 
-			return candles[candles.length - 1].time + (index - candles.length + 1) * fallbackStep;
+			if (index < 0) {
+				const step = this.getCandleIntervalStep(candles, 1);
+				return candles[0].time + index * step;
+			}
+
+			const lastIndex = candles.length - 1;
+			const step = this.getCandleIntervalStep(candles, lastIndex);
+
+			return candles[lastIndex].time + (index - lastIndex) * step;
 		};
 		const lowerTime = getTimeAtIndex(lowerIndex);
 		const upperTime = getTimeAtIndex(upperIndex);
@@ -3522,6 +3879,59 @@ class Home extends React.Component {
 		if (lowerIndex === upperIndex) return lowerTime;
 
 		return lowerTime + (upperTime - lowerTime) * (logical - lowerIndex);
+	};
+
+	getVisibleTimeRange = () => {
+		if (!this.chart) return this.getLoadedTimeRange();
+
+		const timeScale = this.chart.timeScale();
+		const visibleTimeRange = timeScale.getVisibleRange?.();
+		let range = null;
+
+		if (
+			visibleTimeRange
+			&& Number.isFinite(Number(visibleTimeRange.from))
+			&& Number.isFinite(Number(visibleTimeRange.to))
+		) {
+			const from = Number(visibleTimeRange.from);
+			const to = Number(visibleTimeRange.to);
+
+			if (from !== to) {
+				range = {
+					from: Math.min(from, to),
+					to: Math.max(from, to),
+				};
+			}
+		}
+
+		if (!range) {
+			const visibleLogicalRange = timeScale.getVisibleLogicalRange?.();
+
+			if (visibleLogicalRange) {
+				const from = this.logicalToTime(visibleLogicalRange.from);
+				const to = this.logicalToTime(visibleLogicalRange.to);
+
+				if (Number.isFinite(from) && Number.isFinite(to)) {
+					range = {
+						from: Math.min(from, to),
+						to: Math.max(from, to),
+					};
+				}
+			}
+		}
+
+		if (!range) return this.getLoadedTimeRange();
+
+		const loadedRange = this.getLoadedTimeRange();
+
+		if (!loadedRange) return range;
+
+		const margin = 6 * 3600;
+
+		return {
+			from: Math.max(range.from, loadedRange.from - margin),
+			to: Math.min(range.to, loadedRange.to + margin),
+		};
 	};
 
 	getOrderPriceRange = () => {
@@ -3679,6 +4089,7 @@ class Home extends React.Component {
 	getVwapSeriesOptions = () => ({
 		color: '#28d7d7',
 		lineWidth: 2,
+		lineType: LineType.Curved,
 		visible: this.state.showVwapIndicator,
 		priceLineVisible: false,
 		lastValueVisible: false,
@@ -4020,7 +4431,7 @@ class Home extends React.Component {
 					...order,
 					price,
 					y,
-					label: `${order.role === "take_profit" ? "TP " : order.role === "stop_loss" ? "SL " : ""}${this.formatOverlayPriceForProduct(price)} / ${formatOrderValue(order.total_value, order.amount, price, order.quote_size)}`,
+					label: `${order.role === "take_profit" ? "TP " : order.role === "stop_loss" ? "SL " : ""}${this.formatOverlayPriceForProduct(price)} / ${formatOrderValue(order.total_value, order.amount, price, order.quote_size, order.order_total)}`,
 				};
 			})
 			.filter(Boolean);
@@ -4434,39 +4845,22 @@ class Home extends React.Component {
 	buildTimelineTicks = (rightLimit) => {
 		if (!this.chart || !this.state.candles.length) return [];
 
-		const visibleLogicalRange = this.chart.timeScale().getVisibleLogicalRange?.();
-		const loadedRange = this.getLoadedTimeRange();
-		const from = visibleLogicalRange
-			? this.logicalToTime(visibleLogicalRange.from)
-			: loadedRange?.from;
-		const to = visibleLogicalRange
-			? this.logicalToTime(visibleLogicalRange.to)
-			: loadedRange?.to;
+		const visibleRange = this.getVisibleTimeRange();
+		const from = visibleRange?.from;
+		const to = visibleRange?.to;
 
 		if (!Number.isFinite(from) || !Number.isFinite(to)) return [];
 
-		const labels = new Set(["00:00", "06:00", "12:00", "18:00"]);
-		const start = Math.floor((Math.min(from, to) - 3600) / 3600) * 3600;
-		const end = Math.ceil((Math.max(from, to) + 3600) / 3600) * 3600;
-		const ticks = [];
+		const ticks = buildEasternTimelineTimes(from, to)
+			.map(time => {
+				const x = this.timeToX(time);
+				const label = formatTimelineTickLabel(time);
 
-		for (let time = start; time <= end; time += 3600) {
-			const timeLabel = formatChartEasternTime(time, chartTimeFormatter).replace(/^24:/, "00:");
+				if (!label || !Number.isFinite(x) || x < 0 || x > rightLimit) return null;
 
-			if (!labels.has(timeLabel)) continue;
-
-			const x = this.timeToX(time);
-
-			if (!Number.isFinite(x) || x < 0 || x > rightLimit) continue;
-
-			ticks.push({
-				time,
-				x,
-				label: timeLabel === "00:00"
-					? formatChartEasternTime(time, chartDayFormatter)
-					: timeLabel.replace(/^0(?=\d:)/, ""),
-			});
-		}
+				return { time, x, label };
+			})
+			.filter(Boolean);
 
 		return ticks.reduce((visibleTicks, tick) => {
 			const previous = visibleTicks[visibleTicks.length - 1];
@@ -4613,7 +5007,7 @@ class Home extends React.Component {
 		const overlayBaseCurrency = (
 			this.state.isLoading
 				? this.state.baseCurrency
-				: this.state.loadedBaseCurrency || this.state.baseCurrency || DEFAULT_BASE_CURRENCY
+				: this.state.loadedBaseCurrency || this.state.baseCurrency || this.state.defaultBaseCurrency
 		).trim().toUpperCase();
 		const isOverlayMarketLoaded = (
 			overlayBaseCurrency === this.state.loadedBaseCurrency
@@ -4731,11 +5125,11 @@ class Home extends React.Component {
 								onHoverChange={isCurrencyPickerHovered => this.setState({ isCurrencyPickerHovered })}
 								onOpen={this.openMonitorDropdown}
 								onTickerClick={this.handleMonitorTickerLinkClick}
-								onToggle={() => this.setAnimatedDropdown("monitor", !this.state.isMonitorOpen)}
+								onToggle={this.toggleMonitorDropdown}
 								tickers={this.state.monitorTickers}
 							/>
 							<button type="submit" disabled={this.state.isLoading}>
-								{this.state.isLoading ? "Loading" : "Apply"}
+								Apply
 							</button>
 						</div>
 					</form>
@@ -4946,6 +5340,11 @@ class Home extends React.Component {
 						</button>
 					</div>
 
+					{this.state.isLoading && !this.state.error && (
+						<div className="e__loading-notice">
+							Loading
+						</div>
+					)}
 					{this.state.error && (
 						<div className="e__error">
 							{this.state.error}

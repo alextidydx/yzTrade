@@ -10,7 +10,9 @@ import {
 
 const getVisibleBalances = (balances) => (
 	(Array.isArray(balances) ? balances : []).filter(balance => {
-		const isCashBalance = balance.currency === "USD" || balance.currency === "USDC";
+		if (balance.currency === "USDC") return true;
+
+		const isCashBalance = balance.currency === "USD";
 		const balanceValue = isCashBalance
 			? Number(balance.total)
 			: Number(balance.usd_value);

@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 import asyncio
 import base64
+from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal, ROUND_DOWN, InvalidOperation
 import os
 import secrets
@@ -27,7 +28,7 @@ COINBASE_ADVANCED_API = "https://api.coinbase.com"
 COINBASE_ADVANCED_HOST = "api.coinbase.com"
 COINBASE_WS_API = "wss://advanced-trade-ws.coinbase.com"
 COINBASE_USER_WS_API = "wss://advanced-trade-ws-user.coinbase.com"
-PRODUCT_ID = os.getenv("COINBASE_PRODUCT_ID", "GFI-USD")
+PRODUCT_ID = os.getenv("COINBASE_PRODUCT_ID", "BTC-USD")
 GRANULARITY_SECONDS = 3600
 CANDLE_REQUEST_LIMIT = 300
 PUBLIC_DIR = os.path.join(os.path.dirname(__file__), "public")
@@ -351,11 +352,11 @@ def load_env_file():
 
 
 load_env_file()
-PRODUCT_ID = os.getenv("COINBASE_PRODUCT_ID", PRODUCT_ID)
+MONITOR_TICKERS = parse_monitor_tickers(os.getenv("MONITOR_TICKERS"))
+PRODUCT_ID = os.getenv("COINBASE_PRODUCT_ID") or f"{MONITOR_TICKERS[0]}-USD"
 APP_HOST = os.getenv("APP_HOST", "0.0.0.0")
 APP_PORT = int(os.getenv("APP_PORT", "5003"))
 APP_RELOAD = os.getenv("APP_RELOAD", "true").strip().lower() in {"1", "true", "yes", "on"}
-MONITOR_TICKERS = parse_monitor_tickers(os.getenv("MONITOR_TICKERS"))
 
 app = FastAPI()
 live_client_count = 0
@@ -669,6 +670,148 @@ def parse_order_price(value):
     return price if price is not None and price > 0 else None
 
 
+def positive_float(value):
+    parsed = parse_float(value)
+
+    return parsed if parsed is not None and parsed > 0 else None
+
+
+def parse_order_commission_total(order):
+    commission_detail = order.get("commission_detail_total")
+
+    if isinstance(commission_detail, dict):
+        commission = positive_float(commission_detail.get("total_commission"))
+
+        if commission is not None:
+            return commission
+
+    return positive_float(order.get("total_fees"))
+
+
+def parse_order_base_size(order, config):
+    return (
+        positive_float(config.get("base_size"))
+        or positive_float(order.get("base_size"))
+        or positive_float(order.get("size"))
+        or positive_float(order.get("workable_size"))
+    )
+
+
+def parse_order_quote_size(order, config):
+    return positive_float(config.get("quote_size") or order.get("quote_size"))
+
+
+def parse_order_gross_total(order, side, quote_size, commission_total):
+    order_total = positive_float(order.get("order_total"))
+
+    if order_total is not None:
+        return order_total
+
+    total_after_fees = positive_float(order.get("total_value_after_fees"))
+
+    if total_after_fees is not None:
+        return total_after_fees
+
+    if quote_size is None:
+        return None
+
+    if str(side).lower() == "buy" and commission_total is not None:
+        return quote_size + commission_total
+
+    return quote_size
+
+
+def compute_order_remaining_base_size(order, numeric_base_size, numeric_filled_size):
+    leaves_quantity = positive_float(order.get("leaves_quantity"))
+
+    if leaves_quantity is not None:
+        return leaves_quantity
+
+    if numeric_base_size is None:
+        return None
+
+    filled_size = numeric_filled_size if numeric_filled_size is not None else 0
+    remaining_size = numeric_base_size - filled_size
+
+    return remaining_size if remaining_size > 0 else None
+
+
+def build_preview_request_from_order(raw_order):
+    product_id = raw_order.get("product_id")
+    side = str(raw_order.get("side") or "").upper()
+    configuration = raw_order.get("order_configuration") or {}
+
+    if not product_id or side not in ("BUY", "SELL") or not configuration:
+        return None
+
+    return {
+        "product_id": product_id,
+        "side": side,
+        "order_configuration": configuration,
+    }
+
+
+def apply_preview_response_to_order(normalized, preview):
+    if not isinstance(normalized, dict) or not isinstance(preview, dict):
+        return normalized
+
+    base_size = positive_float(preview.get("base_size"))
+
+    if base_size is not None:
+        normalized["amount"] = base_size
+        normalized["base_size"] = base_size
+
+    order_total = positive_float(preview.get("order_total"))
+
+    if order_total is not None:
+        normalized["order_total"] = order_total
+        normalized["total_value"] = order_total
+
+    commission_total = positive_float(preview.get("commission_total"))
+
+    if commission_total is not None:
+        normalized["commission_total"] = commission_total
+
+    quote_size = positive_float(preview.get("quote_size"))
+
+    if quote_size is not None:
+        normalized["quote_size"] = quote_size
+
+    return normalized
+
+
+def apply_preview_snapshot_to_order(normalized, snapshot):
+    if not isinstance(normalized, dict) or not isinstance(snapshot, dict):
+        return normalized
+
+    return apply_preview_response_to_order(normalized, {
+        "base_size": snapshot.get("preview_base_size") or snapshot.get("base_size"),
+        "order_total": snapshot.get("preview_order_total") or snapshot.get("order_total"),
+        "commission_total": snapshot.get("preview_commission_total") or snapshot.get("commission_total"),
+        "quote_size": snapshot.get("preview_quote_size") or snapshot.get("quote_size"),
+    })
+
+
+def fill_order_sizes_from_preview(normalized, raw_order):
+    if not isinstance(normalized, dict):
+        return normalized
+
+    if positive_float(normalized.get("amount")) is not None:
+        return normalized
+
+    preview_request = build_preview_request_from_order(raw_order)
+
+    if preview_request is None:
+        return normalized
+
+    try:
+        preview = coinbase_advanced_post("/api/v3/brokerage/orders/preview", preview_request)
+    except HTTPException:
+        return normalized
+
+    return apply_preview_response_to_order(normalized, preview)
+
+
 def build_coinbase_order_request(order, include_client_order_id=True):
     product_id = str(order.get("product_id") or PRODUCT_ID).upper()
     side = str(order.get("side") or "").upper()
@@ -800,52 +943,27 @@ def normalize_order(order):
         or order.get("limit_price")
         or order.get("stop_price")
     )
-    leaves_quantity = order.get("leaves_quantity")
-    base_size = config.get("base_size") or leaves_quantity or order.get("size")
     filled_size = order.get("filled_size") or order.get("cumulative_quantity") or "0"
+    numeric_price = parse_order_price(price)
 
-    try:
-        numeric_base_size = float(base_size) if base_size is not None else None
-        numeric_filled_size = float(filled_size)
-        remaining_size = (
-            numeric_base_size
-            if leaves_quantity is not None
-            else max(0, numeric_base_size - numeric_filled_size)
-            if numeric_base_size is not None
-            else None
-        )
-    except (TypeError, ValueError):
-        numeric_base_size = None
-        numeric_filled_size = None
-        remaining_size = None
+    if numeric_price is None:
+        return None
+
+    numeric_filled_size = parse_float(filled_size)
+    numeric_base_size = parse_order_base_size(order, config)
+    quote_size = parse_order_quote_size(order, config)
+    order_id = order.get("order_id")
+    side = str(order.get("side") or order.get("order_side") or "").lower()
+    commission_total = parse_order_commission_total(order)
+    remaining_size = compute_order_remaining_base_size(order, numeric_base_size, numeric_filled_size)
+    numeric_order_total = parse_order_gross_total(order, side, quote_size, commission_total)
+    numeric_total_value = numeric_order_total
 
     filled_percent = (
         max(0, min(100, (numeric_filled_size / numeric_base_size) * 100))
         if numeric_base_size and numeric_filled_size is not None
         else None
     )
-
-    numeric_price = parse_order_price(price)
-
-    if numeric_price is None:
-        return None
-
-    numeric_total_value = None
-
-    if remaining_size is not None:
-        numeric_total_value = numeric_price * remaining_size
-    else:
-        try:
-            numeric_total_value = float(
-                config.get("quote_size")
-                or order.get("total_value_after_fees")
-                or order.get("filled_value")
-            )
-        except (TypeError, ValueError):
-            numeric_total_value = None
-
-    order_id = order.get("order_id")
-    side = str(order.get("side") or order.get("order_side") or "").lower()
     order_type = order.get("order_type")
     bracket_legs = []
     take_profit_price = None
@@ -908,10 +1026,12 @@ def normalize_order(order):
         "price": numeric_price,
         "amount": remaining_size,
         "total_value": numeric_total_value,
+        "order_total": numeric_order_total,
+        "commission_total": commission_total,
         "base_size": numeric_base_size,
         "filled_size": numeric_filled_size,
         "filled_percent": filled_percent,
-        "quote_size": config.get("quote_size"),
+        "quote_size": quote_size,
         "order_type": order_type,
         "bracket_legs": bracket_legs,
     }
@@ -1176,40 +1296,50 @@ def get_td_sequential(
     }
 
 
+def fetch_monitor_ticker(currency):
+    product_id = f"{currency}-USD"
+
+    try:
+        stats = coinbase_get(f"/products/{product_id}/stats")
+        open_price = parse_float(stats.get("open"))
+        last_price = parse_float(stats.get("last"))
+        change_24h = (
+            ((last_price - open_price) / open_price) * 100
+            if open_price and last_price is not None
+            else None
+        )
+
+        return {
+            "currency": currency,
+            "product_id": product_id,
+            "price": last_price,
+            "open_24h": open_price,
+            "change_24h": change_24h,
+            "error": None,
+        }
+    except HTTPException as exc:
+        return {
+            "currency": currency,
+            "product_id": product_id,
+            "price": None,
+            "open_24h": None,
+            "change_24h": None,
+            "error": str(exc.detail),
+        }
+
+
+@app.get("/api/monitor-config")
+def get_monitor_config():
+    return {
+        "tickers": MONITOR_TICKERS,
+        "default_base_currency": MONITOR_TICKERS[0] if MONITOR_TICKERS else "BTC",
+    }
+
+
 @app.get("/api/monitor-tickers")
 def get_monitor_tickers():
-    tickers = []
-
-    for currency in MONITOR_TICKERS:
-        product_id = f"{currency}-USD"
-
-        try:
-            stats = coinbase_get(f"/products/{product_id}/stats")
-            open_price = parse_float(stats.get("open"))
-            last_price = parse_float(stats.get("last"))
-            change_24h = (
-                ((last_price - open_price) / open_price) * 100
-                if open_price and last_price is not None
-                else None
-            )
-
-            tickers.append({
-                "currency": currency,
-                "product_id": product_id,
-                "price": last_price,
-                "open_24h": open_price,
-                "change_24h": change_24h,
-                "error": None,
-            })
-        except HTTPException as exc:
-            tickers.append({
-                "currency": currency,
-                "product_id": product_id,
-                "price": None,
-                "open_24h": None,
-                "change_24h": None,
-                "error": str(exc.detail),
-            })
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        tickers = list(executor.map(fetch_monitor_ticker, MONITOR_TICKERS))
 
     return {
         "quote_currency": "USD",
@@ -1290,7 +1420,16 @@ def get_orders(
             f"COINBASE CONNECT FAILED product={normalized_product_id} status={exc.status_code} detail={exc.detail}",
             flush=True,
         )
-        raise
+        return {
+            "product_id": normalized_product_id,
+            "open_total": 0,
+            "exact_total": 0,
+            "applicable_total": 0,
+            "drawable_total": 0,
+            "skipped_total": 0,
+            "orders": [],
+            "error": exc.detail,
+        }
 
     raw_orders = data.get("orders", [])
     if all_products:
@@ -1433,6 +1572,40 @@ def place_order(order: dict):
         flush=True,
     )
 
+    order_id = (
+        (response.get("success_response") or {}).get("order_id")
+        or response.get("order_id")
+    )
+    normalized_order = None
+
+    if order_id:
+        try:
+            order_data = coinbase_advanced_get(f"/api/v3/brokerage/orders/historical/{order_id}")
+            raw_order = order_data.get("order") or order_data
+            normalized_order = normalize_order(raw_order)
+
+            if normalized_order is not None and positive_float(normalized_order.get("amount")) is None:
+                normalized_order = fill_order_sizes_from_preview(normalized_order, raw_order)
+        except HTTPException:
+            normalized_order = None
+
+    if normalized_order is None:
+        normalized_order = apply_preview_snapshot_to_order({
+            "id": order_id,
+            "product_id": product_id,
+            "side": side.lower(),
+            "price": parse_order_price(order.get("limit_price") or order.get("stop_price")),
+            "filled_percent": 0,
+            "bracket_legs": [],
+            "status": "OPEN",
+        }, order)
+
+    if normalized_order is not None:
+        response = {
+            **response,
+            "order": normalized_order,
+        }
+
     return response
 
 
@@ -1508,7 +1681,13 @@ def get_balances():
             f"COINBASE BALANCES FAILED status={exc.status_code} detail={exc.detail}",
             flush=True,
         )
-        raise
+        return {
+            "balances": [],
+            "total_usd": 0,
+            "priced_total": 0,
+            "unpriced_total": 0,
+            "error": exc.detail,
+        }
 
     balances = []
     total_usd = 0.0
@@ -1527,7 +1706,7 @@ def get_balances():
         hold = hold if hold is not None else 0.0
         total = available + hold
 
-        if total <= 0:
+        if total <= 0 and currency != "USDC":
             continue
 
         usd_price = get_usd_price_for_currency(currency)
@@ -1547,6 +1726,17 @@ def get_balances():
             "usd_price": usd_price,
             "usd_value": usd_value,
             "product_id": f"{currency}-USD" if currency not in USD_PEGGED_CURRENCIES else None,
+        })
+
+    if not any(balance["currency"] == "USDC" for balance in balances):
+        balances.append({
+            "currency": "USDC",
+            "available": 0.0,
+            "hold": 0.0,
+            "total": 0.0,
+            "usd_price": 1.0,
+            "usd_value": 0.0,
+            "product_id": None,
         })
 
     pinned_currency_order = {
@@ -2225,6 +2415,21 @@ async def live_market(
     depth_task = asyncio.create_task(guarded_stream("depth", stream_depth_data))
     orders_task = asyncio.create_task(guarded_stream("orders", stream_user_orders))
 
+    async def client_keepalive():
+        while True:
+            await asyncio.sleep(10)
+
+            try:
+                await send_to_client({
+                    "type": "heartbeat",
+                    "stream": "connection",
+                    "product_id": product_id,
+                })
+            except Exception:
+                break
+
+    keepalive_task = asyncio.create_task(client_keepalive())
+
     try:
         await asyncio.gather(market_task, depth_task, orders_task)
     except WebSocketDisconnect:
@@ -2232,10 +2437,17 @@ async def live_market(
     except Exception:
         pass
     finally:
+        keepalive_task.cancel()
         market_task.cancel()
         depth_task.cancel()
         orders_task.cancel()
-        await asyncio.gather(market_task, depth_task, orders_task, return_exceptions=True)
+        await asyncio.gather(
+            keepalive_task,
+            market_task,
+            depth_task,
+            orders_task,
+            return_exceptions=True,
+        )
         live_client_count = max(0, live_client_count - 1)
         print(
             "LIVE CLIENT DISCONNECTED "

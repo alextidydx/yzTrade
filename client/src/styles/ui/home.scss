@@ -903,6 +903,20 @@
 	z-index: 10;
 }
 
+.e__loading-notice {
+	position: absolute;
+	left: 50%;
+	top: 50%;
+	transform: translate(-50%, -50%);
+	max-width: min(520px, calc(100% - 32px));
+	padding: 14px 16px;
+	border: 1px solid rgba(57, 65, 74, 0.82);
+	border-radius: 8px;
+	background: rgba(0, 1, 5, 0.92);
+	color: #7e8b98;
+	z-index: 10;
+}
+
 .e__order-error {
 	position: absolute;
 	right: 12px;

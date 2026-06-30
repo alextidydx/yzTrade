@@ -4,7 +4,6 @@ import {
 	BUY_FEE_ESTIMATE_RATE,
 	BUY_FEE_INCLUSIVE_MIN_TOTAL,
 	CHART_TIME_ZONE,
-	DEFAULT_BASE_CURRENCY,
 	PRICE_PRECISION,
 } from "./homeConstants";
 
@@ -141,7 +140,7 @@ export const getWebSocketBase = () => {
 	return `${window.location.protocol === "https:" ? "wss" : "ws"}://${window.location.host}${API_BASE}`;
 };
 
-export const getBaseCurrencyFromPath = (pathname = "") => {
+export const getBaseCurrencyFromPath = (pathname = "", defaultBaseCurrency = "") => {
 	const segments = pathname
 		.split("/")
 		.map(part => part.trim())
@@ -150,10 +149,10 @@ export const getBaseCurrencyFromPath = (pathname = "") => {
 	const segment = firstSegment?.toLowerCase() === "trade" ? secondSegment : firstSegment;
 
 	if (!segment) {
-		return DEFAULT_BASE_CURRENCY;
+		return defaultBaseCurrency;
 	}
 
-	return segment.replace(/[^a-z0-9]/gi, "").toUpperCase() || DEFAULT_BASE_CURRENCY;
+	return segment.replace(/[^a-z0-9]/gi, "").toUpperCase() || defaultBaseCurrency;
 };
 
 export const getRoutePrefix = (pathname = "") => (
@@ -282,25 +281,147 @@ export const formatUsdFullValue = (value) => {
 	});
 };
 
-export const formatOrderValue = (totalValue, amount, price, quoteSize) => {
+export const formatOrderValue = (totalValue, amount, price, quoteSize, orderTotal) => {
+	const numericOrderTotal = Number(orderTotal);
+
+	if (Number.isFinite(numericOrderTotal) && numericOrderTotal > 0) {
+		return formatUsdFullValue(numericOrderTotal);
+	}
+
 	const numericTotalValue = Number(totalValue);
 
-	if (Number.isFinite(numericTotalValue)) {
+	if (Number.isFinite(numericTotalValue) && numericTotalValue > 0) {
 		return formatUsdFullValue(numericTotalValue);
+	}
+
+	const numericQuoteSize = Number(quoteSize);
+
+	if (Number.isFinite(numericQuoteSize) && numericQuoteSize > 0) {
+		return formatUsdFullValue(numericQuoteSize);
 	}
 
 	const numericAmount = Number(amount);
 	const numericPrice = Number(price);
 
-	if (Number.isFinite(numericAmount) && Number.isFinite(numericPrice)) {
+	if (Number.isFinite(numericAmount) && numericAmount > 0 && Number.isFinite(numericPrice) && numericPrice > 0) {
 		return formatUsdFullValue(numericAmount * numericPrice);
 	}
 
-	const numericQuoteSize = Number(quoteSize);
+	return "--";
+};
 
-	return Number.isFinite(numericQuoteSize)
-		? formatUsdFullValue(numericQuoteSize)
-		: "--";
+export const getOrderDisplayAmount = (order) => {
+	const amount = Number(order?.amount);
+
+	if (Number.isFinite(amount) && amount > 0) return amount;
+
+	const baseSize = Number(order?.base_size);
+
+	if (Number.isFinite(baseSize) && baseSize > 0) return baseSize;
+
+	return null;
+};
+
+const ORDER_VALUE_FIELDS = ["amount", "base_size", "quote_size", "total_value", "order_total", "commission_total"];
+
+export const enrichOrderForDisplay = (order) => {
+	if (!order || typeof order !== "object") return order;
+
+	const displayAmount = getOrderDisplayAmount(order);
+	const orderTotal = Number(order.order_total);
+	const totalValue = Number(order.total_value);
+	const quoteSize = Number(order.quote_size);
+	const commissionTotal = Number(order.commission_total);
+	const enriched = { ...order };
+
+	if (Number.isFinite(displayAmount) && displayAmount > 0) {
+		enriched.amount = displayAmount;
+		enriched.base_size = displayAmount;
+	} else {
+		delete enriched.amount;
+		delete enriched.base_size;
+	}
+
+	if (Number.isFinite(orderTotal) && orderTotal > 0) {
+		enriched.order_total = orderTotal;
+		enriched.total_value = orderTotal;
+	} else if (Number.isFinite(totalValue) && totalValue > 0) {
+		enriched.total_value = totalValue;
+	} else if (Number.isFinite(quoteSize) && quoteSize > 0) {
+		enriched.total_value = quoteSize;
+	}
+
+	if (Number.isFinite(quoteSize) && quoteSize > 0) {
+		enriched.quote_size = quoteSize;
+	}
+
+	if (Number.isFinite(commissionTotal) && commissionTotal >= 0) {
+		enriched.commission_total = commissionTotal;
+	}
+
+	return enriched;
+};
+
+export const mergeOrderFields = (existing, incoming) => {
+	const merged = { ...(existing || {}), ...(incoming || {}) };
+
+	ORDER_VALUE_FIELDS.forEach((key) => {
+		const nextValue = Number(merged[key]);
+		const prevValue = Number(existing?.[key]);
+
+		if ((!Number.isFinite(nextValue) || nextValue <= 0) && Number.isFinite(prevValue) && prevValue > 0) {
+			merged[key] = existing[key];
+		}
+	});
+
+	if (
+		(!Array.isArray(merged.bracket_legs) || !merged.bracket_legs.length)
+		&& Array.isArray(existing?.bracket_legs)
+		&& existing.bracket_legs.length
+	) {
+		merged.bracket_legs = existing.bracket_legs;
+	}
+
+	return enrichOrderForDisplay(merged);
+};
+
+export const buildOptimisticOrderFromPlacement = ({ body, preview, response } = {}) => {
+	if (!preview) return null;
+
+	const price = Number(body?.limit_price ?? body?.stop_price ?? preview?.limit_price);
+	const baseSize = Number(preview?.base_size);
+	const quoteSize = Number(preview?.quote_size);
+	const orderTotal = Number(preview?.order_total);
+	const commissionTotal = Number(preview?.commission_total);
+
+	if (!Number.isFinite(baseSize) || baseSize <= 0) return null;
+
+	const orderId = response?.data?.order?.id
+		|| response?.data?.success_response?.order_id
+		|| response?.data?.order_id
+		|| `pending-${Date.now()}`;
+
+	const placedOrder = response?.data?.order;
+
+	if (placedOrder) {
+		return enrichOrderForDisplay(placedOrder);
+	}
+
+	return enrichOrderForDisplay({
+		id: orderId,
+		product_id: body?.product_id,
+		side: String(body?.side || preview?.side || "").toLowerCase(),
+		price: Number.isFinite(price) ? price : null,
+		amount: baseSize,
+		base_size: baseSize,
+		quote_size: Number.isFinite(quoteSize) && quoteSize > 0 ? quoteSize : null,
+		order_total: Number.isFinite(orderTotal) && orderTotal > 0 ? orderTotal : null,
+		total_value: Number.isFinite(orderTotal) && orderTotal > 0 ? orderTotal : null,
+		commission_total: Number.isFinite(commissionTotal) ? commissionTotal : null,
+		filled_percent: 0,
+		bracket_legs: [],
+		status: "OPEN",
+	});
 };
 
 export const formatSignedPercent = (value) => {
@@ -403,7 +524,7 @@ export const chartTimeFormatter = new Intl.DateTimeFormat("en-US", {
 });
 
 export const chartDayFormatter = new Intl.DateTimeFormat("en-US", {
-	timeZone: "UTC",
+	timeZone: CHART_TIME_ZONE,
 	day: "2-digit",
 });
 
@@ -423,6 +544,42 @@ export const formatChartEasternTime = (time, formatter = chartTimeFormatter) => 
 	if (!Number.isFinite(timestamp)) return "";
 
 	return formatter.format(new Date(timestamp * 1000));
+};
+
+export const TIMELINE_CLOCK_LABELS = new Set(["00:00", "06:00", "12:00", "18:00"]);
+
+export const getEasternClockLabel = (unixSeconds) => (
+	formatChartEasternTime(unixSeconds, chartTimeFormatter).replace(/^24:/, "00:")
+);
+
+export const formatTimelineTickLabel = (unixSeconds) => {
+	const timeLabel = getEasternClockLabel(unixSeconds);
+
+	if (!TIMELINE_CLOCK_LABELS.has(timeLabel)) return null;
+
+	if (timeLabel === "00:00") {
+		return formatChartEasternTime(unixSeconds, chartDayFormatter);
+	}
+
+	return timeLabel.replace(/^0(?=\d:)/, "");
+};
+
+export const buildEasternTimelineTimes = (from, to) => {
+	if (!Number.isFinite(from) || !Number.isFinite(to)) return [];
+
+	const rangeStart = Math.min(from, to);
+	const rangeEnd = Math.max(from, to);
+	const start = Math.floor((rangeStart - 3600) / 3600) * 3600;
+	const end = Math.ceil((rangeEnd + 3600) / 3600) * 3600;
+	const times = [];
+
+	for (let time = start; time <= end; time += 3600) {
+		if (TIMELINE_CLOCK_LABELS.has(getEasternClockLabel(time))) {
+			times.push(time);
+		}
+	}
+
+	return times;
 };
 
 const vwapSessionFormatter = new Intl.DateTimeFormat("en-CA", {

@@ -7,6 +7,7 @@ import {
 	formatBalanceAmount,
 	formatOrderValue,
 	getCurrencyFromProductId,
+	getOrderDisplayAmount,
 } from "../../../utils/homeUtils";
 
 const getFlattenedOrders = (orders) => (
@@ -106,10 +107,16 @@ const OrdersDropdown = ({
 							{group.orders.map(order => {
 								const side = String(order.side).toLowerCase() === "sell" ? "sell" : "buy";
 								const price = Number(order.price);
-								const totalValue = formatOrderValue(order.total_value, order.amount, price, order.quote_size);
-								const amount = Number(order.amount);
-								const amountLabel = Number.isFinite(amount)
-									? `${formatBalanceAmount(amount)} ${group.currency}`
+								const totalValue = formatOrderValue(
+									order.total_value,
+									order.amount,
+									price,
+									order.quote_size,
+									order.order_total,
+								);
+								const displayAmount = getOrderDisplayAmount(order);
+								const amountLabel = Number.isFinite(displayAmount) && displayAmount > 0
+									? `${formatBalanceAmount(displayAmount)} ${group.currency}`
 									: "";
 								const filledPercent = Number(order.filled_percent);
 								const filledLabel = Number.isFinite(filledPercent)
