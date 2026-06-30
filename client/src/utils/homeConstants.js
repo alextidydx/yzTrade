@@ -4,8 +4,6 @@ export const API_BASE = import.meta.env.VITE_API_BASE
 export const DISTRIBUTION_BINS = 160;
 export const DEPTH_RANGE_PADDING = 1.2;
 export const MIN_DEPTH_WIDTH_RATIO = 0.1;
-export const DEFAULT_BASE_CURRENCY = "GFI";
-export const PEAK_THRESHOLD = 0.35;
 export const PRICE_PRECISION = 6;
 export const PRICE_MIN_MOVE = 0.000001;
 export const CHART_TIME_ZONE = "America/New_York";
@@ -23,7 +21,7 @@ export const ORDER_FRACTIONS = [
 	{ label: "1/2", value: 0.5 },
 	{ label: "MAX", value: 1 },
 ];
-export const MONITOR_TICKERS = ["BTC", "ETH", "ICP", "PENGU", "XLM", "ADA", "CRV", "ALGO", "PENDLE", "GFI", "NMR", "FET", "AAVE", "XRP", "SUI", "DOGE", "PEPE", "FIL", "TAO", "SOL", "ZEC", "LTC", "SEI", "BONK"];
+export const PEAK_THRESHOLD = 0.35;
 export const INDICATOR_COOKIES = {
 	td: "yztrade_indicator_td",
 	vwap: "yztrade_indicator_vwap",
