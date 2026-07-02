@@ -721,6 +721,25 @@ def parse_order_gross_total(order, side, quote_size, commission_total):
     return quote_size
 
 
+def compute_order_total_base_size(order, numeric_base_size, numeric_filled_size, quote_size, side, numeric_price):
+    if numeric_base_size is not None:
+        return numeric_base_size
+
+    filled_size = numeric_filled_size if numeric_filled_size is not None else 0
+    leaves_quantity = positive_float(order.get("leaves_quantity"))
+
+    if leaves_quantity is not None:
+        total_size = filled_size + leaves_quantity
+
+        if total_size > 0:
+            return total_size
+
+    if str(side).lower() == "buy" and quote_size is not None and numeric_price:
+        return quote_size / numeric_price
+
+    return None
+
+
 def compute_order_remaining_base_size(order, numeric_base_size, numeric_filled_size):
     leaves_quantity = positive_float(order.get("leaves_quantity"))
 
@@ -760,6 +779,7 @@ def apply_preview_response_to_order(normalized, preview):
     if base_size is not None:
         normalized["amount"] = base_size
         normalized["base_size"] = base_size
+        normalized["total_base_size"] = base_size
 
     order_total = positive_float(preview.get("order_total"))
 
@@ -776,6 +796,15 @@ def apply_preview_response_to_order(normalized, preview):
 
     if quote_size is not None:
         normalized["quote_size"] = quote_size
+
+    filled_size = parse_float(normalized.get("filled_size"))
+    total_base_size = positive_float(normalized.get("total_base_size")) or base_size
+
+    if total_base_size and filled_size is not None:
+        normalized["filled_percent"] = max(
+            0,
+            min(100, (filled_size / total_base_size) * 100),
+        )
 
     return normalized
 
@@ -796,7 +825,7 @@ def fill_order_sizes_from_preview(normalized, raw_order):
     if not isinstance(normalized, dict):
         return normalized
 
-    if positive_float(normalized.get("amount")) is not None:
+    if positive_float(normalized.get("base_size")) is not None:
         return normalized
 
     preview_request = build_preview_request_from_order(raw_order)
@@ -887,8 +916,22 @@ def build_coinbase_order_request(order, include_client_order_id=True):
             "limit_limit_gtc": limit_config,
         }
     elif order_type == "STOP_LIMIT":
-        if base_size is None or limit_price is None or stop_price is None:
-            raise HTTPException(status_code=400, detail="Stop limit requires base_size, limit_price, and stop_price.")
+        if limit_price is None or stop_price is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Stop limit requires base_size or quote_size, limit_price, and stop_price.",
+            )
+
+        if base_size is None and quote_size is not None and limit_price > 0:
+            base_size = quote_size / limit_price
+            formatted_base_size = format_decimal_for_increment(base_size, base_increment)
+
+        if base_size is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Stop limit requires base_size or quote_size, limit_price, and stop_price.",
+            )
+
         order_configuration = {
             "stop_limit_stop_limit_gtc": {
                 "base_size": formatted_base_size,
@@ -955,13 +998,21 @@ def normalize_order(order):
     order_id = order.get("order_id")
     side = str(order.get("side") or order.get("order_side") or "").lower()
     commission_total = parse_order_commission_total(order)
-    remaining_size = compute_order_remaining_base_size(order, numeric_base_size, numeric_filled_size)
+    total_base_size = compute_order_total_base_size(
+        order,
+        numeric_base_size,
+        numeric_filled_size,
+        quote_size,
+        side,
+        numeric_price,
+    )
+    remaining_size = compute_order_remaining_base_size(order, total_base_size, numeric_filled_size)
     numeric_order_total = parse_order_gross_total(order, side, quote_size, commission_total)
     numeric_total_value = numeric_order_total
 
     filled_percent = (
-        max(0, min(100, (numeric_filled_size / numeric_base_size) * 100))
-        if numeric_base_size and numeric_filled_size is not None
+        max(0, min(100, (numeric_filled_size / total_base_size) * 100))
+        if total_base_size and numeric_filled_size is not None
         else None
     )
     order_type = order.get("order_type")
@@ -999,7 +1050,7 @@ def normalize_order(order):
                 "price": take_profit_price,
                 "amount": remaining_size,
                 "total_value": take_profit_price * remaining_size if remaining_size is not None else None,
-                "base_size": numeric_base_size,
+                "base_size": total_base_size,
                 "filled_size": numeric_filled_size,
                 "filled_percent": filled_percent,
             })
@@ -1013,7 +1064,7 @@ def normalize_order(order):
                 "price": stop_loss_price,
                 "amount": remaining_size,
                 "total_value": stop_loss_price * remaining_size if remaining_size is not None else None,
-                "base_size": numeric_base_size,
+                "base_size": total_base_size,
                 "filled_size": numeric_filled_size,
                 "filled_percent": filled_percent,
             })
@@ -1029,8 +1080,10 @@ def normalize_order(order):
         "order_total": numeric_order_total,
         "commission_total": commission_total,
         "base_size": numeric_base_size,
+        "total_base_size": total_base_size,
         "filled_size": numeric_filled_size,
         "filled_percent": filled_percent,
+        "leaves_quantity": positive_float(order.get("leaves_quantity")),
         "quote_size": quote_size,
         "order_type": order_type,
         "bracket_legs": bracket_legs,
@@ -1609,6 +1662,28 @@ def place_order(order: dict):
     return response
 
 
+SOFT_PREVIEW_ERRORS = frozenset({
+    "PREVIEW_INSUFFICIENT_FUND",
+    "PREVIEW_INSUFFICIENT_FUNDS",
+    "PREVIEW_INSUFFICIENT_FUNDS_FOR_ORDER",
+})
+
+
+def normalize_preview_response(response):
+    if not isinstance(response, dict):
+        return response
+
+    normalized = dict(response)
+
+    for field in ("base_size", "quote_size", "order_total", "commission_total"):
+        value = positive_float(response.get(field))
+
+        if value is not None:
+            normalized[field] = value
+
+    return normalized
+
+
 @app.post("/api/orders/preview")
 def preview_order(order: dict):
     order_request = build_coinbase_order_request(order, include_client_order_id=False)
@@ -1637,19 +1712,28 @@ def preview_order(order: dict):
     errs = response.get("errs") or []
 
     if errs:
+        hard_errs = [err for err in errs if err not in SOFT_PREVIEW_ERRORS]
+
+        if hard_errs:
+            print(
+                f"COINBASE PREVIEW ORDER REJECTED product={product_id} side={side} type={order_type} errs={hard_errs}",
+                flush=True,
+            )
+            raise HTTPException(status_code=400, detail={"errs": hard_errs, "preview": response})
+
         print(
-            f"COINBASE PREVIEW ORDER REJECTED product={product_id} side={side} type={order_type} errs={errs}",
+            f"COINBASE PREVIEW ORDER SOFT ERROR product={product_id} side={side} type={order_type} errs={errs}",
             flush=True,
         )
-        raise HTTPException(status_code=400, detail={"errs": errs, "preview": response})
 
-    print(
-        f"COINBASE PREVIEW ORDER OK product={product_id} side={side} type={order_type}",
-        flush=True,
-    )
+    else:
+        print(
+            f"COINBASE PREVIEW ORDER OK product={product_id} side={side} type={order_type}",
+            flush=True,
+        )
 
     return {
-        **response,
+        **normalize_preview_response(response),
         "product_id": product_id,
         "side": side,
         "order_type": order_type,

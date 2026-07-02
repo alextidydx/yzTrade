@@ -1,8 +1,8 @@
+import { TickMarkType } from "lightweight-charts";
+
 import {
 	API_BASE,
 	BOOKMARKED_PRICE_COOKIE,
-	BUY_FEE_ESTIMATE_RATE,
-	BUY_FEE_INCLUSIVE_MIN_TOTAL,
 	CHART_TIME_ZONE,
 	PRICE_PRECISION,
 } from "./homeConstants";
@@ -50,6 +50,12 @@ export const deleteCookie = (name) => {
 	document.cookie = `${encodeURIComponent(name)}=; Max-Age=0; Path=/; SameSite=Lax`;
 };
 
+export const normalizeBookmarkPrice = (price) => {
+	const numeric = Number(price);
+
+	return Number.isFinite(numeric) && numeric > 0 ? numeric : null;
+};
+
 export const getBookmarkedPrice = (currency) => {
 	const value = getCookie(BOOKMARKED_PRICE_COOKIE);
 	const normalizedCurrency = String(currency || "").toUpperCase();
@@ -61,16 +67,14 @@ export const getBookmarkedPrice = (currency) => {
 
 		if (bookmarks && typeof bookmarks === "object" && !Array.isArray(bookmarks)) {
 			if (Object.prototype.hasOwnProperty.call(bookmarks, "currency")) {
-				const price = Number(bookmarks.price);
+				const price = normalizeBookmarkPrice(bookmarks.price);
 
-				return String(bookmarks.currency || "").toUpperCase() === normalizedCurrency && Number.isFinite(price)
+				return String(bookmarks.currency || "").toUpperCase() === normalizedCurrency
 					? price
 					: null;
 			}
 
-			const price = Number(bookmarks[normalizedCurrency]);
-
-			return Number.isFinite(price) ? price : null;
+			return normalizeBookmarkPrice(bookmarks[normalizedCurrency]);
 		}
 	} catch {
 		return null;
@@ -310,24 +314,98 @@ export const formatOrderValue = (totalValue, amount, price, quoteSize, orderTota
 	return "--";
 };
 
-export const getOrderDisplayAmount = (order) => {
-	const amount = Number(order?.amount);
+export const resolveOrderTotalBaseSize = (order) => {
+	if (!order || typeof order !== "object") return null;
 
-	if (Number.isFinite(amount) && amount > 0) return amount;
+	const explicitTotal = Number(order.total_base_size);
 
-	const baseSize = Number(order?.base_size);
+	if (Number.isFinite(explicitTotal) && explicitTotal > 0) {
+		return explicitTotal;
+	}
 
-	if (Number.isFinite(baseSize) && baseSize > 0) return baseSize;
+	const filledSize = Number(order.filled_size);
+	const leavesQuantity = Number(order.leaves_quantity);
+
+	if (
+		Number.isFinite(filledSize)
+		&& filledSize >= 0
+		&& Number.isFinite(leavesQuantity)
+		&& leavesQuantity >= 0
+	) {
+		const totalFromFill = filledSize + leavesQuantity;
+
+		if (totalFromFill > 0) {
+			return totalFromFill;
+		}
+	}
+
+	const baseSize = Number(order.base_size);
+
+	if (Number.isFinite(baseSize) && baseSize > 0) {
+		return baseSize;
+	}
+
+	const side = String(order.side || "").toUpperCase();
+	const price = Number(order.price);
+	const quoteSize = Number(order.quote_size);
+	const orderTotal = Number(order.order_total);
+	const commissionTotal = Number(order.commission_total);
+
+	if (side === "BUY") {
+		if (Number.isFinite(quoteSize) && quoteSize > 0 && Number.isFinite(price) && price > 0) {
+			return quoteSize / price;
+		}
+
+		if (Number.isFinite(orderTotal) && orderTotal > 0 && Number.isFinite(price) && price > 0) {
+			const netUsd = Number.isFinite(commissionTotal) && commissionTotal >= 0
+				? orderTotal - commissionTotal
+				: orderTotal;
+
+			return netUsd / price;
+		}
+	}
 
 	return null;
 };
 
-const ORDER_VALUE_FIELDS = ["amount", "base_size", "quote_size", "total_value", "order_total", "commission_total"];
+export const getOrderTotalBaseSize = (order) => resolveOrderTotalBaseSize(order);
+
+export const getOrderDisplayAmount = (order) => {
+	const remaining = Number(order?.amount);
+
+	if (Number.isFinite(remaining) && remaining > 0) {
+		return remaining;
+	}
+
+	const totalBaseSize = resolveOrderTotalBaseSize(order);
+
+	if (Number.isFinite(totalBaseSize) && totalBaseSize > 0) {
+		return totalBaseSize;
+	}
+
+	return null;
+};
+
+export const getOrderFilledPercent = (order) => {
+	const filledSize = Number(order?.filled_size);
+	const totalBaseSize = resolveOrderTotalBaseSize(order);
+
+	if (Number.isFinite(filledSize) && filledSize >= 0 && Number.isFinite(totalBaseSize) && totalBaseSize > 0) {
+		return Math.max(0, Math.min(100, (filledSize / totalBaseSize) * 100));
+	}
+
+	return null;
+};
+
+const ORDER_VALUE_FIELDS = ["quote_size", "total_value", "order_total", "commission_total", "leaves_quantity"];
+const ORDER_SIZE_FIELDS = ["amount", "base_size", "total_base_size"];
 
 export const enrichOrderForDisplay = (order) => {
 	if (!order || typeof order !== "object") return order;
 
 	const displayAmount = getOrderDisplayAmount(order);
+	const totalBaseSize = resolveOrderTotalBaseSize(order);
+	const filledPercent = getOrderFilledPercent(order);
 	const orderTotal = Number(order.order_total);
 	const totalValue = Number(order.total_value);
 	const quoteSize = Number(order.quote_size);
@@ -336,10 +414,18 @@ export const enrichOrderForDisplay = (order) => {
 
 	if (Number.isFinite(displayAmount) && displayAmount > 0) {
 		enriched.amount = displayAmount;
-		enriched.base_size = displayAmount;
+	}
+
+	if (Number.isFinite(totalBaseSize) && totalBaseSize > 0) {
+		enriched.total_base_size = totalBaseSize;
 	} else {
-		delete enriched.amount;
-		delete enriched.base_size;
+		delete enriched.total_base_size;
+	}
+
+	if (Number.isFinite(filledPercent)) {
+		enriched.filled_percent = filledPercent;
+	} else {
+		delete enriched.filled_percent;
 	}
 
 	if (Number.isFinite(orderTotal) && orderTotal > 0) {
@@ -373,6 +459,43 @@ export const mergeOrderFields = (existing, incoming) => {
 			merged[key] = existing[key];
 		}
 	});
+
+	ORDER_SIZE_FIELDS.forEach((key) => {
+		const nextValue = Number(merged[key]);
+		const prevValue = Number(existing?.[key]);
+
+		if ((!Number.isFinite(nextValue) || nextValue <= 0) && Number.isFinite(prevValue) && prevValue > 0) {
+			merged[key] = existing[key];
+		}
+	});
+
+	const incomingFilled = Number(incoming?.filled_size);
+	const prevFilled = Number(existing?.filled_size);
+
+	if (Number.isFinite(incomingFilled) && incomingFilled >= 0) {
+		merged.filled_size = Number.isFinite(prevFilled)
+			? Math.max(prevFilled, incomingFilled)
+			: incomingFilled;
+	} else if (Number.isFinite(prevFilled) && prevFilled >= 0) {
+		merged.filled_size = prevFilled;
+	}
+
+	const prevTotal = resolveOrderTotalBaseSize(existing);
+	const nextTotal = resolveOrderTotalBaseSize({
+		...merged,
+		total_base_size: undefined,
+	});
+	let stableTotal = null;
+
+	if (Number.isFinite(prevTotal) && Number.isFinite(nextTotal)) {
+		stableTotal = Math.max(prevTotal, nextTotal);
+	} else {
+		stableTotal = nextTotal ?? prevTotal;
+	}
+
+	if (Number.isFinite(stableTotal) && stableTotal > 0) {
+		merged.total_base_size = stableTotal;
+	}
 
 	if (
 		(!Array.isArray(merged.bracket_legs) || !merged.bracket_legs.length)
@@ -472,13 +595,83 @@ export const formatUsdAmountInput = (value) => {
 	return floored.toFixed(2);
 };
 
-export const estimateBuyQuoteSizeFromTotal = (totalAmount) => {
-	const numericTotal = Number(totalAmount);
+export const floorQuoteCurrencyAmount = (value) => {
+	const numericValue = Number(value);
 
-	if (!Number.isFinite(numericTotal) || numericTotal <= 0) return 0;
-	if (numericTotal < BUY_FEE_INCLUSIVE_MIN_TOTAL) return numericTotal;
+	if (!Number.isFinite(numericValue) || numericValue <= 0) return 0;
 
-	return numericTotal / (1 + BUY_FEE_ESTIMATE_RATE);
+	return Math.floor(numericValue * 100) / 100;
+};
+
+// BUY USD Total is always the entered/max $ amount — never preview order_total (fee-adjusted net).
+export const getBuyUsdOrderTicketSummary = (enteredAmount, preview) => {
+	const total = floorQuoteCurrencyAmount(enteredAmount);
+	const fee = Number(preview?.commission_total);
+
+	if (!Number.isFinite(total) || total <= 0) {
+		return null;
+	}
+
+	const hasFee = Number.isFinite(fee) && fee >= 0;
+	const value = hasFee ? Math.max(0, total - fee) : NaN;
+
+	return {
+		total,
+		value,
+		fee: hasFee ? fee : NaN,
+	};
+};
+
+export const getSellUsdOrderTicketSummary = (enteredAmount, preview) => {
+	const enteredTotal = floorQuoteCurrencyAmount(enteredAmount);
+	const previewTotal = floorQuoteCurrencyAmount(preview?.order_total);
+	const fee = Number(preview?.commission_total);
+
+	if (!Number.isFinite(enteredTotal) || enteredTotal <= 0) {
+		return null;
+	}
+
+	const total = previewTotal > 0 ? previewTotal : enteredTotal;
+	const hasFee = Number.isFinite(fee) && fee >= 0;
+	const value = hasFee ? Math.max(0, total - fee) : NaN;
+
+	return {
+		total,
+		value,
+		fee: hasFee ? fee : NaN,
+	};
+};
+
+export const getSellOrderTicketSummary = (preview) => {
+	const total = Number(preview?.order_total);
+	const fee = Number(preview?.commission_total);
+
+	if (!Number.isFinite(total) || total <= 0) {
+		return null;
+	}
+
+	const hasFee = Number.isFinite(fee) && fee >= 0;
+	const value = hasFee ? Math.max(0, total - fee) : NaN;
+
+	return {
+		total,
+		value,
+		fee: hasFee ? fee : NaN,
+	};
+};
+
+export const getBuyUsdPreviewQuoteSize = (enteredAmount) => floorQuoteCurrencyAmount(enteredAmount);
+
+export const getOrderPreviewBaseSize = (preview) => {
+	if (!preview || typeof preview !== "object") return NaN;
+
+	const baseSize = Number(preview.base_size);
+
+	if (Number.isFinite(baseSize) && baseSize > 0) {
+		return baseSize;
+	}
+
+	return NaN;
 };
 
 export const sanitizeNumericInput = (value) => {
@@ -500,7 +693,27 @@ export const sanitizeNumericInput = (value) => {
 		.join("");
 };
 
-export const getOrderErrorLabel = (detail, fallback = "Coinbase order error.") => {
+const COINBASE_ORDER_ERROR_LABELS = {
+	PREVIEW_STOP_PRICE_BELOW_LAST_TRADE_PRICE: ({ side } = {}) => (
+		side === "BUY"
+			? "Stop price must be above the current price for buy stop orders."
+			: "Stop price must be below the current price for sell stop orders."
+	),
+	PREVIEW_STOP_PRICE_ABOVE_LAST_TRADE_PRICE: ({ side } = {}) => (
+		side === "SELL"
+			? "Stop price must be below the current price for sell stop orders."
+			: "Stop price must be above the current price for buy stop orders."
+	),
+	PREVIEW_STOP_PRICE_ABOVE_LIMIT_PRICE: "Limit price must be at or above the stop price.",
+	PREVIEW_STOP_PRICE_BELOW_LIMIT_PRICE: "Limit price must be at or below the stop price.",
+	PREVIEW_INVALID_LIMIT_PRICE: "Enter a valid limit price.",
+	PREVIEW_INVALID_STOP_PRICE: "Enter a valid stop price.",
+	PREVIEW_INSUFFICIENT_FUND: "Insufficient balance. Lower the amount or leave room for the fee.",
+	PREVIEW_INSUFFICIENT_FUNDS: "Insufficient balance. Lower the amount or leave room for the fee.",
+	PREVIEW_INSUFFICIENT_FUNDS_FOR_ORDER: "Insufficient balance. Lower the amount or leave room for the fee.",
+};
+
+export const getOrderErrorLabel = (detail, fallback = "Coinbase order error.", context = {}) => {
 	if (typeof detail === "string") return detail;
 
 	const errs = Array.isArray(detail?.errs)
@@ -509,7 +722,16 @@ export const getOrderErrorLabel = (detail, fallback = "Coinbase order error.") =
 			? detail.preview.errs
 			: null;
 
-	if (errs?.length) return String(errs[0]);
+	if (errs?.length) {
+		const code = String(errs[0]);
+		const label = COINBASE_ORDER_ERROR_LABELS[code];
+
+		if (typeof label === "function") return label(context);
+		if (typeof label === "string") return label;
+
+		return code;
+	}
+
 	if (detail?.error) return String(detail.error);
 	if (detail?.message) return String(detail.message);
 
@@ -521,11 +743,6 @@ export const chartTimeFormatter = new Intl.DateTimeFormat("en-US", {
 	hour: "2-digit",
 	minute: "2-digit",
 	hour12: false,
-});
-
-export const chartDayFormatter = new Intl.DateTimeFormat("en-US", {
-	timeZone: CHART_TIME_ZONE,
-	day: "2-digit",
 });
 
 export const chartFullTimeFormatter = new Intl.DateTimeFormat("en-US", {
@@ -546,40 +763,36 @@ export const formatChartEasternTime = (time, formatter = chartTimeFormatter) => 
 	return formatter.format(new Date(timestamp * 1000));
 };
 
-export const TIMELINE_CLOCK_LABELS = new Set(["00:00", "06:00", "12:00", "18:00"]);
+export const formatChartTickMark = (time, tickMarkType) => {
+	const timestamp = typeof time === "object"
+		? Date.UTC(time.year, time.month - 1, time.day) / 1000
+		: Number(time);
 
-export const getEasternClockLabel = (unixSeconds) => (
-	formatChartEasternTime(unixSeconds, chartTimeFormatter).replace(/^24:/, "00:")
-);
+	if (!Number.isFinite(timestamp)) return null;
 
-export const formatTimelineTickLabel = (unixSeconds) => {
-	const timeLabel = getEasternClockLabel(unixSeconds);
+	const date = new Date(timestamp * 1000);
+	const timeZoneOptions = { timeZone: CHART_TIME_ZONE };
 
-	if (!TIMELINE_CLOCK_LABELS.has(timeLabel)) return null;
-
-	if (timeLabel === "00:00") {
-		return formatChartEasternTime(unixSeconds, chartDayFormatter);
+	switch (tickMarkType) {
+		case TickMarkType.Year:
+			return new Intl.DateTimeFormat("en-US", { ...timeZoneOptions, year: "2-digit" }).format(date);
+		case TickMarkType.Month:
+			return new Intl.DateTimeFormat("en-US", { ...timeZoneOptions, month: "short" }).format(date);
+		case TickMarkType.DayOfMonth:
+			return new Intl.DateTimeFormat("en-US", { ...timeZoneOptions, day: "numeric" }).format(date);
+		case TickMarkType.Time:
+			return formatChartEasternTime(timestamp, chartTimeFormatter).replace(/^24:/, "00:");
+		case TickMarkType.TimeWithSeconds:
+			return new Intl.DateTimeFormat("en-US", {
+				...timeZoneOptions,
+				hour: "2-digit",
+				minute: "2-digit",
+				second: "2-digit",
+				hour12: false,
+			}).format(date).replace(/^24:/, "00:");
+		default:
+			return formatChartEasternTime(timestamp, chartTimeFormatter).replace(/^24:/, "00:");
 	}
-
-	return timeLabel.replace(/^0(?=\d:)/, "");
-};
-
-export const buildEasternTimelineTimes = (from, to) => {
-	if (!Number.isFinite(from) || !Number.isFinite(to)) return [];
-
-	const rangeStart = Math.min(from, to);
-	const rangeEnd = Math.max(from, to);
-	const start = Math.floor((rangeStart - 3600) / 3600) * 3600;
-	const end = Math.ceil((rangeEnd + 3600) / 3600) * 3600;
-	const times = [];
-
-	for (let time = start; time <= end; time += 3600) {
-		if (TIMELINE_CLOCK_LABELS.has(getEasternClockLabel(time))) {
-			times.push(time);
-		}
-	}
-
-	return times;
 };
 
 const vwapSessionFormatter = new Intl.DateTimeFormat("en-CA", {

@@ -8,6 +8,7 @@ import {
 	formatOrderValue,
 	getCurrencyFromProductId,
 	getOrderDisplayAmount,
+	getOrderFilledPercent,
 } from "../../../utils/homeUtils";
 
 const getFlattenedOrders = (orders) => (
@@ -118,7 +119,7 @@ const OrdersDropdown = ({
 								const amountLabel = Number.isFinite(displayAmount) && displayAmount > 0
 									? `${formatBalanceAmount(displayAmount)} ${group.currency}`
 									: "";
-								const filledPercent = Number(order.filled_percent);
+								const filledPercent = getOrderFilledPercent(order);
 								const filledLabel = Number.isFinite(filledPercent)
 									? `${Math.round(filledPercent)}%`
 									: "";

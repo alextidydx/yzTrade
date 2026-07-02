@@ -236,6 +236,11 @@
 		font-size: 12px;
 		font-weight: 850;
 		cursor: pointer;
+
+		&:disabled {
+			opacity: 0.4;
+			cursor: not-allowed;
+		}
 	}
 
 }
@@ -278,6 +283,11 @@
 	padding: 0;
 	accent-color: #f2f6f8;
 	cursor: pointer;
+
+	&:disabled {
+		opacity: 0.4;
+		cursor: not-allowed;
+	}
 }
 
 .e__order-ticket__slider::-webkit-slider-runnable-track {
@@ -365,18 +375,19 @@
 	}
 }
 
-.e__order-ticket__error {
-	color: #ee5858;
+.e__order-ticket__message {
+	min-height: 15px;
+	line-height: 15px;
 	font-size: 11px;
 	font-weight: 850;
-	line-height: 15px;
+}
+
+.e__order-ticket__error {
+	color: #ee5858;
 }
 
 .e__order-ticket__success {
 	color: #20b28f;
-	font-size: 11px;
-	font-weight: 850;
-	line-height: 15px;
 }
 
 .e__order-ticket__actions {

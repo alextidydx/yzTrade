@@ -6,14 +6,16 @@ import { ORDER_FRACTIONS } from "../../../utils/homeConstants";
 
 const OrderBubble = ({
 	amountUnitLabel,
-	baseAmountLabel,
 	isClosing,
 	isOrderTypeMenuOpen,
 	messageIsSuccess,
 	onAmountBlur,
 	onAmountChange,
+	onAmountKeyDown,
 	onCancel,
 	onFractionChange,
+	onFractionCommit,
+	onFractionPreset,
 	onOrderTypeMenuToggle,
 	onPriceFieldChange,
 	onPriceFieldFocus,
@@ -26,11 +28,16 @@ const OrderBubble = ({
 	orderTicketRef,
 	orderTicketStyle,
 	previewBaseAmountLabel,
+	previewBracketLossLabel,
+	previewBracketProfitLabel,
 	previewFeeLabel,
 	previewQuoteSizeLabel,
 	previewTotalLabel,
+	sliderDisabled,
+	sliderFraction,
 	submitLabel,
 	ticketAvailableLabel,
+	ticketMarketPriceLabel,
 	ticketOrderType,
 	ticketPrimaryOrderType,
 	ticketSide,
@@ -126,6 +133,13 @@ const OrderBubble = ({
 				<strong>{ticketAvailableLabel}</strong>
 			</div>
 
+			{ticketMarketPriceLabel !== null && (
+				<div className="e__order-ticket__balance">
+					<span>Price</span>
+					<strong>{ticketMarketPriceLabel}</strong>
+				</div>
+			)}
+
 			{showLimitPrice && (
 				<label>
 					<span>Price</span>
@@ -199,6 +213,7 @@ const OrderBubble = ({
 						pattern="[0-9]*[.,]?[0-9]*"
 						onChange={event => onAmountChange(event.target.value)}
 						onBlur={onAmountBlur}
+						onKeyDown={onAmountKeyDown}
 					/>
 					<button
 						className="e__order-ticket__unit"
@@ -218,8 +233,11 @@ const OrderBubble = ({
 				min="0"
 				max="1"
 				step="0.01"
-				value={Number.isFinite(Number(orderTicket.fraction)) ? orderTicket.fraction : 0}
+				value={Number.isFinite(Number(sliderFraction)) ? sliderFraction : 0}
+				disabled={sliderDisabled}
 				onChange={event => onFractionChange(Number(event.target.value))}
+				onPointerUp={() => onFractionCommit?.()}
+				onTouchEnd={() => onFractionCommit?.()}
 			/>
 
 			<div className="e__order-ticket__fractions">
@@ -227,7 +245,8 @@ const OrderBubble = ({
 					<button
 						key={item.label}
 						type="button"
-						onClick={() => onFractionChange(item.value)}
+						disabled={sliderDisabled}
+						onClick={() => (onFractionPreset || onFractionChange)(item.value)}
 					>
 						{item.label}
 					</button>
@@ -241,31 +260,46 @@ const OrderBubble = ({
 				</div>
 				<div>
 					<span>Amount</span>
-					<strong>{previewBaseAmountLabel || baseAmountLabel}</strong>
+					<strong>{previewBaseAmountLabel}</strong>
 				</div>
 				<div>
 					<span>Fee</span>
 					<strong>{previewFeeLabel}</strong>
 				</div>
-				{previewQuoteSizeLabel && (
+				{previewQuoteSizeLabel !== null && (
 					<div>
-						<span>Pay</span>
+						<span>Value</span>
 						<strong>{previewQuoteSizeLabel}</strong>
+					</div>
+				)}
+				{previewBracketProfitLabel !== null && (
+					<div>
+						<span>Profit</span>
+						<strong>{previewBracketProfitLabel}</strong>
+					</div>
+				)}
+				{previewBracketLossLabel !== null && (
+					<div>
+						<span>Loss</span>
+						<strong>{previewBracketLossLabel}</strong>
 					</div>
 				)}
 			</div>
 
-			{visibleError && (
-				<div className={messageIsSuccess ? "e__order-ticket__success" : "e__order-ticket__error"}>
-					{String(visibleError)}
-				</div>
-			)}
+			<div
+				className={messageIsSuccess
+					? "e__order-ticket__message e__order-ticket__success"
+					: "e__order-ticket__message e__order-ticket__error"}
+				aria-live="polite"
+			>
+				{visibleError ? String(visibleError) : "\u00a0"}
+			</div>
 
 			<div className="e__order-ticket__actions">
 				<button
 					className={isSell ? "e__order-ticket__submit e__order-ticket__submit--sell" : "e__order-ticket__submit e__order-ticket__submit--buy"}
 					type="button"
-					disabled={orderTicket.isSubmitting}
+					disabled={orderTicket.isSubmitting || orderTicket.isPreviewLoading}
 					onClick={onSubmit}
 				>
 					{submitLabel}
