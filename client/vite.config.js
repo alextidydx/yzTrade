@@ -1,4 +1,4 @@
-import { defineConfig } from 'vite'
+import { defineConfig, loadEnv } from 'vite'
 import react from '@vitejs/plugin-react-swc'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -16,9 +16,16 @@ const cleanIndexAssets = () => ({
     },
 })
 
-export default defineConfig(({ command }) => {
+export default defineConfig(({ command, mode }) => {
+    const envDir = path.resolve(__dirname, '..')
+    const env = loadEnv(mode, envDir, '')
+
     return {
         base: command === 'build' ? '/trade/' : '/',
+        envDir,
+        define: {
+            'import.meta.env.TIME_ZONE': JSON.stringify(env.TIME_ZONE || 'America/New_York'),
+        },
 
         plugins: [cleanIndexAssets(), react()],
 

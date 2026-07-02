@@ -168,6 +168,10 @@
 		color: #f2f6f8;
 		box-shadow: none;
 	}
+
+	button.is-loading {
+		opacity: 0.55;
+	}
 }
 
 .e__balance-history__plot {

@@ -116,9 +116,11 @@ const buildSmoothLinePath = (plotPoints, xForTime, yForValue) => {
 
 const BalanceHistoryPlot = ({
 	error,
+	isLoading,
 	onPeriodChange,
 	period,
 	points,
+	selectedPeriod,
 	total,
 }) => {
 	const [activeIndex, setActiveIndex] = useState(null);
@@ -214,7 +216,10 @@ const BalanceHistoryPlot = ({
 				{BALANCE_PERIODS.map(item => (
 					<button
 						key={item.key}
-						className={period === item.key ? "is-active" : ""}
+						className={[
+							selectedPeriod === item.key ? "is-active" : "",
+							isLoading && selectedPeriod === item.key ? "is-loading" : "",
+						].filter(Boolean).join(" ")}
 						type="button"
 						onClick={() => onPeriodChange(item.key)}
 					>
@@ -317,6 +322,8 @@ const BalanceRowContent = ({ balance, getBookmarkDelta }) => {
 const BalanceDropdown = ({
 	balanceHistory,
 	balanceHistoryError,
+	balanceHistoryLoadedPeriod,
+	balanceHistoryLoading,
 	balanceHistoryPeriod,
 	balances,
 	error,
@@ -367,9 +374,11 @@ const BalanceDropdown = ({
 						<div className="e__balance-history-wrap__inner">
 							<BalanceHistoryPlot
 								error={balanceHistoryError}
+								isLoading={balanceHistoryLoading}
 								onPeriodChange={onHistoryPeriodChange}
-								period={balanceHistoryPeriod}
+								period={balanceHistoryLoadedPeriod}
 								points={balanceHistory}
+								selectedPeriod={balanceHistoryPeriod}
 								total={total}
 							/>
 						</div>

@@ -17,16 +17,17 @@ import {
 	LineSeries,
 	LineType,
 	PriceScaleMode,
-	TickMarkType,
 } from 'lightweight-charts';
 
 import {
-	BUY_FEE_ESTIMATE_RATE,
+	DEFAULT_DEPTH_CHART_WIDTH_RATIO,
+	DEFAULT_VISIBLE_HOURS,
 	DEPTH_RANGE_PADDING,
 	DISTRIBUTION_BINS,
 	DROPDOWN_TRANSITION_MS,
 	INDICATOR_COOKIES,
 	MIN_DEPTH_WIDTH_RATIO,
+	MARKET_PREVIEW_POLL_INTERVAL_MS,
 	ORDER_TICKET_ANCHOR_OFFSET_Y,
 	ORDER_TICKET_FALLBACK_HEIGHT,
 	ORDER_TICKET_RIGHT_OFFSET,
@@ -41,11 +42,10 @@ import {
 	chartFullTimeFormatter,
 	chartTimeFormatter,
 	deleteBookmarkedPrice,
-	estimateBuyQuoteSizeFromTotal,
-	buildEasternTimelineTimes,
 	formatAmountWithIncrementFloor,
 	formatBalanceAmount,
 	formatChartEasternTime,
+	formatChartTickMark,
 	formatDisplayPriceWithIncrement,
 	formatMeasurementDuration,
 	formatOrderValue,
@@ -54,7 +54,6 @@ import {
 	formatPriceWithIncrement,
 	formatSignedPercent,
 	formatSignedUsdCents,
-	formatTimelineTickLabel,
 	formatUsdAmountInput,
 	formatUsdCents,
 	formatUsdValue,
@@ -63,8 +62,15 @@ import {
 	getCookieBoolean,
 	buildOptimisticOrderFromPlacement,
 	enrichOrderForDisplay,
+	floorQuoteCurrencyAmount,
+	getBuyUsdOrderTicketSummary,
+	getBuyUsdPreviewQuoteSize,
+	getSellOrderTicketSummary,
+	getSellUsdOrderTicketSummary,
+	getOrderPreviewBaseSize,
 	getOrderErrorLabel,
 	mergeOrderFields,
+	normalizeBookmarkPrice,
 	getPrecisionFromIncrement,
 	getRoutePrefix,
 	getVwapSessionKey,
@@ -105,6 +111,8 @@ class Home extends React.Component {
 		isProfileLoading: false,
 		balanceHistory: [],
 		balanceHistoryPeriod: "week",
+		balanceHistoryLoadedPeriod: "week",
+		balanceHistoryLoading: false,
 		balanceHistoryError: "",
 		isProfileOpen: false,
 		isOrdersOpen: false,
@@ -196,6 +204,7 @@ class Home extends React.Component {
 	profileRefreshTimer = null;
 	allOrdersRefreshTimer = null;
 	balanceHistoryRefreshTimer = null;
+	balanceHistoryRequestId = 0;
 	monitorRefreshTimer = null;
 	productStatsRefreshTimer = null;
 	tdRefreshTimers = [];
@@ -209,6 +218,11 @@ class Home extends React.Component {
 	profileRequestId = 0;
 	dropdownCloseTimers = {};
 	orderTicketCloseTimer = null;
+	orderPreviewTimer = null;
+	orderPreviewRequestId = 0;
+	marketPreviewPollTimer = null;
+	lastMarketPricePollRefreshAt = 0;
+	marketPreviewRequestPrice = null;
 
 	componentDidMount() {
 		window.addEventListener('resize', this.handleResize);
@@ -289,7 +303,22 @@ class Home extends React.Component {
 			this.applyIndicatorVisibility();
 		}
 
-		if (prevProps.history.pathname === this.props.history.pathname) return;
+		if (prevProps.history.pathname === this.props.history.pathname) {
+			const prevTicket = prevState.orderTicket;
+			const nextTicket = this.state.orderTicket;
+			const hadMarketPreviewPoller = Boolean(prevTicket && this.isMarketOrderTicket(prevTicket));
+			const hasMarketPreviewPoller = Boolean(nextTicket && this.isMarketOrderTicket(nextTicket));
+
+			if (hadMarketPreviewPoller !== hasMarketPreviewPoller) {
+				this.syncMarketPreviewPoller();
+			}
+
+			if (nextTicket && prevState.profile !== this.state.profile && !this.state.isOrderTicketClosing) {
+				this.syncOrderTicketOnBalanceChange(prevState);
+			}
+
+			return;
+		}
 
 		const baseCurrency = getBaseCurrencyFromPath(
 			this.props.history.pathname,
@@ -371,6 +400,13 @@ class Home extends React.Component {
 		if (this.orderTicketCloseTimer) {
 			window.clearTimeout(this.orderTicketCloseTimer);
 		}
+
+		if (this.orderPreviewTimer) {
+			window.clearTimeout(this.orderPreviewTimer);
+		}
+
+		this.stopMarketPreviewPoller();
+
 		this.clearTdRefreshTimers();
 
 		if (this.chart) {
@@ -1450,20 +1486,94 @@ class Home extends React.Component {
 		});
 	};
 
-	refitViewport = () => {
-		if (!this.chart) return;
+	getDefaultViewportLogicalRange = (candles) => {
+		if (!Array.isArray(candles) || !candles.length) return null;
 
-		this.chart.priceScale('right').applyOptions({ autoScale: true });
-		this.chart.timeScale().fitContent();
+		const lastIndex = candles.length - 1;
+		const loadedTo = Number(candles[lastIndex].time);
+
+		if (!Number.isFinite(loadedTo)) return null;
+
+		const fromTime = loadedTo - DEFAULT_VISIBLE_HOURS * 3600;
+		let firstIndex = candles.findIndex(candle => Number(candle.time) >= fromTime);
+
+		if (firstIndex < 0) {
+			firstIndex = 0;
+		}
+
+		const visibleBars = Math.max(1, lastIndex - firstIndex + 1);
+		const depthRatio = DEFAULT_DEPTH_CHART_WIDTH_RATIO;
+		const timelinePaddingBars = visibleBars * depthRatio / (1 - depthRatio);
+
+		return {
+			from: firstIndex,
+			to: lastIndex + timelinePaddingBars,
+		};
+	};
+
+	getCandlesForDefaultViewport = (candles) => {
+		if (!Array.isArray(candles) || !candles.length) return [];
+
+		const loadedTo = Number(candles[candles.length - 1].time);
+
+		if (!Number.isFinite(loadedTo)) return candles;
+
+		const fromTime = loadedTo - DEFAULT_VISIBLE_HOURS * 3600;
+
+		return candles.filter(candle => Number(candle.time) >= fromTime);
+	};
+
+	getDepthRangeForCandles = (candles, latestPrice) => {
+		if (!Array.isArray(candles) || !candles.length || !Number.isFinite(Number(latestPrice))) {
+			return null;
+		}
+
+		const timeframeMin = Math.min(...candles.map(candle => candle.low));
+		const timeframeMax = Math.max(...candles.map(candle => candle.high));
+		const minSpan = Math.max(Math.abs(latestPrice) * 0.005, 0.01);
+		const maxDelta = Math.max(
+			Math.abs(timeframeMax - latestPrice),
+			Math.abs(latestPrice - timeframeMin),
+			minSpan,
+		);
+		const depthDelta = maxDelta * DEPTH_RANGE_PADDING;
+
+		return {
+			min_price: latestPrice - depthDelta,
+			max_price: latestPrice + depthDelta,
+		};
+	};
+
+	applyDefaultVisibleRange = (candles = this.state.candles) => {
+		if (!this.chart || !Array.isArray(candles) || !candles.length) return false;
+
+		const logicalRange = this.getDefaultViewportLogicalRange(candles);
+
+		if (!logicalRange || !this.chart.timeScale().setVisibleLogicalRange) return false;
+
+		this.getMainPriceScale()?.applyOptions({ autoScale: true });
+		this.chart.timeScale().applyOptions({ rightOffset: 0 });
+		this.chart.timeScale().setVisibleLogicalRange(logicalRange);
 		this.scheduleOverlayUpdate();
 
 		requestAnimationFrame(() => {
 			if (!this.chart) return;
 
-			this.chart.priceScale('right').applyOptions({ autoScale: true });
-			this.chart.timeScale().fitContent();
+			this.getMainPriceScale()?.applyOptions({ autoScale: true });
 			this.scheduleOverlayUpdate();
 		});
+
+		return true;
+	};
+
+	refitViewport = () => {
+		if (this.applyDefaultVisibleRange()) return;
+
+		if (!this.chart) return;
+
+		this.chart.priceScale('right').applyOptions({ autoScale: true });
+		this.chart.timeScale().fitContent();
+		this.scheduleOverlayUpdate();
 	};
 
 	getBookmarkedPriceForCurrency = (currency) => {
@@ -1472,9 +1582,11 @@ class Home extends React.Component {
 		if (!normalizedCurrency) return null;
 
 		if (this.state.appBookmarks && typeof this.state.appBookmarks === "object") {
-			const price = Number(this.state.appBookmarks[normalizedCurrency]);
+			if (!Object.prototype.hasOwnProperty.call(this.state.appBookmarks, normalizedCurrency)) {
+				return null;
+			}
 
-			return Number.isFinite(price) ? price : null;
+			return normalizeBookmarkPrice(this.state.appBookmarks[normalizedCurrency]);
 		}
 
 		return getBookmarkedPrice(normalizedCurrency);
@@ -1516,12 +1628,12 @@ class Home extends React.Component {
 		const appBookmarks = bookmarks && typeof bookmarks === "object" && !Array.isArray(bookmarks)
 			? Object.fromEntries(
 				Object.entries(bookmarks)
-					.map(([currency, price]) => [String(currency || "").toUpperCase(), Number(price)])
-					.filter(([currency, price]) => currency && Number.isFinite(price))
+					.map(([currency, price]) => [String(currency || "").toUpperCase(), normalizeBookmarkPrice(price)])
+					.filter(([currency, price]) => currency && price !== null)
 			)
 			: {};
 		const currency = this.state.loadedBaseCurrency || this.state.baseCurrency;
-		const bookmarkedPrice = Number(appBookmarks[String(currency || "").toUpperCase()]);
+		const bookmarkedPrice = this.getBookmarkedPriceForCurrency(currency);
 		const settings = appState?.yzTrade?.settings;
 		const appSettings = settings && typeof settings === "object" && !Array.isArray(settings)
 			? {
@@ -1532,7 +1644,7 @@ class Home extends React.Component {
 		this.setState({
 			appBookmarks,
 			appSettings,
-			bookmarkedPrice: Number.isFinite(bookmarkedPrice) ? bookmarkedPrice : null,
+			bookmarkedPrice,
 		}, this.scheduleOverlayUpdate);
 	};
 
@@ -2241,11 +2353,12 @@ class Home extends React.Component {
 		const requestId = ++this.marketRequestId;
 		this.candleRollRequestId += 1;
 		this.isMarketTransitioning = true;
+		const rangeSnapshot = this.getVisibleRangeSnapshot();
 		const shouldPreserveRange =
 			baseCurrency === this.state.loadedBaseCurrency
 			&& periodDays === this.state.loadedPeriodDays
-			&& periodGranularity === this.state.loadedPeriodGranularity;
-		const rangeSnapshot = this.getVisibleRangeSnapshot();
+			&& periodGranularity === this.state.loadedPeriodGranularity
+			&& Boolean(rangeSnapshot?.timeRange || rangeSnapshot?.logicalRange);
 
 		this.setState({
 			isLoading: true,
@@ -2292,18 +2405,11 @@ class Home extends React.Component {
 
 				const { historicalCandles, currentCandle } = this.splitCandlesFromApi(normalizedCandles);
 				const candles = this.buildDisplayCandles(historicalCandles, currentCandle);
-				const timeframeMin = Math.min(...candles.map(candle => candle.low));
-				const timeframeMax = Math.max(...candles.map(candle => candle.high));
 				const latestPrice = candles[candles.length - 1].close;
-				const maxDelta = Math.max(
-					Math.abs(timeframeMax - latestPrice),
-					Math.abs(latestPrice - timeframeMin)
-				);
-				const depthDelta = maxDelta * DEPTH_RANGE_PADDING;
-				const depthRange = {
-					min_price: latestPrice - depthDelta,
-					max_price: latestPrice + depthDelta,
-				};
+				const depthCandles = !shouldPreserveRange && !rangeSnapshot?.timeRange
+					? this.getCandlesForDefaultViewport(candles)
+					: candles;
+				const depthRange = this.getDepthRangeForCandles(depthCandles, latestPrice);
 
 				this.setState({
 					candles,
@@ -2336,7 +2442,7 @@ class Home extends React.Component {
 						: this.restoreVisibleTimeframeByDates(rangeSnapshot, candles);
 
 					if (!didRestoreView) {
-						this.refitViewport();
+						this.applyDefaultVisibleRange(candles);
 					}
 
 					this.syncCurrencyPath(baseCurrency);
@@ -2677,8 +2783,8 @@ class Home extends React.Component {
 		}, this.loadMarket);
 	};
 
-	getAvailableBalanceForSide = (side = this.state.orderTicket?.side) => {
-		const balances = Array.isArray(this.state.profile?.balances) ? this.state.profile.balances : [];
+	getAvailableBalanceForSide = (side = this.state.orderTicket?.side, profile = this.state.profile) => {
+		const balances = Array.isArray(profile?.balances) ? profile.balances : [];
 		const normalizedSide = side === "SELL" ? "SELL" : "BUY";
 
 		if (normalizedSide === "SELL") {
@@ -2847,7 +2953,8 @@ class Home extends React.Component {
 		const saved = this.state.savedOrderTickets[normalizedSide] || {};
 		const priceValue = Number.isFinite(numericPrice) ? this.getOrderPriceInputValue(numericPrice) : "0";
 		const stopLossValue = Number.isFinite(numericPrice) ? this.getOrderPriceInputValue(numericPrice * 0.98) : "0";
-		const ticket = {
+
+		return {
 			...saved,
 			side: normalizedSide,
 			orderType: "LIMIT",
@@ -2860,14 +2967,15 @@ class Home extends React.Component {
 			stopPrice: Number.isFinite(Number(saved.stopPrice)) ? this.getOrderPriceInputValue(saved.stopPrice) : priceValue,
 			takeProfitPrice: Number.isFinite(Number(saved.takeProfitPrice)) ? this.getOrderPriceInputValue(saved.takeProfitPrice) : priceValue,
 			stopLossPrice: Number.isFinite(Number(saved.stopLossPrice)) ? this.getOrderPriceInputValue(saved.stopLossPrice) : stopLossValue,
-			amount: saved.amount ?? "0",
+			amount: "0",
+			fraction: 0,
 			error: "",
 			isSubmitting: false,
-		};
-
-		return {
-			...ticket,
-			fraction: this.getOrderFractionFromAmount(ticket),
+			preview: null,
+			previewBodyKey: "",
+			previewError: "",
+			previewMarketPrice: null,
+			isPreviewLoading: false,
 		};
 	};
 
@@ -2881,11 +2989,28 @@ class Home extends React.Component {
 				stopPrice: ticket.stopPrice,
 				takeProfitPrice: ticket.takeProfitPrice,
 				stopLossPrice: ticket.stopLossPrice,
-				fraction: ticket.fraction,
 				amount: ticket.amount,
+				fraction: ticket.fraction,
 			}
 			: null
 	);
+
+	clearSavedOrderTicketAmounts = (savedOrderTickets = {}) => ({
+		BUY: savedOrderTickets.BUY
+			? {
+				...savedOrderTickets.BUY,
+				amount: "0",
+				fraction: 0,
+			}
+			: null,
+		SELL: savedOrderTickets.SELL
+			? {
+				...savedOrderTickets.SELL,
+				amount: "0",
+				fraction: 0,
+			}
+			: null,
+	});
 
 	mergeOrderTicketForSide = (
 		side,
@@ -2903,6 +3028,7 @@ class Home extends React.Component {
 				: "0";
 		const stopLossValue = Number.isFinite(numericPrice) ? this.getOrderPriceInputValue(numericPrice * 0.98) : "0";
 		const nextOrderType = this.normalizeOrderTypeForSide(normalizedSide, saved.orderType);
+		const amount = saved.amount ?? "0";
 		const ticket = {
 			...saved,
 			side: normalizedSide,
@@ -2922,15 +3048,20 @@ class Home extends React.Component {
 			stopPrice: priceValue,
 			takeProfitPrice: Number.isFinite(Number(saved.takeProfitPrice)) ? this.getOrderPriceInputValue(saved.takeProfitPrice) : priceValue,
 			stopLossPrice: Number.isFinite(Number(saved.stopLossPrice)) ? this.getOrderPriceInputValue(saved.stopLossPrice) : stopLossValue,
-			amount: saved.amount ?? "0",
+			amount,
 			error: "",
 			isSubmitting: false,
+			preview: null,
+			previewBodyKey: "",
+			previewError: "",
+			previewMarketPrice: null,
+			isPreviewLoading: false,
 		};
 
-		return {
+		return this.clampOrderTicketAmount({
 			...ticket,
 			fraction: this.getOrderFractionFromAmount(ticket),
-		};
+		});
 	};
 
 	switchOrderSide = (side) => {
@@ -2938,6 +3069,8 @@ class Home extends React.Component {
 		if (!ticket) return;
 
 		const normalizedSide = side === "SELL" ? "SELL" : "BUY";
+		if (ticket.side === normalizedSide) return;
+
 		const price = Number(ticket.price);
 
 		this.setState(prev => {
@@ -2951,12 +3084,16 @@ class Home extends React.Component {
 				lastOrderSide: normalizedSide,
 				orderTicket: this.mergeOrderTicketForSide(normalizedSide, price, savedOrderTickets, ticket),
 			};
+		}, () => {
+			this.scheduleOrderPreview();
 		});
 	};
 
 	openOrderTicket = (event) => {
 		event.preventDefault();
 		event.stopPropagation();
+
+		if (this.state.isOrderTicketClosing || this.orderTicketCloseTimer) return;
 
 		const hover = this.state.orderScaleHover;
 		if (!hover) return;
@@ -2968,10 +3105,13 @@ class Home extends React.Component {
 
 		const side = this.getDefaultOrderSideForPrice(hover.price);
 
-		this.setState({
+		this.setState(prev => ({
+			savedOrderTickets: this.clearSavedOrderTicketAmounts(prev.savedOrderTickets),
 			orderTicket: this.getOrderTicketDefaults(hover.price, side),
 			isOrderTicketClosing: false,
 			lastOrderSide: side,
+		}), () => {
+			this.scheduleOrderPreview();
 		});
 	};
 
@@ -2983,17 +3123,19 @@ class Home extends React.Component {
 		if (!hover) return;
 
 		if (!this.state.orderTicket) {
-			if (this.orderTicketCloseTimer) {
-				window.clearTimeout(this.orderTicketCloseTimer);
-				this.orderTicketCloseTimer = null;
+			if (this.state.isOrderTicketClosing || this.orderTicketCloseTimer) {
+				return;
 			}
 
 			const side = this.getDefaultOrderSideForPrice(hover.price);
 
-			this.setState({
+			this.setState(prev => ({
+				savedOrderTickets: this.clearSavedOrderTicketAmounts(prev.savedOrderTickets),
 				orderTicket: this.getOrderTicketDefaults(hover.price, side),
 				isOrderTicketClosing: false,
 				lastOrderSide: side,
+			}), () => {
+				this.scheduleOrderPreview();
 			});
 			return;
 		}
@@ -3062,25 +3204,21 @@ class Home extends React.Component {
 			});
 	};
 
-	closeOrderTicket = () => {
-		const ticket = this.state.orderTicket;
-		if (!ticket) return;
+	prepareOrderTicketClose = () => {
+		this.cancelOrderPreviewRequests();
 
+		if (this.orderPreviewTimer) {
+			window.clearTimeout(this.orderPreviewTimer);
+			this.orderPreviewTimer = null;
+		}
+
+		this.stopMarketPreviewPoller();
+	};
+
+	scheduleOrderTicketCloseEnd = () => {
 		if (this.orderTicketCloseTimer) {
 			window.clearTimeout(this.orderTicketCloseTimer);
 		}
-
-		this.setState({
-			isOrderTicketClosing: true,
-			lastOrderSide: ticket?.side === "SELL" ? "SELL" : "BUY",
-			savedOrderTickets: ticket
-				? {
-					...this.state.savedOrderTickets,
-					[ticket.side]: this.getSavedOrderSnapshot(ticket),
-				}
-				: this.state.savedOrderTickets,
-			orderScaleHover: null,
-		});
 
 		this.orderTicketCloseTimer = window.setTimeout(() => {
 			this.orderTicketCloseTimer = null;
@@ -3091,7 +3229,34 @@ class Home extends React.Component {
 		}, DROPDOWN_TRANSITION_MS);
 	};
 
-	updateOrderTicket = (patch) => {
+	closeOrderTicket = () => {
+		const ticket = this.state.orderTicket;
+		if (!ticket || this.state.isOrderTicketClosing) return;
+
+		this.prepareOrderTicketClose();
+
+		this.setState({
+			isOrderTicketClosing: true,
+			lastOrderSide: ticket?.side === "SELL" ? "SELL" : "BUY",
+			savedOrderTickets: {
+				...this.state.savedOrderTickets,
+				[ticket.side]: this.getSavedOrderSnapshot(ticket),
+			},
+			orderScaleHover: null,
+		}, this.scheduleOrderTicketCloseEnd);
+	};
+
+	updateOrderTicket = (patch, options = {}) => {
+		if (this.state.isOrderTicketClosing) {
+			if (typeof options.onCommitted === "function") {
+				options.onCommitted();
+			}
+
+			return;
+		}
+
+		const schedulePreview = options.schedulePreview !== false;
+
 		this.setState(prev => ({
 			orderTicket: prev.orderTicket
 				? {
@@ -3110,15 +3275,35 @@ class Home extends React.Component {
 					}),
 				}
 				: prev.savedOrderTickets,
-		}));
+		}), () => {
+			if (schedulePreview && this.state.orderTicket) {
+				this.scheduleOrderPreview();
+			}
+
+			if (typeof options.onCommitted === "function") {
+				options.onCommitted();
+			}
+		});
 	};
 
 	setOrderType = (orderType) => {
 		const ticket = this.state.orderTicket;
 		if (!ticket) return;
 
+		const normalizedOrderType = this.normalizeOrderTypeForSide(ticket.side, orderType);
+		const currentOrderType = this.normalizeOrderTypeForSide(ticket.side, ticket.orderType);
+
+		if (normalizedOrderType === currentOrderType) return;
+
+		this.cancelOrderPreviewRequests();
+
 		this.updateOrderTicket({
-			orderType: this.normalizeOrderTypeForSide(ticket.side, orderType),
+			...this.getOrderPreviewResetPatch(),
+			orderType: normalizedOrderType,
+		}, {
+			onCommitted: () => {
+				this.syncMarketPreviewPoller();
+			},
 		});
 	};
 
@@ -3127,18 +3312,71 @@ class Home extends React.Component {
 		this.setState({ isOrderTypeMenuOpen: false });
 	};
 
-	getOrderFractionFromAmount = (ticket, amountValue = ticket?.amount) => {
+	getOrderFractionFromAmount = (ticket, amountValue = ticket?.amount, maxAmount = null) => {
 		if (!ticket) return 0;
 
 		const amount = Number(amountValue);
-		const maxAmount = this.getOrderMaxAmount(ticket);
+		const resolvedMaxAmount = Number.isFinite(maxAmount)
+			? maxAmount
+			: this.getOrderMaxAmount(ticket);
 
-		if (!Number.isFinite(amount) || amount <= 0 || !Number.isFinite(maxAmount) || maxAmount <= 0) {
+		if (!Number.isFinite(amount) || amount <= 0 || !Number.isFinite(resolvedMaxAmount) || resolvedMaxAmount <= 0) {
 			return 0;
 		}
 
-		return Math.max(0, Math.min(1, amount / maxAmount));
+		return Math.max(0, Math.min(1, amount / resolvedMaxAmount));
 	};
+
+	syncOrderTicketOnBalanceChange = (prevState) => {
+		const ticket = this.state.orderTicket;
+
+		if (!ticket) return;
+
+		const prevMax = this.getOrderMaxAmount(ticket, prevState.profile);
+		const nextMax = this.getOrderMaxAmount(ticket);
+
+		if (prevMax === nextMax) return;
+
+		const numericAmount = Number(ticket.amount);
+		let nextAmount = ticket.amount;
+
+		if (nextMax <= 0) {
+			nextAmount = "0";
+		} else if (Number.isFinite(numericAmount) && numericAmount > nextMax) {
+			nextAmount = this.getOrderAmountInputValue(ticket, nextMax);
+		}
+
+		const nextFraction = this.getOrderFractionFromAmount(
+			{ ...ticket, amount: nextAmount },
+			nextAmount,
+			nextMax,
+		);
+		const amountChanged = String(nextAmount) !== String(ticket.amount);
+		const fractionChanged = nextFraction !== ticket.fraction;
+
+		if (!amountChanged && !fractionChanged) return;
+
+		const patch = {
+			fraction: nextFraction,
+			amount: nextAmount,
+		};
+
+		if (amountChanged) {
+			Object.assign(patch, this.getOrderPreviewResetPatch());
+		}
+
+		this.updateOrderTicket(patch, {
+			schedulePreview: amountChanged && Number(nextAmount) > 0,
+		});
+	};
+
+	isOrderTicketZeroAvailable = (ticket = this.state.orderTicket) => (
+		!ticket || this.getOrderMaxAmount(ticket) <= 0
+	);
+
+	isSellZeroBalanceTicket = (ticket = this.state.orderTicket) => (
+		ticket?.side === "SELL" && this.isOrderTicketZeroAvailable(ticket)
+	);
 
 	getOrderReferencePrice = (ticket) => {
 		if (!ticket) return NaN;
@@ -3146,7 +3384,7 @@ class Home extends React.Component {
 		const orderType = this.normalizeOrderTypeForSide(ticket.side, ticket.orderType);
 		const price = Number(ticket.price);
 		const takeProfitPrice = Number(ticket.takeProfitPrice);
-		const lastPrice = Number(this.state.candles[this.state.candles.length - 1]?.close);
+		const overlayPrice = this.getOverlayMarketPrice();
 
 		if (orderType === "BRACKET" && Number.isFinite(takeProfitPrice) && takeProfitPrice > 0) {
 			return takeProfitPrice;
@@ -3156,13 +3394,13 @@ class Home extends React.Component {
 			return price;
 		}
 
-		return Number.isFinite(lastPrice) && lastPrice > 0 ? lastPrice : price;
+		return Number.isFinite(overlayPrice) && overlayPrice > 0 ? overlayPrice : price;
 	};
 
-	getOrderMaxAmount = (ticket) => {
+	getOrderMaxAmount = (ticket, profile = this.state.profile) => {
 		if (!ticket) return 0;
 
-		const available = this.getAvailableBalanceForSide(ticket.side);
+		const available = this.getAvailableBalanceForSide(ticket.side, profile);
 		const referencePrice = this.getOrderReferencePrice(ticket);
 		const availableAmount = Number(available.amount) || 0;
 
@@ -3170,7 +3408,7 @@ class Home extends React.Component {
 			return ticket.amountMode === "USD"
 				? availableAmount
 				: referencePrice > 0
-					? estimateBuyQuoteSizeFromTotal(availableAmount) / referencePrice
+					? availableAmount / referencePrice
 					: 0;
 		}
 
@@ -3181,38 +3419,60 @@ class Home extends React.Component {
 			: availableAmount;
 	};
 
-	getOrderRequiredBalance = (ticket) => {
-		if (!ticket) return NaN;
-
-		const amount = Number(ticket.amount);
-		const referencePrice = this.getOrderReferencePrice(ticket);
-
-		if (!Number.isFinite(amount) || amount <= 0) return NaN;
-
-		if (ticket.side === "BUY") {
-			return ticket.amountMode === "USD"
-				? amount
-				: referencePrice > 0
-					? (amount * referencePrice) * (1 + BUY_FEE_ESTIMATE_RATE)
-					: NaN;
-		}
-
-		return ticket.amountMode === "USD"
-			? referencePrice > 0
-				? amount / referencePrice
-				: NaN
-			: amount;
-	};
-
 	updateOrderAmount = (amount) => {
 		const ticket = this.state.orderTicket;
 		if (!ticket) return;
 		const sanitizedAmount = sanitizeNumericInput(amount);
 
+		this.cancelOrderPreviewRequests();
+
 		this.updateOrderTicket({
+			...this.getOrderPreviewResetPatch(),
 			amount: sanitizedAmount,
 			fraction: this.getOrderFractionFromAmount(ticket, sanitizedAmount),
 		});
+	};
+
+	stepOrderAmount = (direction) => {
+		const ticket = this.state.orderTicket;
+		if (!ticket || this.isOrderTicketZeroAvailable(ticket)) return;
+
+		const sign = direction > 0 ? 1 : direction < 0 ? -1 : 0;
+		if (!sign) return;
+
+		const currentAmount = Number(ticket.amount);
+		const safeAmount = Number.isFinite(currentAmount) ? currentAmount : 0;
+		let step = 1;
+
+		if (ticket.amountMode !== "USD") {
+			const referencePrice = this.getOrderReferencePrice(ticket);
+
+			if (!Number.isFinite(referencePrice) || referencePrice <= 0) return;
+
+			step = 1 / referencePrice;
+		}
+
+		const maxAmount = this.getOrderMaxAmount(ticket);
+		const safeMaxAmount = Number.isFinite(maxAmount) && maxAmount > 0 ? maxAmount : 0;
+		const nextAmount = this.getOrderAmountInputValue(
+			ticket,
+			Math.max(0, Math.min(safeAmount + sign * step, safeMaxAmount)),
+		);
+
+		this.cancelOrderPreviewRequests();
+
+		this.updateOrderTicket({
+			...this.getOrderPreviewResetPatch(),
+			amount: nextAmount,
+			fraction: this.getOrderFractionFromAmount(ticket, nextAmount),
+		});
+	};
+
+	handleOrderAmountKeyDown = (event) => {
+		if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
+
+		event.preventDefault();
+		this.stepOrderAmount(event.key === "ArrowUp" ? 1 : -1);
 	};
 
 	formatOrderAmountInput = () => {
@@ -3222,11 +3482,20 @@ class Home extends React.Component {
 		const amount = Number(ticket.amount);
 		if (!Number.isFinite(amount)) return;
 
-		const formattedAmount = this.getOrderAmountInputValue(ticket, amount);
+		const clampedTicket = this.clampOrderTicketAmount({
+			...ticket,
+			amount: this.getOrderAmountInputValue(ticket, amount),
+		});
+		const formattedAmount = clampedTicket.amount;
+		const nextFraction = clampedTicket.fraction;
+		const amountUnchanged = String(formattedAmount) === String(ticket.amount);
+		const fractionUnchanged = nextFraction === ticket.fraction;
 
 		this.updateOrderTicket({
 			amount: formattedAmount,
-			fraction: this.getOrderFractionFromAmount(ticket, formattedAmount),
+			fraction: nextFraction,
+		}, {
+			schedulePreview: !(amountUnchanged && fractionUnchanged),
 		});
 	};
 
@@ -3244,6 +3513,98 @@ class Home extends React.Component {
 			[field]: sanitizedValue,
 			fraction: this.getOrderFractionFromAmount(nextTicket),
 		});
+	};
+
+	getOverlayMarketPrice = (state = this.state) => {
+		const overlayBaseCurrency = (
+			state.isLoading
+				? state.baseCurrency
+				: state.loadedBaseCurrency || state.baseCurrency || state.defaultBaseCurrency
+		).trim().toUpperCase();
+		const isOverlayMarketLoaded = (
+			overlayBaseCurrency === state.loadedBaseCurrency
+			&& !state.isLoading
+			&& Array.isArray(state.candles)
+			&& state.candles.length > 0
+		);
+
+		if (!isOverlayMarketLoaded) {
+			return NaN;
+		}
+
+		return Number(state.candles[state.candles.length - 1]?.close);
+	};
+
+	getLiveMarketPrice = () => this.getOverlayMarketPrice(this.state);
+
+	getLiveMarketPriceFromState = (state = this.state) => this.getOverlayMarketPrice(state);
+
+	getMarketPriceTickSize = () => {
+		const increment = Number(this.state.product?.quote_increment);
+
+		if (Number.isFinite(increment) && increment > 0) {
+			return increment;
+		}
+
+		return PRICE_MIN_MOVE;
+	};
+
+	normalizeMarketPriceForCompare = (price) => {
+		const numericPrice = Number(price);
+		const tick = this.getMarketPriceTickSize();
+
+		if (!Number.isFinite(numericPrice) || numericPrice <= 0) {
+			return NaN;
+		}
+
+		if (!Number.isFinite(tick) || tick <= 0) {
+			return numericPrice;
+		}
+
+		return Math.round(numericPrice / tick) * tick;
+	};
+
+	isMarketOrderTicket = (ticket) => {
+		if (!ticket) return false;
+
+		return this.normalizeOrderTypeForSide(ticket.side, ticket.orderType) === "MARKET";
+	};
+
+	getStopLimitValidationError = (ticket) => {
+		if (!ticket) return "";
+
+		const side = ticket.side === "SELL" ? "SELL" : "BUY";
+		const orderType = this.normalizeOrderTypeForSide(side, ticket.orderType);
+
+		if (orderType !== "STOP_LIMIT") return "";
+
+		const stopPrice = Number(ticket.stopPrice);
+		const limitPrice = Number(ticket.price);
+		const marketPrice = this.getLiveMarketPrice();
+
+		if (!Number.isFinite(stopPrice) || stopPrice <= 0 || !Number.isFinite(limitPrice) || limitPrice <= 0) {
+			return "";
+		}
+
+		if (side === "BUY") {
+			if (Number.isFinite(marketPrice) && stopPrice <= marketPrice) {
+				return "Stop price must be above the current price for buy stop orders.";
+			}
+
+			if (limitPrice < stopPrice) {
+				return "Limit price must be at or above the stop price.";
+			}
+		} else {
+			if (Number.isFinite(marketPrice) && stopPrice >= marketPrice) {
+				return "Stop price must be below the current price for sell stop orders.";
+			}
+
+			if (limitPrice > stopPrice) {
+				return "Limit price must be at or below the stop price.";
+			}
+		}
+
+		return "";
 	};
 
 	getOrderTicketValidation = (ticket) => {
@@ -3265,7 +3626,7 @@ class Home extends React.Component {
 		if (!Number.isFinite(amount) || amount <= 0) {
 			return {
 				isValid: false,
-				error: "Enter amount.",
+				error: "",
 			};
 		}
 
@@ -3276,10 +3637,35 @@ class Home extends React.Component {
 			};
 		}
 
+		if (
+			side === "BUY"
+			&& orderType === "LIMIT"
+			&& Number.isFinite(price)
+			&& price > 0
+		) {
+			const currentPrice = this.getLiveMarketPrice();
+
+			if (Number.isFinite(currentPrice) && price > currentPrice) {
+				return {
+					isValid: false,
+					error: "Limit price cannot exceed current price.",
+				};
+			}
+		}
+
 		if (orderType === "STOP_LIMIT" && (!Number.isFinite(stopPrice) || stopPrice <= 0)) {
 			return {
 				isValid: false,
 				error: "Enter a valid stop price.",
+			};
+		}
+
+		const stopLimitError = this.getStopLimitValidationError(ticket);
+
+		if (stopLimitError) {
+			return {
+				isValid: false,
+				error: stopLimitError,
 			};
 		}
 
@@ -3306,30 +3692,13 @@ class Home extends React.Component {
 			}
 		}
 
-		const available = this.getAvailableBalanceForSide(side);
-		const requiredBalance = this.getOrderRequiredBalance(ticket);
 		const sourceBalance = side === "BUY"
-			? this.getBuyQuoteBalance(requiredBalance)
-			: available;
-
-		if (!Number.isFinite(requiredBalance) || requiredBalance <= 0) {
-			return {
-				isValid: false,
-				error: "Check amount and price.",
-			};
-		}
-
-		if (requiredBalance > sourceBalance.amount) {
-			return {
-				isValid: false,
-				error: `Insufficient ${sourceBalance.currency} balance.`,
-			};
-		}
+			? this.getBuyQuoteBalance(0)
+			: this.getAvailableBalanceForSide(side);
 
 		return {
 			isValid: true,
 			error: "",
-			requiredBalance,
 			sourceCurrency: sourceBalance.currency,
 		};
 	};
@@ -3338,18 +3707,21 @@ class Home extends React.Component {
 		const ticket = this.state.orderTicket;
 		if (!ticket) return;
 
-		const price = Number(ticket.price);
 		const amount = Number(ticket.amount);
 		const nextMode = ticket.amountMode === "USD" ? "BASE" : "USD";
+		const conversionPrice = this.getOrderReferencePrice(ticket);
 		let nextAmount = ticket.amount;
 
-		if (Number.isFinite(price) && price > 0 && Number.isFinite(amount) && amount > 0) {
+		if (Number.isFinite(conversionPrice) && conversionPrice > 0 && Number.isFinite(amount) && amount > 0) {
 			nextAmount = nextMode === "USD"
-				? this.getOrderAmountInputValue({ ...ticket, amountMode: nextMode }, amount * price)
-				: this.getOrderAmountInputValue({ ...ticket, amountMode: nextMode }, amount / price);
+				? this.getOrderAmountInputValue({ ...ticket, amountMode: nextMode }, amount * conversionPrice)
+				: this.getOrderAmountInputValue({ ...ticket, amountMode: nextMode }, amount / conversionPrice);
 		}
 
+		this.cancelOrderPreviewRequests();
+
 		this.updateOrderTicket({
+			...this.getOrderPreviewResetPatch(),
 			amountMode: nextMode,
 			amount: nextAmount,
 			fraction: this.getOrderFractionFromAmount({
@@ -3359,47 +3731,456 @@ class Home extends React.Component {
 		});
 	};
 
-	setOrderFraction = (fraction) => {
+	setOrderFraction = (fraction, options = {}) => {
 		const ticket = this.state.orderTicket;
-		if (!ticket) return;
+		if (!ticket || this.isOrderTicketZeroAvailable(ticket)) return;
 
 		const safeFraction = Number.isFinite(Number(fraction))
 			? Math.max(0, Math.min(1, Number(fraction)))
 			: 0;
 		const maxAmount = this.getOrderMaxAmount(ticket);
-
-		this.updateOrderTicket({
+		const patch = {
 			fraction: safeFraction,
 			amount: maxAmount > 0
 				? this.getOrderAmountInputValue(ticket, maxAmount * safeFraction)
 				: "0",
-		});
+		};
+
+		if (options.schedulePreview === true) {
+			this.cancelOrderPreviewRequests();
+			Object.assign(patch, this.getOrderPreviewResetPatch());
+		}
+
+		this.updateOrderTicket(patch, { schedulePreview: options.schedulePreview === true });
 	};
 
-	loadBalanceHistory = (period = this.state.balanceHistoryPeriod) => (
-		api.getBalanceHistory({
+	applyOrderFractionPreset = (fraction) => {
+		this.setOrderFraction(fraction, { schedulePreview: true });
+	};
+
+	loadBalanceHistory = (period = this.state.balanceHistoryPeriod) => {
+		const requestId = ++this.balanceHistoryRequestId;
+
+		return api.getBalanceHistory({
 			period,
 			_: Date.now(),
 		}).then(response => {
+			if (requestId !== this.balanceHistoryRequestId) return;
+
 			this.setState({
 				balanceHistory: Array.isArray(response.data?.points) ? response.data.points : [],
 				balanceHistoryPeriod: period,
+				balanceHistoryLoadedPeriod: period,
+				balanceHistoryLoading: false,
 				balanceHistoryError: "",
 			});
 		}).catch(error => {
+			if (requestId !== this.balanceHistoryRequestId) return;
+
 			this.setState({
+				balanceHistoryLoading: false,
 				balanceHistoryError: error.response?.data?.detail || error.message || "Unable to load balance history.",
 			});
-		})
-	);
+		});
+	};
 
 	setBalanceHistoryPeriod = (period) => {
-		this.setState({ balanceHistoryPeriod: period }, () => {
+		if (period === this.state.balanceHistoryPeriod) return;
+
+		this.setState({
+			balanceHistoryPeriod: period,
+			balanceHistoryLoading: true,
+			balanceHistoryError: "",
+		}, () => {
 			this.loadBalanceHistory(period);
 		});
 	};
 
-	buildOrderTicketBody = (ticket = this.state.orderTicket) => {
+	getOrderTicketPreviewError = (ticket) => {
+		if (!ticket) return "Order ticket is closed.";
+
+		const side = ticket.side === "SELL" ? "SELL" : "BUY";
+		const orderType = this.normalizeOrderTypeForSide(side, ticket.orderType);
+		const amount = Number(ticket.amount);
+		const price = Number(ticket.price);
+		const stopPrice = Number(ticket.stopPrice);
+		const takeProfitPrice = Number(ticket.takeProfitPrice);
+		const stopLossPrice = Number(ticket.stopLossPrice);
+
+		if (!Number.isFinite(amount) || amount <= 0) {
+			return "";
+		}
+
+		if (orderType !== "MARKET" && orderType !== "BRACKET" && (!Number.isFinite(price) || price <= 0)) {
+			return "Enter a valid limit price.";
+		}
+
+		if (
+			side === "BUY"
+			&& orderType === "LIMIT"
+			&& Number.isFinite(price)
+			&& price > 0
+		) {
+			const currentPrice = this.getLiveMarketPrice();
+
+			if (Number.isFinite(currentPrice) && price > currentPrice) {
+				return "Limit price cannot exceed current price.";
+			}
+		}
+
+		if (orderType === "STOP_LIMIT" && (!Number.isFinite(stopPrice) || stopPrice <= 0)) {
+			return "Enter a valid stop price.";
+		}
+
+		const stopLimitError = this.getStopLimitValidationError(ticket);
+
+		if (stopLimitError) {
+			return stopLimitError;
+		}
+
+		if (orderType === "BRACKET") {
+			if (side !== "SELL") {
+				return "Bracket is only available for sell.";
+			}
+
+			if (!Number.isFinite(takeProfitPrice) || takeProfitPrice <= 0) {
+				return "Enter a valid TP price.";
+			}
+
+			if (!Number.isFinite(stopLossPrice) || stopLossPrice <= 0) {
+				return "Enter a valid SL price.";
+			}
+		}
+
+		return "";
+	};
+
+	scheduleOrderPreview = () => {
+		if (this.state.isOrderTicketClosing) return;
+
+		const ticket = this.state.orderTicket;
+
+		if (ticket && this.isMarketOrderTicket(ticket) && !(Number(ticket.amount) > 0)) {
+			return;
+		}
+
+		if (this.orderPreviewTimer) {
+			window.clearTimeout(this.orderPreviewTimer);
+		}
+
+		this.orderPreviewTimer = window.setTimeout(() => {
+			this.orderPreviewTimer = null;
+			this.refreshOrderPreview({ fromAmountChange: true });
+		}, 350);
+	};
+
+	stopMarketPreviewPoller = () => {
+		if (this.marketPreviewPollTimer) {
+			window.clearTimeout(this.marketPreviewPollTimer);
+			this.marketPreviewPollTimer = null;
+		}
+	};
+
+	ensureMarketPreviewPoller = () => {
+		const ticket = this.state.orderTicket;
+
+		if (!ticket || !this.isMarketOrderTicket(ticket)) {
+			this.stopMarketPreviewPoller();
+			return;
+		}
+
+		if (this.marketPreviewPollTimer) {
+			return;
+		}
+
+		this.marketPreviewPollTimer = window.setTimeout(() => {
+			this.marketPreviewPollTimer = null;
+			this.pollMarketOrderPreviewIfNeeded();
+			this.ensureMarketPreviewPoller();
+		}, MARKET_PREVIEW_POLL_INTERVAL_MS);
+	};
+
+	syncMarketPreviewPoller = () => {
+		const ticket = this.state.orderTicket;
+		const shouldPoll = Boolean(ticket && this.isMarketOrderTicket(ticket));
+
+		if (!shouldPoll) {
+			this.stopMarketPreviewPoller();
+			return;
+		}
+
+		this.ensureMarketPreviewPoller();
+	};
+
+	pollMarketOrderPreviewIfNeeded = () => {
+		const ticket = this.state.orderTicket;
+
+		if (!ticket || !this.isMarketOrderTicket(ticket)) {
+			return false;
+		}
+
+		if (!(Number(ticket.amount) > 0) || ticket.isPreviewLoading) {
+			return false;
+		}
+
+		const now = Date.now();
+
+		if (now - this.lastMarketPricePollRefreshAt < MARKET_PREVIEW_POLL_INTERVAL_MS) {
+			return false;
+		}
+
+		const snapshotPrice = this.normalizeMarketPriceForCompare(ticket.previewMarketPrice);
+		const overlayPrice = this.normalizeMarketPriceForCompare(this.getOverlayMarketPrice());
+
+		if (!Number.isFinite(overlayPrice) || overlayPrice <= 0) {
+			return false;
+		}
+
+		if (!Number.isFinite(snapshotPrice) || snapshotPrice <= 0) {
+			return false;
+		}
+
+		if (snapshotPrice === overlayPrice) {
+			return false;
+		}
+
+		this.refreshOrderPreview({ fromMarketPricePoll: true });
+		return true;
+	};
+
+	flushOrderPreview = () => {
+		if (this.orderPreviewTimer) {
+			window.clearTimeout(this.orderPreviewTimer);
+			this.orderPreviewTimer = null;
+		}
+
+		this.refreshOrderPreview({ fromAmountChange: true });
+	};
+
+	cancelOrderPreviewRequests = () => {
+		this.orderPreviewRequestId += 1;
+
+		if (this.orderPreviewTimer) {
+			window.clearTimeout(this.orderPreviewTimer);
+			this.orderPreviewTimer = null;
+		}
+	};
+
+	getOrderPreviewResetPatch = () => ({
+		preview: null,
+		previewBodyKey: "",
+		previewError: "",
+		previewMarketPrice: null,
+		previewEnteredAmount: null,
+		isPreviewLoading: false,
+	});
+
+	getOrderTicketPreviewBodyKey = (ticket, responseData) => {
+		if (!ticket || !responseData) return "";
+
+		const build = this.buildOrderTicketBody({
+			...ticket,
+			preview: responseData,
+			previewEnteredAmount: ticket.amount,
+		}, { forPreview: true });
+
+		return build.body ? JSON.stringify(build.body) : "";
+	};
+
+	finishOrderPreview = (requestId, bodyKey, responseData) => {
+		if (requestId !== this.orderPreviewRequestId) return false;
+
+		if (this.state.isOrderTicketClosing) return false;
+
+		const currentTicket = this.state.orderTicket;
+
+		if (!currentTicket) return false;
+
+		const acceptedBodyKey = this.getOrderTicketPreviewBodyKey(currentTicket, responseData);
+
+		if (!acceptedBodyKey) {
+			this.updateOrderTicket({
+				isPreviewLoading: false,
+			}, { schedulePreview: false });
+			return false;
+		}
+
+		const errs = Array.isArray(responseData?.errs) ? responseData.errs : [];
+		const previewError = errs.length && !this.isSellZeroBalanceTicket(currentTicket)
+			? getOrderErrorLabel({ errs }, "Unable to preview Coinbase order.", {
+				side: currentTicket.side,
+				orderType: this.normalizeOrderTypeForSide(currentTicket.side, currentTicket.orderType),
+			})
+			: "";
+		const previewMarketPrice = Number.isFinite(Number(this.marketPreviewRequestPrice))
+			&& Number(this.marketPreviewRequestPrice) > 0
+			? Number(this.marketPreviewRequestPrice)
+			: this.getOverlayMarketPrice();
+
+		this.marketPreviewRequestPrice = null;
+
+		this.updateOrderTicket({
+			preview: responseData,
+			previewBodyKey: acceptedBodyKey,
+			previewError,
+			previewMarketPrice: this.isMarketOrderTicket(currentTicket) ? previewMarketPrice : null,
+			previewEnteredAmount: currentTicket.amount,
+			isPreviewLoading: false,
+		}, {
+			schedulePreview: false,
+			onCommitted: () => {
+				if (this.isMarketOrderTicket(this.state.orderTicket)) {
+					this.ensureMarketPreviewPoller();
+				}
+			},
+		});
+
+		return true;
+	};
+
+	refreshOrderPreview = (options = {}) => {
+		if (this.state.isOrderTicketClosing) return;
+
+		const ticket = this.state.orderTicket;
+
+		if (!ticket || ticket.isSubmitting) return;
+
+		if (this.isOrderTicketZeroAvailable(ticket)) {
+			this.updateOrderTicket({
+				...this.getOrderPreviewResetPatch(),
+				previewError: "",
+			}, { schedulePreview: false });
+			return;
+		}
+
+		const stopLimitError = this.getStopLimitValidationError(ticket);
+
+		if (stopLimitError) {
+			this.updateOrderTicket({
+				preview: null,
+				previewBodyKey: "",
+				previewError: stopLimitError,
+				previewMarketPrice: null,
+				isPreviewLoading: false,
+			}, { schedulePreview: false });
+			return;
+		}
+
+		const previewError = this.getOrderTicketPreviewError(ticket);
+
+		if (previewError) {
+			this.updateOrderTicket({
+				preview: null,
+				previewBodyKey: "",
+				previewError: previewError === "" ? "" : previewError,
+				previewMarketPrice: null,
+				isPreviewLoading: false,
+			}, { schedulePreview: false });
+			return;
+		}
+
+		const displayBuild = this.buildOrderTicketBody(ticket, { forPreview: true });
+		const displayBodyKey = displayBuild.body ? JSON.stringify(displayBuild.body) : "";
+		const isMarketTicket = this.isMarketOrderTicket(ticket);
+		const isPricePollRequest = options.fromMarketPricePoll === true;
+		const isAmountChangeRequest = options.fromAmountChange === true;
+
+		if (isMarketTicket) {
+			if (!isPricePollRequest && !isAmountChangeRequest) {
+				return;
+			}
+
+			if (
+				isAmountChangeRequest
+				&& ticket.preview
+				&& !ticket.previewError
+				&& ticket.previewEnteredAmount !== null
+				&& String(ticket.previewEnteredAmount) === String(ticket.amount)
+			) {
+				return;
+			}
+		} else if (
+			ticket.preview
+			&& !ticket.previewError
+			&& ticket.previewBodyKey === displayBodyKey
+		) {
+			return;
+		}
+
+		const probeTicket = {
+			...ticket,
+			preview: null,
+			previewEnteredAmount: null,
+			previewBodyKey: "",
+			previewError: "",
+		};
+		const orderBuild = this.buildOrderTicketBody(probeTicket, { forPreview: true });
+
+		if (!orderBuild.body) {
+			this.updateOrderTicket({
+				preview: null,
+				previewBodyKey: "",
+				previewError: "",
+				previewMarketPrice: null,
+				isPreviewLoading: false,
+			}, { schedulePreview: false });
+			return;
+		}
+
+		const body = orderBuild.body;
+		const bodyKey = JSON.stringify(body);
+
+		if (isMarketTicket) {
+			this.marketPreviewRequestPrice = this.getOverlayMarketPrice();
+
+			if (isPricePollRequest) {
+				this.lastMarketPricePollRefreshAt = Date.now();
+			}
+		}
+
+		const requestId = this.orderPreviewRequestId + 1;
+		this.orderPreviewRequestId = requestId;
+
+		this.updateOrderTicket({
+			isPreviewLoading: true,
+			previewError: "",
+		}, { schedulePreview: false });
+
+		api.previewOrder(body)
+			.then(response => {
+				this.finishOrderPreview(requestId, bodyKey, response.data);
+			})
+			.catch(error => {
+				if (requestId !== this.orderPreviewRequestId) return;
+
+				const detail = error.response?.data?.detail;
+
+				if (detail?.preview) {
+					this.finishOrderPreview(requestId, bodyKey, {
+						...detail.preview,
+						errs: detail.errs || detail.preview.errs || [],
+					});
+					return;
+				}
+
+				this.updateOrderTicket({
+					preview: null,
+					previewBodyKey: "",
+					previewError: getOrderErrorLabel(
+						detail || error.message || "Unable to preview Coinbase order.",
+						"Unable to preview Coinbase order.",
+						{
+							side: ticket.side,
+							orderType: this.normalizeOrderTypeForSide(ticket.side, ticket.orderType),
+						},
+					),
+					previewMarketPrice: null,
+					isPreviewLoading: false,
+				}, { schedulePreview: false });
+			});
+	};
+
+	buildOrderTicketBody = (ticket = this.state.orderTicket, { forPreview = false } = {}) => {
 		if (!ticket) {
 			return {
 				body: null,
@@ -3410,6 +4191,8 @@ class Home extends React.Component {
 		const side = ticket.side === "SELL" ? "SELL" : "BUY";
 		const orderType = this.normalizeOrderTypeForSide(side, ticket.orderType);
 		const price = Number(ticket.price);
+		const formattedLimitPrice = Number(this.getOrderPriceInputValue(price));
+		const formattedStopPrice = Number(this.getOrderPriceInputValue(Number(ticket.stopPrice)));
 		const referencePrice = this.getOrderReferencePrice({ ...ticket, side, orderType });
 		const amount = Number(ticket.amount);
 		const baseCurrency = (this.state.loadedBaseCurrency || this.state.baseCurrency).trim().toUpperCase();
@@ -3429,18 +4212,35 @@ class Home extends React.Component {
 			};
 		}
 
-		const validation = this.getOrderTicketValidation(ticket);
+		let quoteCurrency = side === "BUY" ? "USD" : "USDC";
 
-		if (!validation.isValid) {
-			return {
-				body: null,
-				error: validation.error || "Check order values.",
-			};
+		if (forPreview) {
+			const previewError = this.getOrderTicketPreviewError(ticket);
+
+			if (previewError) {
+				return {
+					body: null,
+					error: previewError,
+				};
+			}
+
+			if (side === "BUY") {
+				quoteCurrency = this.getBuyQuoteBalance(0).currency || "USD";
+			}
+		} else {
+			const validation = this.getOrderTicketValidation(ticket);
+
+			if (!validation.isValid) {
+				return {
+					body: null,
+					error: validation.error || "Check order values.",
+				};
+			}
+
+			quoteCurrency = side === "BUY"
+				? validation.sourceCurrency || "USD"
+				: "USDC";
 		}
-
-		const quoteCurrency = side === "BUY"
-			? validation.sourceCurrency || "USD"
-			: "USDC";
 
 		const body = {
 			product_id: `${baseCurrency}-${quoteCurrency}`,
@@ -3454,17 +4254,17 @@ class Home extends React.Component {
 		};
 
 		if (ticket.amountMode === "USD" && side === "BUY") {
-			body.quote_size = estimateBuyQuoteSizeFromTotal(amount);
+			body.quote_size = getBuyUsdPreviewQuoteSize(amount);
 			delete body.base_size;
 		}
 
 		if (orderType === "LIMIT") {
-			body.limit_price = price;
+			body.limit_price = formattedLimitPrice;
 		}
 
 		if (orderType === "STOP_LIMIT") {
-			body.limit_price = price;
-			body.stop_price = Number(ticket.stopPrice);
+			body.limit_price = formattedLimitPrice;
+			body.stop_price = formattedStopPrice;
 		}
 
 		if (orderType === "BRACKET") {
@@ -3485,7 +4285,7 @@ class Home extends React.Component {
 
 	submitOrderTicket = () => {
 		const ticket = this.state.orderTicket;
-		if (!ticket || ticket.isSubmitting) return;
+		if (!ticket || ticket.isSubmitting || ticket.isPreviewLoading) return;
 
 		const orderBuild = this.buildOrderTicketBody(ticket);
 
@@ -3493,7 +4293,7 @@ class Home extends React.Component {
 			this.updateOrderTicket({
 				...(orderBuild.patch || {}),
 				error: orderBuild.error || "Check order values.",
-			});
+			}, { schedulePreview: false });
 			return;
 		}
 
@@ -3503,33 +4303,12 @@ class Home extends React.Component {
 		const previewId = preview?.preview_id;
 		const hasValidPreview = preview && ticket.previewBodyKey === bodyKey && !ticket.previewError;
 
-		this.updateOrderTicket({ isSubmitting: true, error: "" });
-
 		if (!hasValidPreview) {
-			api.previewOrder(body)
-				.then(response => {
-					this.updateOrderTicket({
-						isSubmitting: false,
-						preview: response.data,
-						previewBodyKey: bodyKey,
-						previewError: "",
-						error: "Preview ready. Review totals, then place order.",
-					});
-				})
-				.catch(error => {
-					const detail = error.response?.data?.detail || error.message || "Unable to preview Coinbase order.";
-					const previewError = getOrderErrorLabel(detail, "Unable to preview Coinbase order.");
-
-					this.updateOrderTicket({
-						isSubmitting: false,
-						preview: null,
-						previewBodyKey: "",
-						previewError,
-						error: previewError,
-					});
-				});
+			this.refreshOrderPreview({ fromAmountChange: true });
 			return;
 		}
+
+		this.updateOrderTicket({ isSubmitting: true, error: "" }, { schedulePreview: false });
 
 		api.placeOrder({
 			...body,
@@ -3541,26 +4320,53 @@ class Home extends React.Component {
 		})
 			.then((response) => {
 				const optimisticOrder = buildOptimisticOrderFromPlacement({ body, preview, response });
+				const closingTicket = this.state.orderTicket;
 
-				if (optimisticOrder) {
-					this.setState(prev => ({
-						allOrders: this.mergeOrderUpdates(prev.allOrders, [optimisticOrder], new Set()),
-						orders: this.mergeOrderUpdates(prev.orders, [optimisticOrder], new Set()),
-					}));
-				}
+				this.prepareOrderTicketClose();
 
-				this.closeOrderTicket();
-				this.loadOrders();
-				this.loadAllOrders();
-				this.loadProfile();
+				this.setState(prev => {
+					const ticket = prev.orderTicket;
+					const nextState = {};
+
+					if (optimisticOrder) {
+						nextState.allOrders = this.mergeOrderUpdates(prev.allOrders, [optimisticOrder], new Set());
+						nextState.orders = this.mergeOrderUpdates(prev.orders, [optimisticOrder], new Set());
+					}
+
+					if (!ticket) {
+						return Object.keys(nextState).length ? nextState : null;
+					}
+
+					return {
+						...nextState,
+						isOrderTicketClosing: true,
+						lastOrderSide: ticket.side === "SELL" ? "SELL" : "BUY",
+						savedOrderTickets: {
+							...prev.savedOrderTickets,
+							[ticket.side]: this.getSavedOrderSnapshot(ticket),
+						},
+						orderScaleHover: null,
+					};
+				}, () => {
+					if (closingTicket) {
+						this.scheduleOrderTicketCloseEnd();
+					}
+
+					this.loadOrders();
+					this.loadAllOrders();
+					this.loadProfile();
+				});
 			})
 			.catch(error => {
 				const detail = error.response?.data?.detail || error.message || "Unable to place Coinbase order.";
 
 				this.updateOrderTicket({
 					isSubmitting: false,
-					error: getOrderErrorLabel(detail, "Unable to place Coinbase order."),
-				});
+					error: getOrderErrorLabel(detail, "Unable to place Coinbase order.", {
+						side: ticket.side,
+						orderType: this.normalizeOrderTypeForSide(ticket.side, ticket.orderType),
+					}),
+				}, { schedulePreview: false });
 			});
 	};
 
@@ -3864,7 +4670,7 @@ class Home extends React.Component {
 			if (candles[index]) return candles[index].time;
 
 			if (index < 0) {
-				const step = this.getCandleIntervalStep(candles, 1);
+				const step = this.getCandleIntervalStep(candles, candles.length - 1);
 				return candles[0].time + index * step;
 			}
 
@@ -4250,7 +5056,6 @@ class Home extends React.Component {
 			hoveredVolumeIndex,
 			measurementStart,
 			measurementEnd,
-			bookmarkedPrice,
 			orderTicket,
 			overlayTick,
 			showTdIndicator,
@@ -4274,7 +5079,6 @@ class Home extends React.Component {
 		const profileLeft = 12;
 		const priceScaleWidth = Math.max(this.chart?.priceScale("right")?.width?.() || 0, 76);
 		const priceScaleLeft = Math.max(120, chartSize.width - priceScaleWidth);
-		const timelineTicks = this.buildTimelineTicks(priceScaleLeft - 4);
 		const orderLabelOffset = 34;
 		const orderCancelOffset = 16;
 		const maxProfileWidth = Math.min(178, chartSize.width * 0.18);
@@ -4303,7 +5107,7 @@ class Home extends React.Component {
 		const availableDepthWidth = Math.max(24, depthRightLimit - depthStartX);
 		const targetDepthWidth = Math.min(
 			availableDepthWidth,
-			Math.max(chartSize.width * MIN_DEPTH_WIDTH_RATIO, availableDepthWidth)
+			Math.max(chartSize.width * MIN_DEPTH_WIDTH_RATIO, availableDepthWidth),
 		);
 		const getLevelUsdValue = (level) => {
 			const price = Number(level.price);
@@ -4453,9 +5257,18 @@ class Home extends React.Component {
 				return rows;
 			}, []);
 		const orderLabelYById = new Map(orderedLabelRows.map(row => [row.id, row.labelY]));
-		const bookmarkedPriceValue = Number(bookmarkedPrice);
-		const bookmarkedY = Number.isFinite(bookmarkedPriceValue)
-			? this.priceToY(bookmarkedPriceValue)
+		const bookmarkedPriceValue = this.getBookmarkedPriceForCurrency(
+			this.state.loadedBaseCurrency || this.state.baseCurrency
+		);
+		const bookmarkedCoordinate = bookmarkedPriceValue === null
+			? null
+			: this.priceToY(bookmarkedPriceValue);
+		const bookmarkedY = (
+			Number.isFinite(bookmarkedCoordinate)
+			&& bookmarkedCoordinate >= 0
+			&& bookmarkedCoordinate <= chartSize.height
+		)
+			? bookmarkedCoordinate
 			: null;
 		const bookmarkedLabelY = bookmarkedY === null
 			? null
@@ -4600,18 +5413,6 @@ class Home extends React.Component {
 				height={chartSize.height}
 				style={{ width: priceScaleLeft }}
 			>
-				<g className="e__timeline-labels">
-					{timelineTicks.map(tick => (
-						<text
-							key={`${tick.time}-${tick.label}`}
-							x={tick.x}
-							y={chartSize.height - 8}
-							textAnchor="middle"
-						>
-							{tick.label}
-						</text>
-					))}
-				</g>
 				{timelineHoverLabel && (
 					<g className="e__timeline-hover-label">
 						<text
@@ -4838,41 +5639,6 @@ class Home extends React.Component {
 		);
 	};
 
-	formatChartTick = (time, tickMarkType) => {
-		return "";
-	};
-
-	buildTimelineTicks = (rightLimit) => {
-		if (!this.chart || !this.state.candles.length) return [];
-
-		const visibleRange = this.getVisibleTimeRange();
-		const from = visibleRange?.from;
-		const to = visibleRange?.to;
-
-		if (!Number.isFinite(from) || !Number.isFinite(to)) return [];
-
-		const ticks = buildEasternTimelineTimes(from, to)
-			.map(time => {
-				const x = this.timeToX(time);
-				const label = formatTimelineTickLabel(time);
-
-				if (!label || !Number.isFinite(x) || x < 0 || x > rightLimit) return null;
-
-				return { time, x, label };
-			})
-			.filter(Boolean);
-
-		return ticks.reduce((visibleTicks, tick) => {
-			const previous = visibleTicks[visibleTicks.length - 1];
-
-			if (!previous || tick.x - previous.x >= 34) {
-				visibleTicks.push(tick);
-			}
-
-			return visibleTicks;
-		}, []);
-	};
-
 	initChart = () => {
 		const el = this.chartRef.current;
 
@@ -4907,8 +5673,8 @@ class Home extends React.Component {
 				timeVisible: true,
 				secondsVisible: false,
 				borderColor: '#111820',
-				rightOffset: 52,
-				tickMarkFormatter: this.formatChartTick,
+				rightOffset: 0,
+				tickMarkFormatter: formatChartTickMark,
 			},
 			handleScroll: {
 				mouseWheel: true,
@@ -5015,7 +5781,7 @@ class Home extends React.Component {
 			&& this.state.candles.length > 0
 		);
 		const hasOverlayPricePrecision = hasPriceIncrement(this.state.product?.quote_increment);
-		const currentPrice = isOverlayMarketLoaded ? Number(lastCandle?.close) : NaN;
+		const currentPrice = isOverlayMarketLoaded ? this.getOverlayMarketPrice() : NaN;
 		const change24h = isOverlayMarketLoaded ? this.getOverlayPriceChange24h(currentPrice) : null;
 		const volume24h = isOverlayMarketLoaded ? this.getVolume24h() : null;
 		const changeClass = !change24h
@@ -5051,11 +5817,9 @@ class Home extends React.Component {
 					: null
 			: null;
 		const ticketBaseAmount = orderTicket && Number.isFinite(ticketAmountValue) && ticketAmountValue > 0
-			? orderTicket.amountMode === "USD"
-				? Number.isFinite(ticketSummaryPrice) && ticketSummaryPrice > 0
-					? ticketAmountValue / ticketSummaryPrice
-					: null
-				: ticketAmountValue
+			? orderTicket.amountMode === "BASE"
+				? ticketAmountValue
+				: null
 			: null;
 		const ticketAvailableAmount = Number(ticketAvailable?.amount);
 		const ticketAvailableLabel = ticketAvailable
@@ -5063,43 +5827,167 @@ class Home extends React.Component {
 				? this.getBaseAmountInputValue(ticketAvailableAmount)
 				: formatBalanceAmount(ticketAvailableAmount)} ${ticketAvailable.currency}`
 			: "--";
-		const ticketBaseAmountLabel = ticketBaseAmount !== null
-			? `${this.getBaseAmountInputValue(ticketBaseAmount)} ${ticketBaseCurrency}`
-			: "--";
-		const ticketPreview = orderTicket?.preview || null;
-		const ticketPreviewTotal = Number(ticketPreview?.order_total);
-		const ticketPreviewFee = Number(ticketPreview?.commission_total);
-		const ticketPreviewQuoteSize = Number(ticketPreview?.quote_size);
-		const ticketPreviewBaseSize = Number(ticketPreview?.base_size);
-		const ticketPreviewTotalLabel = Number.isFinite(ticketPreviewTotal)
-			? formatUsdCents(ticketPreviewTotal)
-			: ticketUsdTotal !== null
-				? formatUsdCents(ticketUsdTotal)
-				: "--";
-		const ticketPreviewBaseAmountLabel = Number.isFinite(ticketPreviewBaseSize) && ticketPreviewBaseSize > 0
-			? `${this.getBaseAmountInputValue(ticketPreviewBaseSize)} ${ticketBaseCurrency}`
+		const ticketPreviewMarketPrice = Number(orderTicket?.previewMarketPrice);
+		const isSellMarketTicket = ticketSide === "SELL" && ticketOrderType === "MARKET";
+		const isSellTicket = ticketSide === "SELL";
+		const isSellCoinAmountTicket = isSellTicket && orderTicket?.amountMode === "BASE";
+		const ticketMarketPriceLabel = (ticketSide === "BUY" || isSellMarketTicket) && ticketOrderType === "MARKET"
+			? orderTicket?.isPreviewLoading
+				? "..."
+				: Number.isFinite(ticketPreviewMarketPrice) && ticketPreviewMarketPrice > 0
+					? `${formatDisplayPriceWithIncrement(ticketPreviewMarketPrice, this.state.product?.quote_increment)} USD`
+					: "--"
 			: null;
+		const ticketPreview = orderTicket?.preview || null;
+		const ticketCurrentBody = orderTicket ? this.buildOrderTicketBody(orderTicket, { forPreview: true }).body : null;
+		const ticketCurrentBodyKey = ticketCurrentBody ? JSON.stringify(ticketCurrentBody) : "";
+		const ticketHasMatchingPreview = Boolean(
+			ticketPreview
+			&& orderTicket?.previewBodyKey === ticketCurrentBodyKey
+		);
+		const ticketHasPreviewDisplay = ticketHasMatchingPreview;
+		const ticketHasValidPreview = ticketHasMatchingPreview && !orderTicket?.previewError;
+		const previewMatchesAmount = Boolean(
+			ticketPreview
+			&& !orderTicket?.previewError
+			&& orderTicket?.previewEnteredAmount !== null
+			&& orderTicket?.previewEnteredAmount !== undefined
+			&& String(orderTicket.previewEnteredAmount) === String(orderTicket.amount)
+		);
+		const ticketSummaryPending = Number.isFinite(ticketAmountValue) && ticketAmountValue > 0
+			&& !previewMatchesAmount
+			&& !orderTicket?.previewError;
+		const isBuyUsdPayMode = ticketSide === "BUY" && orderTicket?.amountMode === "USD";
+		const isSellUsdPayMode = ticketSide === "SELL" && orderTicket?.amountMode === "USD";
+		const isBuyCoinAmountTicket = ticketSide === "BUY" && orderTicket?.amountMode === "BASE";
+		const buyUsdPreviewSummary = isBuyUsdPayMode && Number.isFinite(ticketAmountValue) && ticketAmountValue > 0
+			? getBuyUsdOrderTicketSummary(
+				ticketAmountValue,
+				previewMatchesAmount ? ticketPreview : null,
+			)
+			: null;
+		const sellUsdPreviewSummary = isSellUsdPayMode && Number.isFinite(ticketAmountValue) && ticketAmountValue > 0
+			? getSellUsdOrderTicketSummary(
+				ticketAmountValue,
+				previewMatchesAmount ? ticketPreview : null,
+			)
+			: null;
+		const sellCoinPreviewSummary = isSellCoinAmountTicket && previewMatchesAmount
+			? getSellOrderTicketSummary(ticketPreview)
+			: null;
+		const ticketPreviewTotal = buyUsdPreviewSummary
+			? buyUsdPreviewSummary.total
+			: sellUsdPreviewSummary
+				? sellUsdPreviewSummary.total
+				: sellCoinPreviewSummary
+					? sellCoinPreviewSummary.total
+					: previewMatchesAmount
+						? Number(ticketPreview?.order_total)
+						: isSellTicket
+							? NaN
+							: ticketUsdTotal;
+		const ticketPreviewFee = buyUsdPreviewSummary
+			? buyUsdPreviewSummary.fee
+			: sellUsdPreviewSummary
+				? sellUsdPreviewSummary.fee
+				: sellCoinPreviewSummary
+					? sellCoinPreviewSummary.fee
+					: previewMatchesAmount
+						? Number(ticketPreview?.commission_total)
+						: NaN;
+		const ticketPreviewQuoteSize = buyUsdPreviewSummary
+			? buyUsdPreviewSummary.value
+			: sellUsdPreviewSummary
+				? sellUsdPreviewSummary.value
+				: sellCoinPreviewSummary
+					? sellCoinPreviewSummary.value
+					: previewMatchesAmount
+						? Number(ticketPreview?.quote_size)
+						: NaN;
+		const ticketPreviewBaseSize = previewMatchesAmount
+			? getOrderPreviewBaseSize(ticketPreview)
+			: NaN;
+		const ticketPreviewTotalLabel = Number.isFinite(ticketPreviewTotal) && ticketPreviewTotal > 0
+			? formatUsdCents(ticketPreviewTotal)
+			: orderTicket?.isPreviewLoading && !isBuyUsdPayMode && !isSellUsdPayMode
+				? "..."
+				: "--";
+		const ticketPreviewBaseAmountLabel = isSellCoinAmountTicket && Number.isFinite(ticketAmountValue) && ticketAmountValue > 0
+			? `${this.getBaseAmountInputValue(ticketAmountValue)} ${ticketBaseCurrency}`
+			: isBuyCoinAmountTicket && Number.isFinite(ticketAmountValue) && ticketAmountValue > 0
+				? `${this.getBaseAmountInputValue(ticketAmountValue)} ${ticketBaseCurrency}`
+				: previewMatchesAmount && Number.isFinite(ticketPreviewBaseSize) && ticketPreviewBaseSize > 0
+					? `${this.getBaseAmountInputValue(ticketPreviewBaseSize)} ${ticketBaseCurrency}`
+					: ticketSummaryPending || orderTicket?.isPreviewLoading
+						? "..."
+						: "--";
 		const ticketPreviewFeeLabel = Number.isFinite(ticketPreviewFee)
 			? formatUsdCents(ticketPreviewFee)
-			: "--";
-		const ticketPreviewQuoteSizeLabel = Number.isFinite(ticketPreviewQuoteSize) && ticketPreviewQuoteSize > 0
-			? formatUsdCents(ticketPreviewQuoteSize)
+			: ticketSummaryPending || orderTicket?.isPreviewLoading
+				? "..."
+				: "--";
+		const ticketPreviewQuoteSizeLabel = (ticketSide === "BUY" || isSellTicket)
+			? previewMatchesAmount && Number.isFinite(ticketPreviewQuoteSize) && ticketPreviewQuoteSize > 0
+				? formatUsdCents(ticketPreviewQuoteSize)
+				: ticketSummaryPending || orderTicket?.isPreviewLoading
+					? "..."
+					: "--"
 			: null;
+		const isSellBracketTicket = ticketSide === "SELL" && ticketOrderType === "BRACKET";
+		const ticketTakeProfitPrice = Number(orderTicket?.takeProfitPrice);
+		const ticketStopLossPrice = Number(orderTicket?.stopLossPrice);
+		const ticketBracketCoinAmount = isSellBracketTicket && Number.isFinite(ticketAmountValue) && ticketAmountValue > 0
+			? orderTicket?.amountMode === "BASE"
+				? ticketAmountValue
+				: Number.isFinite(ticketTakeProfitPrice) && ticketTakeProfitPrice > 0
+					? ticketAmountValue / ticketTakeProfitPrice
+					: previewMatchesAmount && Number.isFinite(ticketPreviewBaseSize) && ticketPreviewBaseSize > 0
+						? ticketPreviewBaseSize
+						: NaN
+			: NaN;
+		const ticketBracketProfit = isSellBracketTicket
+			&& Number.isFinite(ticketBracketCoinAmount)
+			&& ticketBracketCoinAmount > 0
+			&& Number.isFinite(ticketTakeProfitPrice)
+			&& ticketTakeProfitPrice > 0
+			? ticketBracketCoinAmount * ticketTakeProfitPrice
+			: NaN;
+		const ticketBracketLoss = isSellBracketTicket
+			&& Number.isFinite(ticketBracketCoinAmount)
+			&& ticketBracketCoinAmount > 0
+			&& Number.isFinite(ticketStopLossPrice)
+			&& ticketStopLossPrice > 0
+			? ticketBracketCoinAmount * ticketStopLossPrice
+			: NaN;
+		const ticketBracketProfitLabel = isSellBracketTicket
+			? Number.isFinite(ticketBracketProfit) && ticketBracketProfit > 0
+				? formatUsdCents(ticketBracketProfit)
+				: "--"
+			: null;
+		const ticketBracketLossLabel = isSellBracketTicket
+			? Number.isFinite(ticketBracketLoss) && ticketBracketLoss > 0
+				? formatUsdCents(ticketBracketLoss)
+				: "--"
+			: null;
+		const ticketSliderDisabled = this.isOrderTicketZeroAvailable(orderTicket);
+		const ticketSliderFraction = orderTicket
+			? this.getOrderFractionFromAmount(orderTicket)
+			: 0;
 		const ticketAmountUnitLabel = orderTicket?.amountMode === "USD" ? "USD" : ticketBaseCurrency;
-		const ticketCurrentBody = orderTicket ? this.buildOrderTicketBody(orderTicket).body : null;
-		const ticketCurrentBodyKey = ticketCurrentBody ? JSON.stringify(ticketCurrentBody) : "";
-		const ticketHasValidPreview = Boolean(ticketPreview && orderTicket?.previewBodyKey === ticketCurrentBodyKey && !orderTicket?.previewError);
 		const ticketActionLabel = orderTicket?.isSubmitting
-			? ticketHasValidPreview
-				? "Placing"
-				: "Previewing"
-			: ticketHasValidPreview
-				? `Place ${ticketActionSideLabel}`
-				: `Preview ${ticketActionSideLabel}`;
+			? "Placing..."
+			: orderTicket?.isPreviewLoading
+				? "Updating..."
+				: ticketHasValidPreview
+					? `Place ${ticketActionSideLabel}`
+					: `Preview ${ticketActionSideLabel}`;
 		const ticketValidation = this.getOrderTicketValidation(orderTicket);
-		const ticketVisibleError = orderTicket?.error || ticketValidation.error;
-		const ticketMessageIsSuccess = String(ticketVisibleError).startsWith("Order placed")
-			|| String(ticketVisibleError).startsWith("Preview ready");
+		const ticketVisibleError = ticketSliderDisabled
+			? orderTicket?.error || ticketValidation.error
+			: orderTicket?.error
+				|| ticketValidation.error
+				|| orderTicket?.previewError;
+		const ticketMessageIsSuccess = String(ticketVisibleError).startsWith("Order placed");
 		const orderTicketStyle = orderTicket ? this.getOrderTicketStyle(orderTicket) : null;
 		return (
 			<div className={classnames} ref={this.container}>
@@ -5163,6 +6051,8 @@ class Home extends React.Component {
 						<BalanceDropdown
 							balanceHistory={this.state.balanceHistory}
 							balanceHistoryError={this.state.balanceHistoryError}
+							balanceHistoryLoadedPeriod={this.state.balanceHistoryLoadedPeriod}
+							balanceHistoryLoading={this.state.balanceHistoryLoading}
 							balanceHistoryPeriod={this.state.balanceHistoryPeriod}
 							balances={profileBalances}
 							error={this.state.profileError}
@@ -5222,14 +6112,16 @@ class Home extends React.Component {
 					)}
 					<OrderBubble
 						amountUnitLabel={ticketAmountUnitLabel}
-						baseAmountLabel={ticketBaseAmountLabel}
 						isClosing={this.state.isOrderTicketClosing}
 						isOrderTypeMenuOpen={this.state.isOrderTypeMenuOpen}
 						messageIsSuccess={ticketMessageIsSuccess}
 						onAmountBlur={this.formatOrderAmountInput}
 						onAmountChange={this.updateOrderAmount}
+						onAmountKeyDown={this.handleOrderAmountKeyDown}
 						onCancel={this.closeOrderTicket}
 						onFractionChange={this.setOrderFraction}
+						onFractionCommit={this.flushOrderPreview}
+						onFractionPreset={this.applyOrderFractionPreset}
 						onOrderTypeMenuToggle={() => {
 							if (ticketPrimaryOrderType !== "STOP") {
 								this.setOrderType("STOP_LIMIT");
@@ -5248,11 +6140,16 @@ class Home extends React.Component {
 						orderTicketRef={this.orderTicketRef}
 						orderTicketStyle={orderTicketStyle}
 						previewBaseAmountLabel={ticketPreviewBaseAmountLabel}
+						previewBracketLossLabel={ticketBracketLossLabel}
+						previewBracketProfitLabel={ticketBracketProfitLabel}
 						previewFeeLabel={ticketPreviewFeeLabel}
 						previewQuoteSizeLabel={ticketPreviewQuoteSizeLabel}
 						previewTotalLabel={ticketPreviewTotalLabel}
+						sliderDisabled={ticketSliderDisabled}
+						sliderFraction={ticketSliderFraction}
 						submitLabel={ticketActionLabel}
 						ticketAvailableLabel={ticketAvailableLabel}
+						ticketMarketPriceLabel={ticketMarketPriceLabel}
 						ticketOrderType={ticketOrderType}
 						ticketPrimaryOrderType={ticketPrimaryOrderType}
 						ticketSide={ticketSide}
