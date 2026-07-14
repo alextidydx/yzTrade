@@ -21,8 +21,9 @@ import {
 
 import {
 	DEFAULT_DEPTH_CHART_WIDTH_RATIO,
-	DEFAULT_VISIBLE_HOURS,
-	DEPTH_RANGE_PADDING,
+	DEFAULT_PERIOD_DAYS,
+	MAX_VISIBLE_PERIOD_DAYS,
+	DEPTH_CHART_PADDING_RATIO,
 	DISTRIBUTION_BINS,
 	DROPDOWN_TRANSITION_MS,
 	INDICATOR_COOKIES,
@@ -39,13 +40,9 @@ import {
 } from "../../../utils/homeConstants";
 
 import {
-	chartFullTimeFormatter,
-	chartTimeFormatter,
 	deleteBookmarkedPrice,
 	formatAmountWithIncrementFloor,
 	formatBalanceAmount,
-	formatChartEasternTime,
-	formatChartTickMark,
 	formatDisplayPriceWithIncrement,
 	formatMeasurementDuration,
 	formatOrderValue,
@@ -62,14 +59,17 @@ import {
 	getCookieBoolean,
 	buildOptimisticOrderFromPlacement,
 	enrichOrderForDisplay,
+	filterOrdersForChartProduct,
 	floorQuoteCurrencyAmount,
 	getBuyUsdOrderTicketSummary,
 	getBuyUsdPreviewQuoteSize,
-	getSellOrderTicketSummary,
-	getSellUsdOrderTicketSummary,
+	getSellPreviewTicketSummary,
 	getOrderPreviewBaseSize,
 	getOrderErrorLabel,
+	isOpenOrderStatus,
+	isRemovedLiveOrder,
 	mergeOrderFields,
+	normalizeBalanceHistoryPeriod,
 	normalizeBookmarkPrice,
 	getPrecisionFromIncrement,
 	getRoutePrefix,
@@ -80,6 +80,12 @@ import {
 	setBookmarkedPrice,
 	setCookieBoolean,
 } from "../../../utils/homeUtils";
+import {
+	formatChartCrosshairTime,
+	toChartData,
+	toChartPoint,
+	toChartTime,
+} from "../../../utils/chartTime";
 export default (props) => (
 	<Home {...props} payload={useParams()} history={useLocation()} navigate={useNavigate()} />
 );
@@ -130,6 +136,7 @@ class Home extends React.Component {
 		appBookmarks: null,
 		appSettings: {
 			balanceHistoryExpanded: false,
+			balanceHistoryPeriod: "week",
 		},
 		isMonitorOpen: false,
 		isCurrencyPickerHovered: false,
@@ -145,10 +152,10 @@ class Home extends React.Component {
 		showVwapIndicator: getCookieBoolean(INDICATOR_COOKIES.vwap, true),
 		showHistogramIndicator: getCookieBoolean(INDICATOR_COOKIES.histogram, true),
 		baseCurrency: getBaseCurrencyFromPath(window.location.pathname),
-		periodDays: 7,
+		periodDays: DEFAULT_PERIOD_DAYS,
 		periodGranularity: 300,
 		loadedBaseCurrency: getBaseCurrencyFromPath(window.location.pathname),
-		loadedPeriodDays: 7,
+		loadedPeriodDays: DEFAULT_PERIOD_DAYS,
 		loadedPeriodGranularity: 300,
 		product: null,
 		productStats: null,
@@ -184,11 +191,13 @@ class Home extends React.Component {
 	priceScaleWheelState = null;
 	priceScaleWheelOverlayTimer = null;
 	visibleRangeHandler = null;
+	isCrosshairTimeLabelVisible = false;
 	liveSocket = null;
 	liveProductId = null;
 	liveReconnectTimer = null;
 	liveReconnectAttempt = 0;
 	liveReconnectConfig = null;
+	pinnedMarketDepthRange = null;
 	liveConnectTimeout = null;
 	liveWatchdogTimer = null;
 	lastLiveMessageAt = 0;
@@ -216,12 +225,13 @@ class Home extends React.Component {
 	isDisconnectingLive = false;
 	suppressMeasurementClick = false;
 	profileRequestId = 0;
+	profileRefreshAfterOrderTimers = [];
 	dropdownCloseTimers = {};
 	orderTicketCloseTimer = null;
 	orderPreviewTimer = null;
 	orderPreviewRequestId = 0;
 	marketPreviewPollTimer = null;
-	lastMarketPricePollRefreshAt = 0;
+	lastMarketPreviewAt = 0;
 	marketPreviewRequestPrice = null;
 
 	componentDidMount() {
@@ -235,7 +245,7 @@ class Home extends React.Component {
 		this.connectAppStateSocket();
 		this.bootstrapFromConfig();
 		this.loadBalanceHistory();
-		this.profileRefreshTimer = window.setInterval(this.loadProfile, 5000);
+		this.profileRefreshTimer = window.setInterval(this.loadProfile, 60000);
 		this.allOrdersRefreshTimer = window.setInterval(this.loadAllOrders, 5000);
 		this.balanceHistoryRefreshTimer = window.setInterval(this.loadBalanceHistory, 60000);
 		this.monitorRefreshTimer = window.setInterval(this.loadMonitorTickers, 60000);
@@ -400,6 +410,9 @@ class Home extends React.Component {
 		if (this.orderTicketCloseTimer) {
 			window.clearTimeout(this.orderTicketCloseTimer);
 		}
+
+		this.profileRefreshAfterOrderTimers.forEach(timer => window.clearTimeout(timer));
+		this.profileRefreshAfterOrderTimers = [];
 
 		if (this.orderPreviewTimer) {
 			window.clearTimeout(this.orderPreviewTimer);
@@ -910,11 +923,24 @@ class Home extends React.Component {
 		const time = this.getCrosshairTimeFromX(x);
 
 		if (!Number.isFinite(time)) return;
-		this.chart.setCrosshairPosition(price, time, this.candleSeries);
+		this.chart.setCrosshairPosition(price, toChartTime(time), this.candleSeries);
 	};
 
 	clearNativeCrosshair = () => {
 		this.chart?.clearCrosshairPosition?.();
+	};
+
+	setCrosshairTimeLabelVisible = (visible) => {
+		if (!this.chart || visible === this.isCrosshairTimeLabelVisible) return;
+
+		this.isCrosshairTimeLabelVisible = visible;
+		this.chart.applyOptions({
+			crosshair: {
+				vertLine: {
+					labelVisible: visible,
+				},
+			},
+		});
 	};
 
 	handleFreeCrosshairMove = (event) => {
@@ -932,6 +958,16 @@ class Home extends React.Component {
 			&& x >= hover.x - 36
 			&& x <= rect.width;
 		const isOverPriceScale = x >= scaleLeft && x <= rect.width;
+		const firstCandleTime = this.state.candles[0]?.time;
+		const lastCandleTime = this.state.candles[this.state.candles.length - 1]?.time;
+		const firstCandleX = Number.isFinite(firstCandleTime) ? this.timeToX(firstCandleTime) : null;
+		const lastCandleX = Number.isFinite(lastCandleTime) ? this.timeToX(lastCandleTime) : null;
+		const isOverCandleZone = (
+			Number.isFinite(firstCandleX)
+			&& Number.isFinite(lastCandleX)
+			&& x >= firstCandleX
+			&& x <= lastCandleX
+		);
 		const scalePrice = isOverPriceScale ? this.candleSeries?.coordinateToPrice(y) : null;
 		const bridgePrice = isMovingTowardOrderHover ? this.candleSeries?.coordinateToPrice(y) : null;
 		const orderScaleHover = Number.isFinite(scalePrice)
@@ -947,7 +983,11 @@ class Home extends React.Component {
 			return;
 		}
 
-		const nextHoveredVolumeIndex = this.getHoveredCandleIndexFromX(x);
+		this.setCrosshairTimeLabelVisible(isOverCandleZone);
+
+		const nextHoveredVolumeIndex = isOverCandleZone
+			? this.getHoveredCandleIndexFromX(x)
+			: null;
 
 		if (nextHoveredVolumeIndex !== this.state.hoveredVolumeIndex) {
 			this.syncVolumeSeries(this.state.candles, nextHoveredVolumeIndex);
@@ -987,6 +1027,8 @@ class Home extends React.Component {
 	handleFreeCrosshairLeave = (event) => {
 		if (event?.relatedTarget?.closest?.(".e__scale-hover-actions")) return;
 		if (this.isPointerOnOrderPlus) return;
+
+		this.setCrosshairTimeLabelVisible(false);
 
 		if (this.state.hoveredVolumeIndex !== null) {
 			this.syncVolumeSeries(this.state.candles, null);
@@ -1053,6 +1095,22 @@ class Home extends React.Component {
 		this.setState({ orderScaleHover: nextHover });
 	};
 
+	getTimeScaleBarSpacingOptions = (width) => {
+		const chartWidth = Number(width);
+		const granularity = Number(this.state.periodGranularity) || 300;
+
+		if (!Number.isFinite(chartWidth) || chartWidth <= 0) {
+			return {};
+		}
+
+		const maxVisibleBars = Math.ceil((MAX_VISIBLE_PERIOD_DAYS * 86400) / granularity);
+
+		return {
+			maxBarSpacing: 0,
+			minBarSpacing: chartWidth / maxVisibleBars,
+		};
+	};
+
 	handleResize = () => {
 		if (!this.chart || !this.chartRef.current) return;
 
@@ -1060,6 +1118,7 @@ class Home extends React.Component {
 		const height = this.chartRef.current.clientHeight;
 
 		this.chart.applyOptions({ width, height });
+		this.chart.timeScale().applyOptions(this.getTimeScaleBarSpacingOptions(width));
 		this.setState({ chartSize: { width, height } });
 	};
 
@@ -1098,8 +1157,8 @@ class Home extends React.Component {
 		const requestedFrom = Number(snapshot.timeRange.from);
 		const requestedTo = Number(snapshot.timeRange.to);
 		const duration = requestedTo - requestedFrom;
-		const loadedFrom = Number(candles[0].time);
-		const loadedTo = Number(candles[candles.length - 1].time);
+		const loadedFrom = toChartTime(candles[0].time);
+		const loadedTo = toChartTime(candles[candles.length - 1].time);
 
 		if (
 			!Number.isFinite(requestedFrom)
@@ -1136,7 +1195,7 @@ class Home extends React.Component {
 			return Number(this.state.loadedPeriodGranularity);
 		}
 
-		return Number(this.state.loadedPeriodDays) <= 7 ? 3600 : 21600;
+		return Number(this.state.loadedPeriodDays) <= DEFAULT_PERIOD_DAYS ? 3600 : 21600;
 	};
 
 	findCandleIndexByTime = (candles, time) => {
@@ -1203,12 +1262,12 @@ class Home extends React.Component {
 
 		return api.getCandles({
 			product_id: `${baseCurrency}-USD`,
-			days: Number(this.state.loadedPeriodDays) || 7,
+			days: Number(this.state.loadedPeriodDays) || DEFAULT_PERIOD_DAYS,
 			granularity,
 			end_time: Math.max(0, Math.floor(Number(endTime))),
 			limit: Math.max(1, Math.min(300, limit)),
 			_: Date.now(),
-		}).then(response => this.normalizeCandles(response.data))
+		}).then(response => this.parseCandlesResponse(response.data).candles)
 			.catch(() => []);
 	};
 
@@ -1356,8 +1415,12 @@ class Home extends React.Component {
 			return prev.depth;
 		}
 
-		const minPrice = Number(prev.depth.min_price);
-		const maxPrice = Number(prev.depth.max_price);
+		const minPrice = Number(
+			this.pinnedMarketDepthRange?.min_price ?? prev.depth.min_price,
+		);
+		const maxPrice = Number(
+			this.pinnedMarketDepthRange?.max_price ?? prev.depth.max_price,
+		);
 		const isInRange = level => {
 			const levelPrice = Number(level.price);
 
@@ -1365,13 +1428,15 @@ class Home extends React.Component {
 				&& (!Number.isFinite(minPrice) || levelPrice >= minPrice)
 				&& (!Number.isFinite(maxPrice) || levelPrice <= maxPrice);
 		};
-		const bids = depthMessage.depth.bids.filter(isInRange);
-		const asks = depthMessage.depth.asks.filter(isInRange);
+		const bids = this.mergeDepthLevels(prev.depth.bids, depthMessage.depth.bids.filter(isInRange));
+		const asks = this.mergeDepthLevels(prev.depth.asks, depthMessage.depth.asks.filter(isInRange));
 
 		if (!bids.length && !asks.length) return prev.depth;
 
 		return {
 			...prev.depth,
+			min_price: minPrice,
+			max_price: maxPrice,
 			current_price: Number.isFinite(Number(depthMessage.depth.current_price))
 				? Number(depthMessage.depth.current_price)
 				: Number.isFinite(latestPrice)
@@ -1385,12 +1450,12 @@ class Home extends React.Component {
 	updateCurrentCandleOnChart = (currentCandle, highlightedIndex = this.state.hoveredVolumeIndex) => {
 		if (!currentCandle || !this.candleSeries) return;
 
-		this.candleSeries.update(currentCandle);
+		this.candleSeries.update(toChartPoint(currentCandle));
 
 		if (!this.volumeSeries) return;
 
 		this.volumeSeries.update({
-			time: currentCandle.time,
+			time: toChartTime(currentCandle.time),
 			value: this.getCandleVolumeUsd(currentCandle),
 			color: this.getVolumeBarColor(
 				currentCandle,
@@ -1402,7 +1467,7 @@ class Home extends React.Component {
 	syncCandleSeries = (candles = this.state.candles) => {
 		if (!Array.isArray(candles) || !candles.length) return;
 
-		this.candleSeries?.setData(candles);
+		this.candleSeries?.setData(toChartData(candles));
 		this.syncVolumeSeries(candles);
 	};
 
@@ -1429,7 +1494,7 @@ class Home extends React.Component {
 
 		api.getCandles({
 			product_id: `${baseCurrency}-USD`,
-			days: Number(this.state.loadedPeriodDays) || 7,
+			days: Number(this.state.loadedPeriodDays) || DEFAULT_PERIOD_DAYS,
 			granularity,
 			end_time: Math.max(0, oldestTime - 1),
 			limit: 300,
@@ -1437,7 +1502,7 @@ class Home extends React.Component {
 		}).then(response => {
 			if (requestId !== this.marketRequestId || baseCurrency !== this.state.loadedBaseCurrency) return;
 
-			const olderCandles = this.normalizeCandles(response.data)
+			const olderCandles = this.parseCandlesResponse(response.data).candles
 				.filter(candle => Number(candle.time) < oldestTime);
 
 			if (!olderCandles.length) {
@@ -1490,18 +1555,8 @@ class Home extends React.Component {
 		if (!Array.isArray(candles) || !candles.length) return null;
 
 		const lastIndex = candles.length - 1;
-		const loadedTo = Number(candles[lastIndex].time);
-
-		if (!Number.isFinite(loadedTo)) return null;
-
-		const fromTime = loadedTo - DEFAULT_VISIBLE_HOURS * 3600;
-		let firstIndex = candles.findIndex(candle => Number(candle.time) >= fromTime);
-
-		if (firstIndex < 0) {
-			firstIndex = 0;
-		}
-
-		const visibleBars = Math.max(1, lastIndex - firstIndex + 1);
+		const firstIndex = 0;
+		const visibleBars = lastIndex + 1;
 		const depthRatio = DEFAULT_DEPTH_CHART_WIDTH_RATIO;
 		const timelinePaddingBars = visibleBars * depthRatio / (1 - depthRatio);
 
@@ -1512,36 +1567,82 @@ class Home extends React.Component {
 	};
 
 	getCandlesForDefaultViewport = (candles) => {
-		if (!Array.isArray(candles) || !candles.length) return [];
+		if (!Array.isArray(candles) || !candles.length) return candles;
 
+		const periodDays = Number(this.state.loadedPeriodDays || this.state.periodDays) || DEFAULT_PERIOD_DAYS;
 		const loadedTo = Number(candles[candles.length - 1].time);
 
 		if (!Number.isFinite(loadedTo)) return candles;
 
-		const fromTime = loadedTo - DEFAULT_VISIBLE_HOURS * 3600;
+		const fromTime = loadedTo - periodDays * 24 * 3600;
 
 		return candles.filter(candle => Number(candle.time) >= fromTime);
 	};
 
-	getDepthRangeForCandles = (candles, latestPrice) => {
-		if (!Array.isArray(candles) || !candles.length || !Number.isFinite(Number(latestPrice))) {
+	getDepthRangeForCandles = (candles) => {
+		if (!Array.isArray(candles) || !candles.length) {
 			return null;
 		}
 
-		const timeframeMin = Math.min(...candles.map(candle => candle.low));
-		const timeframeMax = Math.max(...candles.map(candle => candle.high));
-		const minSpan = Math.max(Math.abs(latestPrice) * 0.005, 0.01);
-		const maxDelta = Math.max(
-			Math.abs(timeframeMax - latestPrice),
-			Math.abs(latestPrice - timeframeMin),
-			minSpan,
-		);
-		const depthDelta = maxDelta * DEPTH_RANGE_PADDING;
+		const chartMin = Math.min(...candles.map(candle => candle.low));
+		const chartMax = Math.max(...candles.map(candle => candle.high));
+		const minSpan = Math.max(Math.abs(chartMax) * 0.005, 0.01);
+		const span = Math.max(chartMax - chartMin, minSpan);
+		const padding = span * DEPTH_CHART_PADDING_RATIO;
 
 		return {
-			min_price: latestPrice - depthDelta,
-			max_price: latestPrice + depthDelta,
+			min_price: chartMin - padding,
+			max_price: chartMax + padding,
 		};
+	};
+
+	parseCandlesResponse = (data) => {
+		const payload = Array.isArray(data)
+			? { candles: data }
+			: (data && typeof data === "object" ? data : { candles: [] });
+		const candles = this.normalizeCandles(payload.candles);
+		const priceRange = (
+			payload.price_range
+			&& Number.isFinite(Number(payload.price_range.min_price))
+			&& Number.isFinite(Number(payload.price_range.max_price))
+		)
+			? {
+				min_price: Number(payload.price_range.min_price),
+				max_price: Number(payload.price_range.max_price),
+			}
+			: this.getDepthRangeForCandles(candles);
+
+		return { candles, priceRange };
+	};
+
+	getPinnedMarketDepthRange = () => this.pinnedMarketDepthRange;
+
+	mergeDepthLevels = (previousLevels, nextLevels) => {
+		const merged = new Map();
+
+		(Array.isArray(previousLevels) ? previousLevels : []).forEach(level => {
+			const price = Number(level?.price);
+
+			if (Number.isFinite(price)) {
+				merged.set(price, level);
+			}
+		});
+
+		(Array.isArray(nextLevels) ? nextLevels : []).forEach(level => {
+			const price = Number(level?.price);
+			const size = Number(level?.size);
+
+			if (!Number.isFinite(price)) return;
+
+			if (!Number.isFinite(size) || size <= 0) {
+				merged.delete(price);
+				return;
+			}
+
+			merged.set(price, level);
+		});
+
+		return Array.from(merged.values());
 	};
 
 	applyDefaultVisibleRange = (candles = this.state.candles) => {
@@ -1635,9 +1736,15 @@ class Home extends React.Component {
 		const currency = this.state.loadedBaseCurrency || this.state.baseCurrency;
 		const bookmarkedPrice = this.getBookmarkedPriceForCurrency(currency);
 		const settings = appState?.yzTrade?.settings;
+		const balanceHistoryPeriod = normalizeBalanceHistoryPeriod(
+			settings?.balanceHistoryPeriod,
+			this.state.balanceHistoryPeriod,
+		);
+		const periodChanged = balanceHistoryPeriod !== this.state.balanceHistoryPeriod;
 		const appSettings = settings && typeof settings === "object" && !Array.isArray(settings)
 			? {
 				balanceHistoryExpanded: Boolean(settings.balanceHistoryExpanded),
+				balanceHistoryPeriod,
 			}
 			: this.state.appSettings;
 
@@ -1645,7 +1752,20 @@ class Home extends React.Component {
 			appBookmarks,
 			appSettings,
 			bookmarkedPrice,
-		}, this.scheduleOverlayUpdate);
+			...(periodChanged
+				? {
+					balanceHistoryPeriod,
+					balanceHistoryLoading: true,
+					balanceHistoryError: "",
+				}
+				: {}),
+		}, () => {
+			this.scheduleOverlayUpdate();
+
+			if (periodChanged) {
+				this.loadBalanceHistory(balanceHistoryPeriod);
+			}
+		});
 	};
 
 	updateAppSettings = (settings) => {
@@ -1905,7 +2025,13 @@ class Home extends React.Component {
 
 	connectLiveMarket = (productId, periodDays, periodGranularity, depth) => {
 		this.disconnectLiveMarket();
-		this.liveReconnectConfig = { productId, periodDays, periodGranularity, depth };
+		const depthRange = depth || this.pinnedMarketDepthRange;
+
+		if (depthRange) {
+			this.pinnedMarketDepthRange = depthRange;
+		}
+
+		this.liveReconnectConfig = { productId, periodDays, periodGranularity, depth: depthRange };
 		this.liveReconnectAttempt = 0;
 		this.openLiveSocket(this.liveReconnectConfig);
 	};
@@ -2126,8 +2252,12 @@ class Home extends React.Component {
 			if (!prev.depth) return null;
 
 			const currentPrice = Number(depth.current_price);
-			const minPrice = Number(prev.depth.min_price);
-			const maxPrice = Number(prev.depth.max_price);
+			const minPrice = Number(
+				this.pinnedMarketDepthRange?.min_price ?? prev.depth.min_price,
+			);
+			const maxPrice = Number(
+				this.pinnedMarketDepthRange?.max_price ?? prev.depth.max_price,
+			);
 			const isInRange = level => {
 				const price = Number(level.price);
 
@@ -2135,8 +2265,8 @@ class Home extends React.Component {
 					&& (!Number.isFinite(minPrice) || price >= minPrice)
 					&& (!Number.isFinite(maxPrice) || price <= maxPrice);
 			};
-			const bids = depth.bids.filter(isInRange);
-			const asks = depth.asks.filter(isInRange);
+			const bids = this.mergeDepthLevels(prev.depth.bids, depth.bids.filter(isInRange));
+			const asks = this.mergeDepthLevels(prev.depth.asks, depth.asks.filter(isInRange));
 
 			if (!bids.length && !asks.length) return null;
 
@@ -2156,6 +2286,8 @@ class Home extends React.Component {
 				candles: this.buildDisplayCandles(prev.historicalCandles, currentCandle),
 				depth: {
 					...prev.depth,
+					min_price: minPrice,
+					max_price: maxPrice,
 					current_price: Number.isFinite(currentPrice)
 						? currentPrice
 						: prev.depth.current_price,
@@ -2176,6 +2308,7 @@ class Home extends React.Component {
 	applyLiveOrders = (message) => {
 		const updatedOrders = Array.isArray(message.orders) ? message.orders : [];
 		const removedOrderIds = new Set(Array.isArray(message.removed_order_ids) ? message.removed_order_ids : []);
+		const shouldRefreshProfile = removedOrderIds.size > 0;
 
 		this.setState(prev => {
 			return {
@@ -2184,23 +2317,38 @@ class Home extends React.Component {
 				orderError: "",
 				allOrdersError: "",
 			};
-		}, this.scheduleOverlayUpdate);
+		}, () => {
+			this.scheduleOverlayUpdate();
+
+			if (shouldRefreshProfile) {
+				this.refreshProfileAfterOrderChange();
+			}
+		});
 	};
 
 	mergeOrderUpdates = (orders, updatedOrders, removedOrderIds) => {
 		const ordersById = new Map();
 
 		(Array.isArray(orders) ? orders : []).forEach(order => {
-			if (order?.id && !removedOrderIds.has(order.id)) {
+			if (
+				order?.id
+				&& !isRemovedLiveOrder(order, removedOrderIds)
+				&& isOpenOrderStatus(order.status)
+			) {
 				ordersById.set(order.id, enrichOrderForDisplay(order));
 			}
 		});
 
 		updatedOrders.forEach(order => {
-			if (order?.id) {
-				const existing = ordersById.get(order.id);
-				ordersById.set(order.id, mergeOrderFields(existing, order));
+			if (!order?.id) return;
+
+			if (!isOpenOrderStatus(order.status) || isRemovedLiveOrder(order, removedOrderIds)) {
+				ordersById.delete(order.id);
+				return;
 			}
+
+			const existing = ordersById.get(order.id);
+			ordersById.set(order.id, mergeOrderFields(existing, order));
 		});
 
 		return Array.from(ordersById.values());
@@ -2305,7 +2453,7 @@ class Home extends React.Component {
 
 	refreshTdSequential = () => {
 		const baseCurrency = (this.state.loadedBaseCurrency || this.state.baseCurrency).trim().toUpperCase();
-		const periodDays = Number(this.state.loadedPeriodDays || this.state.periodDays) || 7;
+		const periodDays = Number(this.state.loadedPeriodDays || this.state.periodDays) || DEFAULT_PERIOD_DAYS;
 
 		if (!baseCurrency || this.tdRefreshInFlight) return;
 
@@ -2336,7 +2484,7 @@ class Home extends React.Component {
 
 	loadMarket = () => {
 		const baseCurrency = this.state.baseCurrency.trim().toUpperCase();
-		const periodDays = Number(this.state.periodDays) || 7;
+		const periodDays = Number(this.state.periodDays) || DEFAULT_PERIOD_DAYS;
 		const periodGranularity = this.state.periodGranularity ? Number(this.state.periodGranularity) : null;
 
 		if (!baseCurrency) {
@@ -2383,6 +2531,7 @@ class Home extends React.Component {
 			bookmarkedPrice: this.getBookmarkedPriceForCurrency(baseCurrency),
 		});
 		this.disconnectLiveMarket();
+		this.pinnedMarketDepthRange = null;
 		this.candleSeries?.setData([]);
 		this.volumeSeries?.setData([]);
 		this.syncVwapSeries([]);
@@ -2397,19 +2546,19 @@ class Home extends React.Component {
 			.then((candlesResponse) => {
 				if (requestId !== this.marketRequestId) return;
 
-				const normalizedCandles = this.normalizeCandles(candlesResponse.data);
+				const { candles: normalizedCandles, priceRange } = this.parseCandlesResponse(
+					candlesResponse.data,
+				);
 
 				if (!normalizedCandles.length) {
 					throw new Error(`Coinbase returned no candle data for ${productId}.`);
 				}
 
 				const { historicalCandles, currentCandle } = this.splitCandlesFromApi(normalizedCandles);
-				const candles = this.buildDisplayCandles(historicalCandles, currentCandle);
-				const latestPrice = candles[candles.length - 1].close;
-				const depthCandles = !shouldPreserveRange && !rangeSnapshot?.timeRange
-					? this.getCandlesForDefaultViewport(candles)
-					: candles;
-				const depthRange = this.getDepthRangeForCandles(depthCandles, latestPrice);
+				const loadedMarketCandles = this.buildDisplayCandles(historicalCandles, currentCandle);
+				this.pinnedMarketDepthRange = priceRange;
+				const depthRange = this.pinnedMarketDepthRange;
+				const candles = loadedMarketCandles;
 
 				this.setState({
 					candles,
@@ -2430,7 +2579,7 @@ class Home extends React.Component {
 						this.getMainPriceScale()?.applyOptions({ autoScale: true });
 					}
 
-					this.candleSeries.setData(candles);
+					this.candleSeries.setData(toChartData(candles));
 					this.applyPriceSeriesFormat();
 					this.syncVolumeSeries(candles);
 					this.syncVwapSeries(candles);
@@ -2504,7 +2653,11 @@ class Home extends React.Component {
 			if (requestId !== this.marketRequestId) return;
 
 			this.setState({
-				depth: depthResponse.data,
+				depth: {
+					...depthResponse.data,
+					min_price: this.pinnedMarketDepthRange?.min_price ?? depthRange.min_price,
+					max_price: this.pinnedMarketDepthRange?.max_price ?? depthRange.max_price,
+				},
 			}, this.scheduleOverlayUpdate);
 		}).catch(() => {});
 
@@ -2671,21 +2824,37 @@ class Home extends React.Component {
 		});
 
 		return api.getBalances().then(response => {
-			if (requestId !== this.profileRequestId) return;
+			if (requestId !== this.profileRequestId) return null;
+
+			const profile = response.data;
 
 			this.setState({
-				profile: response.data,
+				profile,
 				profileError: "",
 				isProfileLoading: false,
 			});
+
+			return profile;
 		}).catch(error => {
-			if (requestId !== this.profileRequestId) return;
+			if (requestId !== this.profileRequestId) return null;
 
 			this.setState({
 				profileError: error.response?.data?.detail || error.message || "Unable to load Coinbase balances.",
 				isProfileLoading: false,
 			});
+
+			return null;
 		});
+	};
+
+	refreshProfileAfterOrderChange = () => {
+		this.profileRefreshAfterOrderTimers.forEach(timer => window.clearTimeout(timer));
+		this.profileRefreshAfterOrderTimers = [0, 1500, 4000].map(delay => (
+			window.setTimeout(() => {
+				this.loadProfile();
+				this.loadAllOrders();
+			}, delay)
+		));
 	};
 
 	loadOrders = () => {
@@ -2720,23 +2889,37 @@ class Home extends React.Component {
 	};
 
 	loadAllOrders = () => {
+		const baseCurrency = (this.state.loadedBaseCurrency || this.state.baseCurrency).trim().toUpperCase();
+		const productId = `${baseCurrency}-USD`;
+
 		this.setState({
 			isOrdersLoading: !this.state.allOrders.length,
 			allOrdersError: "",
 		});
 
 		return api.getOrders({
-			product_id: `${(this.state.loadedBaseCurrency || this.state.baseCurrency).trim().toUpperCase()}-USD`,
+			product_id: productId,
 			all_products: true,
 			_: Date.now(),
 		}).then(response => {
+			const allOrders = Array.isArray(response.data?.orders)
+				? response.data.orders.map(enrichOrderForDisplay)
+				: [];
+			const chartOrders = filterOrdersForChartProduct(allOrders, productId);
+
 			this.setState({
-				allOrders: Array.isArray(response.data?.orders)
-					? response.data.orders.map(enrichOrderForDisplay)
-					: [],
+				allOrders,
+				orders: chartOrders,
+				orderStats: {
+					openTotal: response.data?.open_total,
+					applicableTotal: chartOrders.length,
+					drawableTotal: chartOrders.length,
+					skippedTotal: response.data?.skipped_total,
+				},
 				allOrdersError: "",
+				orderError: "",
 				isOrdersLoading: false,
-			});
+			}, this.scheduleOverlayUpdate);
 		}).catch(error => {
 			this.setState({
 				allOrdersError: error.response?.data?.detail || error.message || "Unable to load Coinbase orders.",
@@ -2797,14 +2980,11 @@ class Home extends React.Component {
 			};
 		}
 
-		const usd = balances.find(item => item.currency === "USD");
-		const usdc = balances.find(item => item.currency === "USDC");
-		const usdAmount = Number(usd?.available) || 0;
-		const usdcAmount = Number(usdc?.available) || 0;
+		const quote = this.getBuyQuoteBalance(0, profile);
 
 		return {
-			currency: "USD/USDC",
-			amount: Math.max(usdAmount, usdcAmount),
+			currency: quote.currency,
+			amount: quote.amount,
 		};
 	};
 
@@ -2835,8 +3015,8 @@ class Home extends React.Component {
 		};
 	};
 
-	getBuyQuoteBalance = (requiredAmount = 0) => {
-		const balances = Array.isArray(this.state.profile?.balances) ? this.state.profile.balances : [];
+	getBuyQuoteBalance = (requiredAmount = 0, profile = this.state.profile) => {
+		const balances = Array.isArray(profile?.balances) ? profile.balances : [];
 		const usd = balances.find(item => item.currency === "USD");
 		const usdc = balances.find(item => item.currency === "USDC");
 		const options = [
@@ -3111,6 +3291,7 @@ class Home extends React.Component {
 			isOrderTicketClosing: false,
 			lastOrderSide: side,
 		}), () => {
+			this.loadProfile();
 			this.scheduleOrderPreview();
 		});
 	};
@@ -3135,18 +3316,43 @@ class Home extends React.Component {
 				isOrderTicketClosing: false,
 				lastOrderSide: side,
 			}), () => {
+				this.loadProfile();
 				this.scheduleOrderPreview();
 			});
 			return;
 		}
 
-		const field = this.state.orderTicket.activePriceField || "price";
+		const ticket = this.state.orderTicket;
+		const field = ticket.activePriceField || "price";
 		const allowedFields = ["price", "stopPrice", "takeProfitPrice", "stopLossPrice"];
+		const targetField = allowedFields.includes(field) ? field : "price";
+		const priceValue = this.getOrderPriceInputValue(hover.price);
 
-		this.updateOrderPriceField(
-			allowedFields.includes(field) ? field : "price",
-			this.getOrderPriceInputValue(hover.price)
-		);
+		if (this.isMarketOrderTicket(ticket)) {
+			this.cancelOrderPreviewRequests();
+
+			const nextTicket = {
+				...ticket,
+				orderType: "LIMIT",
+				price: priceValue,
+				activePriceField: "price",
+			};
+
+			this.updateOrderTicket({
+				...this.getOrderPreviewResetPatch(),
+				orderType: "LIMIT",
+				price: priceValue,
+				activePriceField: "price",
+				fraction: this.getOrderFractionFromAmount(nextTicket),
+			}, {
+				onCommitted: () => {
+					this.stopMarketPreviewPoller();
+				},
+			});
+			return;
+		}
+
+		this.updateOrderPriceField(targetField, priceValue);
 	};
 
 	bookmarkOrderHoverPrice = (event) => {
@@ -3370,8 +3576,8 @@ class Home extends React.Component {
 		});
 	};
 
-	isOrderTicketZeroAvailable = (ticket = this.state.orderTicket) => (
-		!ticket || this.getOrderMaxAmount(ticket) <= 0
+	isOrderTicketZeroAvailable = (ticket = this.state.orderTicket, profile = this.state.profile) => (
+		!ticket || this.getOrderMaxAmount(ticket, profile) <= 0
 	);
 
 	isSellZeroBalanceTicket = (ticket = this.state.orderTicket) => (
@@ -3733,12 +3939,14 @@ class Home extends React.Component {
 
 	setOrderFraction = (fraction, options = {}) => {
 		const ticket = this.state.orderTicket;
-		if (!ticket || this.isOrderTicketZeroAvailable(ticket)) return;
+		const profile = options.profile || this.state.profile;
+
+		if (!ticket || this.isOrderTicketZeroAvailable(ticket, profile)) return;
 
 		const safeFraction = Number.isFinite(Number(fraction))
 			? Math.max(0, Math.min(1, Number(fraction)))
 			: 0;
-		const maxAmount = this.getOrderMaxAmount(ticket);
+		const maxAmount = this.getOrderMaxAmount(ticket, profile);
 		const patch = {
 			fraction: safeFraction,
 			amount: maxAmount > 0
@@ -3755,7 +3963,14 @@ class Home extends React.Component {
 	};
 
 	applyOrderFractionPreset = (fraction) => {
-		this.setOrderFraction(fraction, { schedulePreview: true });
+		this.loadProfile().then(profile => {
+			if (!this.state.orderTicket) return;
+
+			this.setOrderFraction(fraction, {
+				schedulePreview: true,
+				profile: profile || this.state.profile,
+			});
+		});
 	};
 
 	loadBalanceHistory = (period = this.state.balanceHistoryPeriod) => {
@@ -3785,14 +4000,21 @@ class Home extends React.Component {
 	};
 
 	setBalanceHistoryPeriod = (period) => {
-		if (period === this.state.balanceHistoryPeriod) return;
+		const normalizedPeriod = normalizeBalanceHistoryPeriod(
+			period,
+			this.state.balanceHistoryPeriod,
+		);
+
+		if (normalizedPeriod === this.state.balanceHistoryPeriod) return;
+
+		this.updateAppSettings({ balanceHistoryPeriod: normalizedPeriod });
 
 		this.setState({
-			balanceHistoryPeriod: period,
+			balanceHistoryPeriod: normalizedPeriod,
 			balanceHistoryLoading: true,
 			balanceHistoryError: "",
 		}, () => {
-			this.loadBalanceHistory(period);
+			this.loadBalanceHistory(normalizedPeriod);
 		});
 	};
 
@@ -3925,7 +4147,7 @@ class Home extends React.Component {
 
 		const now = Date.now();
 
-		if (now - this.lastMarketPricePollRefreshAt < MARKET_PREVIEW_POLL_INTERVAL_MS) {
+		if (now - this.lastMarketPreviewAt < MARKET_PREVIEW_POLL_INTERVAL_MS) {
 			return false;
 		}
 
@@ -4030,6 +4252,7 @@ class Home extends React.Component {
 			schedulePreview: false,
 			onCommitted: () => {
 				if (this.isMarketOrderTicket(this.state.orderTicket)) {
+					this.stopMarketPreviewPoller();
 					this.ensureMarketPreviewPoller();
 				}
 			},
@@ -4132,10 +4355,8 @@ class Home extends React.Component {
 
 		if (isMarketTicket) {
 			this.marketPreviewRequestPrice = this.getOverlayMarketPrice();
-
-			if (isPricePollRequest) {
-				this.lastMarketPricePollRefreshAt = Date.now();
-			}
+			this.lastMarketPreviewAt = Date.now();
+			this.stopMarketPreviewPoller();
 		}
 
 		const requestId = this.orderPreviewRequestId + 1;
@@ -4354,7 +4575,7 @@ class Home extends React.Component {
 
 					this.loadOrders();
 					this.loadAllOrders();
-					this.loadProfile();
+					this.refreshProfileAfterOrderChange();
 				});
 			})
 			.catch(error => {
@@ -4390,7 +4611,7 @@ class Home extends React.Component {
 		api.cancelOrder(orderId).then(() => {
 			this.loadOrders();
 			this.loadAllOrders();
-			this.loadProfile();
+			this.refreshProfileAfterOrderChange();
 		}).catch(error => {
 			this.setState({
 				orderError: error.response?.data?.detail || error.message || "Unable to cancel Coinbase order.",
@@ -4609,7 +4830,7 @@ class Home extends React.Component {
 	timeToX = (time) => {
 		if (!this.chart) return null;
 
-		const coordinate = this.chart.timeScale().timeToCoordinate(time);
+		const coordinate = this.chart.timeScale().timeToCoordinate(toChartTime(time));
 		if (Number.isFinite(coordinate)) return coordinate;
 
 		const { candles } = this.state;
@@ -4880,7 +5101,7 @@ class Home extends React.Component {
 
 	buildVolumeData = (candles, highlightedIndex = this.state.hoveredVolumeIndex) => (
 		candles.map((candle, index) => ({
-			time: candle.time,
+			time: toChartTime(candle.time),
 			value: this.getCandleVolumeUsd(candle),
 			color: this.getVolumeBarColor(candle, index === highlightedIndex),
 		}))
@@ -4972,7 +5193,7 @@ class Home extends React.Component {
 
 		sessions.forEach((session, index) => {
 			this.vwapSeries[index].applyOptions({ visible: this.state.showVwapIndicator });
-			this.vwapSeries[index].setData(session.data);
+			this.vwapSeries[index].setData(toChartData(session.data));
 		});
 	};
 
@@ -5041,7 +5262,7 @@ class Home extends React.Component {
 			.filter(point => Number.isFinite(point.time) && Number.isFinite(point.value))
 			.filter(point => this.isTimeInLoadedRange(point.time, candles));
 
-		this.tdSequentialSeries.setData(data);
+		this.tdSequentialSeries.setData(toChartData(data));
 	};
 
 	renderOverlay = () => {
@@ -5214,6 +5435,7 @@ class Home extends React.Component {
 		const depthHoverLabel = depthHoverPoint ? getTrailLabelPosition(depthHoverPoint, depthHoverPoint.side === "ask" ? -14 : 18) : null;
 		const orderLineRight = priceScaleLeft;
 		const drawableOrders = (Array.isArray(orders) ? orders : [])
+			.filter(order => isOpenOrderStatus(order.status))
 			.flatMap(order => (
 				Array.isArray(order.bracket_legs) && order.bracket_legs.length
 					? order.bracket_legs.map(leg => ({
@@ -5391,21 +5613,10 @@ class Home extends React.Component {
 		)
 			? {
 				x: Math.min(chartSize.width - 12, Math.max(12, hoveredVolumeX)),
-				y: Math.min(chartSize.height - 18, Math.max(chartSize.height * 0.72, hoveredVolumeY - 12)),
+				y: chartSize.height - 34,
 				text: formatUsdValue(hoveredVolumeValue),
 			}
 			: null;
-		const timelineHoverLabel = (
-			hoveredVolumeCandle
-			&& Number.isFinite(hoveredVolumeX)
-		)
-			? {
-				x: Math.min(chartSize.width - 18, Math.max(18, hoveredVolumeX)),
-				y: chartSize.height - 24,
-				text: formatChartEasternTime(hoveredVolumeCandle.time, chartTimeFormatter).replace(/\b24:/, "00:"),
-			}
-			: null;
-
 		return (
 			<svg
 				className="e__market-overlay"
@@ -5413,17 +5624,6 @@ class Home extends React.Component {
 				height={chartSize.height}
 				style={{ width: priceScaleLeft }}
 			>
-				{timelineHoverLabel && (
-					<g className="e__timeline-hover-label">
-						<text
-							x={timelineHoverLabel.x}
-							y={timelineHoverLabel.y}
-							textAnchor="middle"
-						>
-							{timelineHoverLabel.text}
-						</text>
-					</g>
-				)}
 				{freeCrosshairX !== null && (
 					<line
 						className="e__free-crosshair"
@@ -5656,7 +5856,7 @@ class Home extends React.Component {
 				horzLines: { color: '#070b12' },
 			},
 			localization: {
-				timeFormatter: time => formatChartEasternTime(time, chartFullTimeFormatter),
+				timeFormatter: formatChartCrosshairTime,
 			},
 			rightPriceScale: {
 				visible: true,
@@ -5674,7 +5874,7 @@ class Home extends React.Component {
 				secondsVisible: false,
 				borderColor: '#111820',
 				rightOffset: 0,
-				tickMarkFormatter: formatChartTickMark,
+				...this.getTimeScaleBarSpacingOptions(el.clientWidth),
 			},
 			handleScroll: {
 				mouseWheel: true,
@@ -5866,50 +6066,57 @@ class Home extends React.Component {
 				previewMatchesAmount ? ticketPreview : null,
 			)
 			: null;
-		const sellUsdPreviewSummary = isSellUsdPayMode && Number.isFinite(ticketAmountValue) && ticketAmountValue > 0
-			? getSellUsdOrderTicketSummary(
-				ticketAmountValue,
-				previewMatchesAmount ? ticketPreview : null,
+		const sellPreviewSummary = isSellTicket && ticketHasValidPreview
+			? getSellPreviewTicketSummary(
+				ticketPreview,
+				isSellUsdPayMode ? ticketAmountValue : null,
 			)
 			: null;
-		const sellCoinPreviewSummary = isSellCoinAmountTicket && previewMatchesAmount
-			? getSellOrderTicketSummary(ticketPreview)
-			: null;
+		const sellSummaryReady = Boolean(sellPreviewSummary);
 		const ticketPreviewTotal = buyUsdPreviewSummary
 			? buyUsdPreviewSummary.total
-			: sellUsdPreviewSummary
-				? sellUsdPreviewSummary.total
-				: sellCoinPreviewSummary
-					? sellCoinPreviewSummary.total
-					: previewMatchesAmount
-						? Number(ticketPreview?.order_total)
-						: isSellTicket
-							? NaN
-							: ticketUsdTotal;
+			: sellPreviewSummary
+				? sellPreviewSummary.total
+				: previewMatchesAmount
+					? isSellTicket
+						? getSellPreviewTicketSummary(
+							ticketPreview,
+							isSellUsdPayMode ? ticketAmountValue : null,
+						)?.total
+						: Number(ticketPreview?.order_total)
+					: isSellTicket
+						? NaN
+						: ticketUsdTotal;
 		const ticketPreviewFee = buyUsdPreviewSummary
 			? buyUsdPreviewSummary.fee
-			: sellUsdPreviewSummary
-				? sellUsdPreviewSummary.fee
-				: sellCoinPreviewSummary
-					? sellCoinPreviewSummary.fee
-					: previewMatchesAmount
-						? Number(ticketPreview?.commission_total)
-						: NaN;
+			: sellPreviewSummary
+				? sellPreviewSummary.fee
+				: previewMatchesAmount
+					? isSellTicket
+						? getSellPreviewTicketSummary(
+							ticketPreview,
+							isSellUsdPayMode ? ticketAmountValue : null,
+						)?.fee
+						: Number(ticketPreview?.commission_total)
+					: NaN;
 		const ticketPreviewQuoteSize = buyUsdPreviewSummary
 			? buyUsdPreviewSummary.value
-			: sellUsdPreviewSummary
-				? sellUsdPreviewSummary.value
-				: sellCoinPreviewSummary
-					? sellCoinPreviewSummary.value
-					: previewMatchesAmount
-						? Number(ticketPreview?.quote_size)
-						: NaN;
+			: sellPreviewSummary
+				? sellPreviewSummary.value
+				: previewMatchesAmount
+					? isSellTicket
+						? getSellPreviewTicketSummary(
+							ticketPreview,
+							isSellUsdPayMode ? ticketAmountValue : null,
+						)?.value
+						: Number(ticketPreview?.quote_size)
+					: NaN;
 		const ticketPreviewBaseSize = previewMatchesAmount
 			? getOrderPreviewBaseSize(ticketPreview)
 			: NaN;
 		const ticketPreviewTotalLabel = Number.isFinite(ticketPreviewTotal) && ticketPreviewTotal > 0
 			? formatUsdCents(ticketPreviewTotal)
-			: orderTicket?.isPreviewLoading && !isBuyUsdPayMode && !isSellUsdPayMode
+			: orderTicket?.isPreviewLoading && !isBuyUsdPayMode && !(isSellTicket && isSellUsdPayMode)
 				? "..."
 				: "--";
 		const ticketPreviewBaseAmountLabel = isSellCoinAmountTicket && Number.isFinite(ticketAmountValue) && ticketAmountValue > 0
@@ -5923,13 +6130,15 @@ class Home extends React.Component {
 						: "--";
 		const ticketPreviewFeeLabel = Number.isFinite(ticketPreviewFee)
 			? formatUsdCents(ticketPreviewFee)
-			: ticketSummaryPending || orderTicket?.isPreviewLoading
+			: (ticketSummaryPending || orderTicket?.isPreviewLoading) && !(isSellTicket && sellSummaryReady)
 				? "..."
 				: "--";
 		const ticketPreviewQuoteSizeLabel = (ticketSide === "BUY" || isSellTicket)
-			? previewMatchesAmount && Number.isFinite(ticketPreviewQuoteSize) && ticketPreviewQuoteSize > 0
+			? (isSellTicket ? sellSummaryReady : previewMatchesAmount)
+				&& Number.isFinite(ticketPreviewQuoteSize)
+				&& ticketPreviewQuoteSize > 0
 				? formatUsdCents(ticketPreviewQuoteSize)
-				: ticketSummaryPending || orderTicket?.isPreviewLoading
+				: (ticketSummaryPending || orderTicket?.isPreviewLoading) && !(isSellTicket && sellSummaryReady)
 					? "..."
 					: "--"
 			: null;

@@ -245,7 +245,6 @@ const OrderBubble = ({
 					<button
 						key={item.label}
 						type="button"
-						disabled={sliderDisabled}
 						onClick={() => (onFractionPreset || onFractionChange)(item.value)}
 					>
 						{item.label}

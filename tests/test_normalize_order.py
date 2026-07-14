@@ -109,5 +109,16 @@ class NormalizeOrderTests(unittest.TestCase):
         self.assertEqual(enriched["commission_total"], 0.15)
 
 
+class OpenOrderStatusTests(unittest.TestCase):
+    def test_partially_filled_stays_open(self):
+        self.assertTrue(app.is_open_order_status("PARTIALLY_FILLED"))
+
+    def test_filled_is_closed(self):
+        self.assertFalse(app.is_open_order_status("FILLED"))
+
+    def test_cancelled_is_closed(self):
+        self.assertFalse(app.is_open_order_status("CANCELLED"))
+
+
 if __name__ == "__main__":
     unittest.main()

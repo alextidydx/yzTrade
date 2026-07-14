@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 import unittest
@@ -60,6 +61,37 @@ class BalanceHistoryTests(unittest.TestCase):
                 {"time": now, "total_usd": 30.0},
             ],
         )
+
+    def test_refuses_to_shrink_existing_history_file(self):
+        history_path = self.with_history_file()
+        points = [
+            {"time": 1_700_000_000, "total_usd": 1000.0},
+            {"time": 1_700_003_600, "total_usd": 1100.0},
+            {"time": 1_700_007_200, "total_usd": 1200.0},
+        ]
+
+        with open(history_path, "w", encoding="utf-8") as history_file:
+            json.dump(points, history_file)
+
+        result = app.write_balance_history([points[0]])
+
+        self.assertEqual(len(result), 3)
+        self.assertEqual(app.count_balance_history_points(history_path), 3)
+
+    def test_archives_corrupt_main_file_to_error(self):
+        history_path = self.with_history_file()
+        corrupt_payload = "{not json"
+
+        with open(history_path, "w", encoding="utf-8") as history_file:
+            history_file.write(corrupt_payload)
+
+        self.assertEqual(app.read_balance_history(), [])
+
+        error_path = f"{history_path}.error"
+        self.assertTrue(os.path.exists(error_path))
+
+        with open(error_path, "r", encoding="utf-8") as error_file:
+            self.assertEqual(error_file.read(), corrupt_payload)
 
 
 if __name__ == "__main__":

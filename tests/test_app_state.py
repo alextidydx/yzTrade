@@ -49,6 +49,19 @@ class AppStateTests(unittest.TestCase):
         with self.assertRaises(HTTPException):
             app.set_app_state_bookmark("GFI", "nan")
 
+    def test_balance_history_period_setting_persists(self):
+        self.with_state_file()
+
+        app.set_app_state_settings({"balanceHistoryPeriod": "30d"})
+        state = app.read_app_state()
+
+        self.assertEqual(state["yzTrade"]["settings"]["balanceHistoryPeriod"], "30d")
+
+        app.set_app_state_settings({"balanceHistoryPeriod": "invalid"})
+        state = app.read_app_state()
+
+        self.assertEqual(state["yzTrade"]["settings"]["balanceHistoryPeriod"], "week")
+
 
 if __name__ == "__main__":
     unittest.main()

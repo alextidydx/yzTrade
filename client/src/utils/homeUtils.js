@@ -1,5 +1,3 @@
-import { TickMarkType } from "lightweight-charts";
-
 import {
 	API_BASE,
 	BOOKMARKED_PRICE_COOKIE,
@@ -54,6 +52,14 @@ export const normalizeBookmarkPrice = (price) => {
 	const numeric = Number(price);
 
 	return Number.isFinite(numeric) && numeric > 0 ? numeric : null;
+};
+
+const BALANCE_HISTORY_PERIODS = new Set(["day", "week", "30d", "all"]);
+
+export const normalizeBalanceHistoryPeriod = (period, fallback = "week") => {
+	const normalized = String(period || "").trim().toLowerCase();
+
+	return BALANCE_HISTORY_PERIODS.has(normalized) ? normalized : fallback;
 };
 
 export const getBookmarkedPrice = (currency) => {
@@ -171,6 +177,55 @@ export const getRoutePrefix = (pathname = "") => (
 export const getCurrencyFromProductId = (productId = "") => (
 	String(productId || "").trim().toUpperCase().split("-", 1)[0] || "UNKNOWN"
 );
+
+export const isOpenOrderStatus = (status) => {
+	const normalized = String(status || "").toUpperCase();
+
+	if (!normalized) return true;
+
+	if (["OPEN", "PENDING", "QUEUED", "ACTIVE", "PARTIALLY_FILLED"].includes(normalized)) {
+		return true;
+	}
+
+	if (["FILLED", "CANCELLED", "CANCELED", "EXPIRED", "FAILED", "REJECTED"].includes(normalized)) {
+		return false;
+	}
+
+	if (normalized.includes("PARTIALLY")) {
+		return true;
+	}
+
+	const closedMarkers = ["CANCEL", "FILLED", "EXPIRED", "FAILED", "REJECTED"];
+
+	return !closedMarkers.some(marker => normalized.includes(marker));
+};
+
+export const filterOrdersForChartProduct = (orders, productId) => {
+	const normalizedProductId = String(productId || "").trim().toUpperCase();
+	const selectedBaseCurrency = getCurrencyFromProductId(normalizedProductId);
+	const normalizedOrders = Array.isArray(orders) ? orders : [];
+	const exactMatches = normalizedOrders.filter(
+		order => String(order?.product_id || "").trim().toUpperCase() === normalizedProductId,
+	);
+
+	if (exactMatches.length) {
+		return exactMatches;
+	}
+
+	return normalizedOrders.filter(
+		order => getCurrencyFromProductId(order?.product_id) === selectedBaseCurrency,
+	);
+};
+
+export const isRemovedLiveOrder = (order, removedOrderIds) => {
+	if (!order?.id) return true;
+
+	if (removedOrderIds.has(order.id)) return true;
+	if (order.cancel_id && removedOrderIds.has(order.cancel_id)) return true;
+	if (order.parent_id && removedOrderIds.has(order.parent_id)) return true;
+
+	return false;
+};
 
 export const formatPrice = (price) => (
 	Number.isFinite(Number(price)) ? Number(price).toFixed(PRICE_PRECISION) : "--"
@@ -622,43 +677,47 @@ export const getBuyUsdOrderTicketSummary = (enteredAmount, preview) => {
 	};
 };
 
-export const getSellUsdOrderTicketSummary = (enteredAmount, preview) => {
-	const enteredTotal = floorQuoteCurrencyAmount(enteredAmount);
-	const previewTotal = floorQuoteCurrencyAmount(preview?.order_total);
-	const fee = Number(preview?.commission_total);
+export const getSellPreviewTicketSummary = (preview, enteredAmount = null) => {
+	if (!preview || typeof preview !== "object") {
+		const enteredTotal = floorQuoteCurrencyAmount(enteredAmount);
 
-	if (!Number.isFinite(enteredTotal) || enteredTotal <= 0) {
+		if (!Number.isFinite(enteredTotal) || enteredTotal <= 0) {
+			return null;
+		}
+
+		return {
+			total: enteredTotal,
+			value: enteredTotal,
+			fee: NaN,
+		};
+	}
+
+	const fee = Number(preview.commission_total);
+	const hasFee = Number.isFinite(fee) && fee >= 0;
+	let orderTotal = floorQuoteCurrencyAmount(preview.order_total);
+
+	if (!Number.isFinite(orderTotal) || orderTotal <= 0) {
+		orderTotal = floorQuoteCurrencyAmount(preview.quote_size);
+	}
+
+	if (!Number.isFinite(orderTotal) || orderTotal <= 0) {
 		return null;
 	}
 
-	const total = previewTotal > 0 ? previewTotal : enteredTotal;
-	const hasFee = Number.isFinite(fee) && fee >= 0;
-	const value = hasFee ? Math.max(0, total - fee) : NaN;
-
 	return {
-		total,
-		value,
+		total: hasFee ? floorQuoteCurrencyAmount(orderTotal + fee) : orderTotal,
+		value: orderTotal,
 		fee: hasFee ? fee : NaN,
 	};
 };
 
-export const getSellOrderTicketSummary = (preview) => {
-	const total = Number(preview?.order_total);
-	const fee = Number(preview?.commission_total);
+export const getSellUsdOrderTicketSummary = (enteredAmount, preview) => (
+	getSellPreviewTicketSummary(preview, enteredAmount)
+);
 
-	if (!Number.isFinite(total) || total <= 0) {
-		return null;
-	}
-
-	const hasFee = Number.isFinite(fee) && fee >= 0;
-	const value = hasFee ? Math.max(0, total - fee) : NaN;
-
-	return {
-		total,
-		value,
-		fee: hasFee ? fee : NaN,
-	};
-};
+export const getSellOrderTicketSummary = (preview) => (
+	getSellPreviewTicketSummary(preview)
+);
 
 export const getBuyUsdPreviewQuoteSize = (enteredAmount) => floorQuoteCurrencyAmount(enteredAmount);
 
@@ -736,63 +795,6 @@ export const getOrderErrorLabel = (detail, fallback = "Coinbase order error.", c
 	if (detail?.message) return String(detail.message);
 
 	return fallback;
-};
-
-export const chartTimeFormatter = new Intl.DateTimeFormat("en-US", {
-	timeZone: CHART_TIME_ZONE,
-	hour: "2-digit",
-	minute: "2-digit",
-	hour12: false,
-});
-
-export const chartFullTimeFormatter = new Intl.DateTimeFormat("en-US", {
-	timeZone: CHART_TIME_ZONE,
-	day: "2-digit",
-	hour: "2-digit",
-	minute: "2-digit",
-	hour12: false,
-});
-
-export const formatChartEasternTime = (time, formatter = chartTimeFormatter) => {
-	const timestamp = typeof time === "object"
-		? Date.UTC(time.year, time.month - 1, time.day) / 1000
-		: Number(time);
-
-	if (!Number.isFinite(timestamp)) return "";
-
-	return formatter.format(new Date(timestamp * 1000));
-};
-
-export const formatChartTickMark = (time, tickMarkType) => {
-	const timestamp = typeof time === "object"
-		? Date.UTC(time.year, time.month - 1, time.day) / 1000
-		: Number(time);
-
-	if (!Number.isFinite(timestamp)) return null;
-
-	const date = new Date(timestamp * 1000);
-	const timeZoneOptions = { timeZone: CHART_TIME_ZONE };
-
-	switch (tickMarkType) {
-		case TickMarkType.Year:
-			return new Intl.DateTimeFormat("en-US", { ...timeZoneOptions, year: "2-digit" }).format(date);
-		case TickMarkType.Month:
-			return new Intl.DateTimeFormat("en-US", { ...timeZoneOptions, month: "short" }).format(date);
-		case TickMarkType.DayOfMonth:
-			return new Intl.DateTimeFormat("en-US", { ...timeZoneOptions, day: "numeric" }).format(date);
-		case TickMarkType.Time:
-			return formatChartEasternTime(timestamp, chartTimeFormatter).replace(/^24:/, "00:");
-		case TickMarkType.TimeWithSeconds:
-			return new Intl.DateTimeFormat("en-US", {
-				...timeZoneOptions,
-				hour: "2-digit",
-				minute: "2-digit",
-				second: "2-digit",
-				hour12: false,
-			}).format(date).replace(/^24:/, "00:");
-		default:
-			return formatChartEasternTime(timestamp, chartTimeFormatter).replace(/^24:/, "00:");
-	}
 };
 
 const vwapSessionFormatter = new Intl.DateTimeFormat("en-CA", {

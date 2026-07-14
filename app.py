@@ -3,6 +3,8 @@ import asyncio
 import base64
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal, ROUND_DOWN, InvalidOperation
+import json
+import math
 import os
 import secrets
 import shutil
@@ -14,8 +16,6 @@ from typing import Annotated, Optional
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
-import json
-import math
 
 from fastapi import Body, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -31,11 +31,20 @@ COINBASE_USER_WS_API = "wss://advanced-trade-ws-user.coinbase.com"
 PRODUCT_ID = os.getenv("COINBASE_PRODUCT_ID", "BTC-USD")
 GRANULARITY_SECONDS = 3600
 CANDLE_REQUEST_LIMIT = 300
+DEPTH_CHART_PADDING_RATIO = 0.13
 PUBLIC_DIR = os.path.join(os.path.dirname(__file__), "public")
 INDEX_HTML = os.path.join(PUBLIC_DIR, "index.html")
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 APP_STATE_FILE = os.getenv("APP_STATE_FILE", os.path.join(DATA_DIR, "app_state.json"))
 BALANCE_HISTORY_FILE = os.getenv("BALANCE_HISTORY_FILE", os.path.join(DATA_DIR, "balance_history.json"))
+
+
+def get_balance_history_backup_file():
+    return f"{BALANCE_HISTORY_FILE}.bak"
+
+
+def get_balance_history_error_file():
+    return f"{BALANCE_HISTORY_FILE}.error"
 BALANCE_HISTORY_BUCKET_SECONDS = 60 * 60
 BALANCE_HISTORY_RETENTION_SECONDS = 5 * 365 * 24 * 60 * 60
 DEFAULT_APP_STATE = {
@@ -44,10 +53,12 @@ DEFAULT_APP_STATE = {
         "bookmarks": {},
         "settings": {
             "balanceHistoryExpanded": False,
+            "balanceHistoryPeriod": "week",
         },
     },
 }
 USD_PEGGED_CURRENCIES = {"USD", "USDC", "USDT", "DAI", "PYUSD"}
+BALANCE_HISTORY_PERIODS = {"day", "week", "30d", "all"}
 DEFAULT_MONITOR_TICKERS = [
     "BTC",
     "ETH",
@@ -84,6 +95,12 @@ def parse_monitor_tickers(value):
     ]
 
     return tickers or DEFAULT_MONITOR_TICKERS
+
+
+def normalize_balance_history_period(period, default="week"):
+    normalized = str(period or default).strip().lower()
+
+    return normalized if normalized in BALANCE_HISTORY_PERIODS else default
 
 
 def get_default_app_state():
@@ -130,6 +147,9 @@ def normalize_app_state(raw_state):
     }
     normalized["yzTrade"]["settings"]["balanceHistoryExpanded"] = bool(
         normalized["yzTrade"]["settings"].get("balanceHistoryExpanded")
+    )
+    normalized["yzTrade"]["settings"]["balanceHistoryPeriod"] = normalize_balance_history_period(
+        normalized["yzTrade"]["settings"].get("balanceHistoryPeriod")
     )
 
     return normalized
@@ -218,6 +238,11 @@ def set_app_state_settings(settings):
     if "balanceHistoryExpanded" in settings:
         current_settings["balanceHistoryExpanded"] = bool(settings.get("balanceHistoryExpanded"))
 
+    if "balanceHistoryPeriod" in settings:
+        current_settings["balanceHistoryPeriod"] = normalize_balance_history_period(
+            settings.get("balanceHistoryPeriod")
+        )
+
     return write_app_state(state)
 
 
@@ -248,23 +273,95 @@ def normalize_balance_history(raw_history, now=None):
     return normalized
 
 
-def read_balance_history():
-    if not os.path.exists(BALANCE_HISTORY_FILE):
-        return []
+def load_balance_history_json(path):
+    with open(path, "r", encoding="utf-8") as history_file:
+        payload = json.load(history_file)
+
+    return payload if isinstance(payload, list) else []
+
+
+def count_balance_history_points(path):
+    if not os.path.exists(path):
+        return 0
 
     try:
-        with open(BALANCE_HISTORY_FILE, "r", encoding="utf-8") as history_file:
-            return normalize_balance_history(json.load(history_file))
+        return len(load_balance_history_json(path))
     except (OSError, json.JSONDecodeError):
-        return []
+        return 0
 
 
-def write_balance_history(history):
+def backup_balance_history_file():
+    if not os.path.exists(BALANCE_HISTORY_FILE):
+        return
+
+    try:
+        shutil.copy2(BALANCE_HISTORY_FILE, get_balance_history_backup_file())
+    except OSError as error:
+        print(f"BALANCE_HISTORY BACKUP ERROR err={error}", flush=True)
+
+
+def archive_balance_history_read_error(error):
+    if not os.path.exists(BALANCE_HISTORY_FILE):
+        return
+
+    try:
+        shutil.copy2(BALANCE_HISTORY_FILE, get_balance_history_error_file())
+        print(
+            "BALANCE_HISTORY READ ERROR archived "
+            f"path={get_balance_history_error_file()} err={error}",
+            flush=True,
+        )
+    except OSError as archive_error:
+        print(f"BALANCE_HISTORY ERROR ARCHIVE FAILED err={archive_error}", flush=True)
+
+
+def read_balance_history():
+    for path in (BALANCE_HISTORY_FILE, get_balance_history_backup_file()):
+        if not os.path.exists(path):
+            continue
+
+        try:
+            normalized = normalize_balance_history(load_balance_history_json(path))
+
+            if normalized or path == BALANCE_HISTORY_FILE:
+                if path == get_balance_history_backup_file() and normalized:
+                    print("BALANCE_HISTORY RESTORED from backup file", flush=True)
+                    write_balance_history(normalized, allow_shrink=True)
+
+                return normalized
+        except (OSError, json.JSONDecodeError) as error:
+            print(f"BALANCE_HISTORY READ ERROR path={path} err={error}", flush=True)
+            if path == BALANCE_HISTORY_FILE:
+                archive_balance_history_read_error(error)
+
+    return []
+
+
+def write_balance_history(history, allow_shrink=False):
     normalized = normalize_balance_history(history)
+    existing_point_count = max(
+        count_balance_history_points(BALANCE_HISTORY_FILE),
+        count_balance_history_points(get_balance_history_backup_file()),
+    )
+
+    if (
+        not allow_shrink
+        and existing_point_count >= 2
+        and len(normalized) < existing_point_count
+    ):
+        print(
+            "BALANCE_HISTORY WRITE BLOCKED "
+            f"existing={existing_point_count} next={len(normalized)}",
+            flush=True,
+        )
+        return read_balance_history()
+
     history_dir = os.path.dirname(BALANCE_HISTORY_FILE)
 
     if history_dir:
         os.makedirs(history_dir, exist_ok=True)
+
+    backup_balance_history_file()
 
     fd, temp_path = tempfile.mkstemp(
         prefix=".balance_history.",
@@ -298,6 +395,18 @@ def record_balance_history_point(total_usd):
     now = int(time.time())
     bucket_time = (now // BALANCE_HISTORY_BUCKET_SECONDS) * BALANCE_HISTORY_BUCKET_SECONDS
     history = read_balance_history()
+
+    if (
+        not history
+        and os.path.exists(BALANCE_HISTORY_FILE)
+        and os.path.getsize(BALANCE_HISTORY_FILE) > 10
+    ):
+        print(
+            "BALANCE_HISTORY WARN refusing write after empty read "
+            f"file_bytes={os.path.getsize(BALANCE_HISTORY_FILE)}",
+            flush=True,
+        )
+        return history
 
     if any(point["time"] == bucket_time for point in history):
         return history
@@ -1158,6 +1267,22 @@ def normalize_candle_rows(rows):
     return candles
 
 
+def build_candle_price_range(candles):
+    if not candles:
+        return None
+
+    chart_min = min(candle["low"] for candle in candles)
+    chart_max = max(candle["high"] for candle in candles)
+    min_span = max(abs(chart_max) * 0.005, 0.01)
+    span = max(chart_max - chart_min, min_span)
+    padding = span * DEPTH_CHART_PADDING_RATIO
+
+    return {
+        "min_price": chart_min - padding,
+        "max_price": chart_max + padding,
+    }
+
+
 def aggregate_candles(candles, bucket_seconds):
     buckets = {}
 
@@ -1254,6 +1379,28 @@ def is_open_order_status(status):
     if not normalized:
         return True
 
+    if normalized in {
+        "OPEN",
+        "PENDING",
+        "QUEUED",
+        "ACTIVE",
+        "PARTIALLY_FILLED",
+    }:
+        return True
+
+    if normalized in {
+        "FILLED",
+        "CANCELLED",
+        "CANCELED",
+        "EXPIRED",
+        "FAILED",
+        "REJECTED",
+    }:
+        return False
+
+    if "PARTIALLY" in normalized:
+        return True
+
     closed_markers = (
         "CANCEL",
         "FILLED",
@@ -1268,7 +1415,7 @@ def is_open_order_status(status):
 @app.get("/api/candles")
 def get_candles(
     product_id: Annotated[str, Query()] = PRODUCT_ID,
-    days: Annotated[int, Query(ge=1, le=28)] = 7,
+    days: Annotated[int, Query(ge=1, le=28)] = 5,
     granularity: Annotated[Optional[int], Query()] = None,
     end_time: Annotated[Optional[int], Query()] = None,
     limit: Annotated[int, Query(ge=1, le=CANDLE_REQUEST_LIMIT)] = CANDLE_REQUEST_LIMIT,
@@ -1283,7 +1430,12 @@ def get_candles(
         start = end - timedelta(days=days)
 
     rows = fetch_coinbase_candles(product_id, start, end, candle_granularity)
-    return normalize_candle_rows(rows)
+    candles = normalize_candle_rows(rows)
+
+    return {
+        "candles": candles,
+        "price_range": build_candle_price_range(candles),
+    }
 
 
 @app.get("/api/product")
@@ -1976,7 +2128,7 @@ async def live_app_state(websocket: WebSocket):
 async def live_market(
     websocket: WebSocket,
     product_id: str = PRODUCT_ID,
-    days: int = 7,
+    days: int = 5,
     granularity: Optional[int] = None,
     min_price: Optional[float] = None,
     max_price: Optional[float] = None,

@@ -3,8 +3,10 @@ export const API_BASE = import.meta.env.VITE_API_BASE
 
 export const DISTRIBUTION_BINS = 160;
 export const DEPTH_RANGE_PADDING = 1.2;
+export const DEPTH_CHART_PADDING_RATIO = 0.13;
 export const MIN_DEPTH_WIDTH_RATIO = 0.1;
-export const DEFAULT_VISIBLE_HOURS = 24;
+export const DEFAULT_PERIOD_DAYS = 5;
+export const MAX_VISIBLE_PERIOD_DAYS = 20;
 export const DEFAULT_DEPTH_CHART_WIDTH_RATIO = 0.15;
 export const PRICE_PRECISION = 6;
 export const PRICE_MIN_MOVE = 0.000001;
