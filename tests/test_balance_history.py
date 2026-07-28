@@ -45,6 +45,20 @@ class BalanceHistoryTests(unittest.TestCase):
         self.assertEqual(len(history), 2)
         self.assertEqual(history[-1]["total_usd"], 1100.0)
 
+    def test_written_history_includes_human_readable_utc_time(self):
+        history_path = self.with_history_file()
+
+        app.write_balance_history([
+            {"time": 1_704_067_200, "total_usd": 1000.0},
+        ], allow_shrink=True)
+
+        with open(history_path, "r", encoding="utf-8") as history_file:
+            saved_history = json.load(history_file)
+
+        self.assertEqual(saved_history[0]["time"], 1_704_067_200)
+        self.assertEqual(saved_history[0]["time_utc"], "01/01/2024 00:00")
+        self.assertEqual(saved_history[0]["total_usd"], 1000.0)
+
     def test_prunes_points_older_than_five_years(self):
         now = 1_800_000_000
         cutoff = now - app.BALANCE_HISTORY_RETENTION_SECONDS

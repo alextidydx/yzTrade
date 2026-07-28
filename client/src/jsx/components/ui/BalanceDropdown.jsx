@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useId, useState } from "react";
 
 import "../../../styles/ui/dropdownShared.scss";
 import "../../../styles/ui/balanceDropdown.scss";
@@ -8,18 +8,105 @@ import {
 	formatUsdCents,
 } from "../../../utils/homeUtils";
 
-const getVisibleBalances = (balances) => (
-	(Array.isArray(balances) ? balances : []).filter(balance => {
-		if (balance.currency === "USDC") return true;
+const getBalanceCurrency = (balance) => String(balance?.currency || "").trim().toUpperCase();
 
-		const isCashBalance = balance.currency === "USD";
-		const balanceValue = isCashBalance
-			? Number(balance.total)
-			: Number(balance.usd_value);
+const getBalanceUsdValue = (balance) => {
+	const currency = getBalanceCurrency(balance);
 
-		return Number.isFinite(balanceValue) && balanceValue >= 0.99;
-	})
-);
+	if (currency === "USD" || currency === "USDC") {
+		return Number(balance?.total);
+	}
+
+	return Number(balance?.usd_value);
+};
+
+const isBookmarkedCurrency = (currency, appBookmarks, getBookmarkedPrice) => {
+	const key = String(currency || "").trim().toUpperCase();
+
+	if (!key) return false;
+
+	if (appBookmarks && typeof appBookmarks === "object") {
+		if (Object.prototype.hasOwnProperty.call(appBookmarks, key)) {
+			const price = Number(appBookmarks[key]);
+
+			return Number.isFinite(price) && price > 0;
+		}
+
+		// App state loaded but this currency isn't bookmarked there.
+		if (appBookmarks !== null) return false;
+	}
+
+	const fallbackPrice = Number(getBookmarkedPrice?.(key));
+
+	return Number.isFinite(fallbackPrice) && fallbackPrice > 0;
+};
+
+const listBookmarkedCurrencies = (appBookmarks, getBookmarkedPrice) => {
+	const currencies = new Set();
+
+	if (appBookmarks && typeof appBookmarks === "object") {
+		Object.keys(appBookmarks).forEach((key) => {
+			if (isBookmarkedCurrency(key, appBookmarks, getBookmarkedPrice)) {
+				currencies.add(String(key).trim().toUpperCase());
+			}
+		});
+	}
+
+	return [...currencies];
+};
+
+const getVisibleBalances = (balances, appBookmarks, getBookmarkedPrice) => {
+	const list = Array.isArray(balances) ? balances : [];
+	const visible = [];
+	const seen = new Set();
+
+	list.forEach((balance) => {
+		const currency = getBalanceCurrency(balance);
+
+		if (!currency || seen.has(currency)) return;
+
+		if (currency === "USDC") {
+			visible.push(balance);
+			seen.add(currency);
+			return;
+		}
+
+		const balanceValue = getBalanceUsdValue(balance);
+		const hasMaterialValue = Number.isFinite(balanceValue) && balanceValue >= 0.99;
+
+		if (hasMaterialValue) {
+			visible.push(balance);
+			seen.add(currency);
+			return;
+		}
+
+		if (currency === "USD") return;
+
+		if (isBookmarkedCurrency(currency, appBookmarks, getBookmarkedPrice)) {
+			visible.push(balance);
+			seen.add(currency);
+		}
+	});
+
+	listBookmarkedCurrencies(appBookmarks, getBookmarkedPrice).forEach((currency) => {
+		if (seen.has(currency)) return;
+
+		const existing = list.find(balance => getBalanceCurrency(balance) === currency);
+
+		visible.push(existing || {
+			currency,
+			available: 0,
+			hold: 0,
+			total: 0,
+			usd_price: null,
+			usd_value: 0,
+			product_id: `${currency}-USD`,
+		});
+		seen.add(currency);
+	});
+
+	return visible;
+};
 
 const BALANCE_PERIODS = [
 	{ key: "day", label: "DAY", seconds: 24 * 60 * 60 },
@@ -116,7 +203,9 @@ const buildSmoothLinePath = (plotPoints, xForTime, yForValue) => {
 
 const BalanceHistoryPlot = ({
 	error,
+	isColorLine,
 	isLoading,
+	onColorLineChange,
 	onPeriodChange,
 	period,
 	points,
@@ -124,6 +213,7 @@ const BalanceHistoryPlot = ({
 	total,
 }) => {
 	const [activeIndex, setActiveIndex] = useState(null);
+	const lineGradientId = `balance-history-${useId().replace(/:/g, "")}`;
 	const width = 312;
 	const height = 92;
 	const padX = 8;
@@ -186,8 +276,46 @@ const BalanceHistoryPlot = ({
 	}
 
 	const linePath = buildSmoothLinePath(plotPoints, xForTime, yForValue);
+	const lineGradientStops = plotPoints.map((point, index) => {
+		const value = Number(point.total_usd);
+		const previousValue = Number(plotPoints[index - 1]?.total_usd);
+		const color = index === 0 || !Number.isFinite(value) || !Number.isFinite(previousValue)
+			? "#7e8b98"
+			: value > previousValue
+				? "#20b28f"
+				: value < previousValue
+					? "#ee5858"
+					: "#7e8b98";
+
+		return {
+			color: isColorLine ? color : "#7e8b98",
+			offset: `${((Number(point.time) - firstTime) / timeSpan) * 100}%`,
+		};
+	});
 
 	const activePoint = Number.isInteger(activeIndex) ? plotPoints[activeIndex] : null;
+	const previousPoint = Number.isInteger(activeIndex) && activeIndex > 0
+		? plotPoints[activeIndex - 1]
+		: null;
+	const activeValue = Number(activePoint?.total_usd);
+	const previousValue = Number(previousPoint?.total_usd);
+	const activeDeltaPercent = (
+		Number.isFinite(activeValue)
+		&& Number.isFinite(previousValue)
+		&& previousValue > 0
+	)
+		? ((activeValue - previousValue) / previousValue) * 100
+		: null;
+	const activeDeltaClass = activeDeltaPercent === null
+		? ""
+		: activeDeltaPercent > 0
+			? "e__balance-history__delta--up"
+			: activeDeltaPercent < 0
+				? "e__balance-history__delta--down"
+				: "e__balance-history__delta--flat";
+	const activeDeltaLabel = activeDeltaPercent === null
+		? ""
+		: `${activeDeltaPercent > 0 ? "+" : ""}${activeDeltaPercent.toFixed(1)}%`;
 
 	const handleMove = (event) => {
 		const rect = event.currentTarget.getBoundingClientRect();
@@ -226,6 +354,23 @@ const BalanceHistoryPlot = ({
 						{item.label}
 					</button>
 				))}
+				<div className="e__balance-history__color-mode">
+					<button
+						className={isColorLine ? "is-active" : ""}
+						type="button"
+						onClick={() => onColorLineChange(true)}
+					>
+						COLOR
+					</button>
+					<span>/</span>
+					<button
+						className={!isColorLine ? "is-active" : ""}
+						type="button"
+						onClick={() => onColorLineChange(false)}
+					>
+						GRAY
+					</button>
+				</div>
 			</div>
 
 			{error ? (
@@ -239,6 +384,24 @@ const BalanceHistoryPlot = ({
 					onMouseMove={handleMove}
 					onMouseLeave={handleLeave}
 				>
+					<defs>
+						<linearGradient
+							id={lineGradientId}
+							gradientUnits="userSpaceOnUse"
+							x1={padX}
+							x2={width - padX}
+							y1={0}
+							y2={0}
+						>
+							{lineGradientStops.map((stop, index) => (
+								<stop
+									key={`${stop.offset}-${index}`}
+									offset={stop.offset}
+									stopColor={stop.color}
+								/>
+							))}
+						</linearGradient>
+					</defs>
 					{/* gaps can be added back here if you want */}
 					<line className="e__balance-history__axis" x1={0} x2={width} y1={axisY} y2={axisY} />
 					{dayMarks.map(markTime => (
@@ -251,7 +414,11 @@ const BalanceHistoryPlot = ({
 							y2={axisY}
 						/>
 					))}
-					<path className="e__balance-history__line" d={linePath} />
+					<path
+						className="e__balance-history__line"
+						d={linePath}
+						style={{ stroke: `url(#${lineGradientId})` }}
+					/>
 
 					{activePoint && (
 						<g className="e__balance-history__hover">
@@ -278,6 +445,11 @@ const BalanceHistoryPlot = ({
 					{activePoint 
 						? formatUsdCents(activePoint.total_usd) 
 						: formatUsdCents(total)}
+					{activeDeltaLabel && (
+						<b className={`e__balance-history__delta ${activeDeltaClass}`}>
+							{` (${activeDeltaLabel})`}
+						</b>
+					)}
 				</span>
 				<strong>
 					{activePoint
@@ -289,17 +461,63 @@ const BalanceHistoryPlot = ({
 	);
 };
 
-const BalanceRowContent = ({ balance, getBookmarkDelta }) => {
-	const isCashBalance = balance.currency === "USD" || balance.currency === "USDC";
-	const balanceValue = isCashBalance
-		? balance.total
-		: balance.usd_value;
+const isDustBookmarkBalance = (balance, appBookmarks, getBookmarkedPrice) => {
+	const currency = getBalanceCurrency(balance);
+	const isCashBalance = currency === "USD" || currency === "USDC";
+	const balanceValue = getBalanceUsdValue(balance);
+	const hasMaterialValue = Number.isFinite(Number(balanceValue)) && Number(balanceValue) >= 0.99;
+
+	return !isCashBalance
+		&& !hasMaterialValue
+		&& isBookmarkedCurrency(currency, appBookmarks, getBookmarkedPrice);
+};
+
+const BalanceRowContent = ({
+	appBookmarks,
+	balance,
+	getBookmarkDelta,
+	getBookmarkedPrice,
+	onClearBookmark,
+}) => {
+	const currency = getBalanceCurrency(balance);
+	const isCashBalance = currency === "USD" || currency === "USDC";
+	const balanceValue = getBalanceUsdValue(balance);
 	const availableBalance = Number(balance.available);
-	const bookmarkDelta = getBookmarkDelta(balance);
+	const bookmarkDelta = getBookmarkDelta?.(balance);
+	const isDustBookmarkRow = isDustBookmarkBalance(balance, appBookmarks, getBookmarkedPrice);
+
+	if (isDustBookmarkRow) {
+		const deltaClass = bookmarkDelta
+			? `e__profile-row__bookmark ${bookmarkDelta.isPositive ? "e__profile-row__bookmark--up" : "e__profile-row__bookmark--down"}`
+			: "e__profile-row__bookmark";
+
+		return (
+			<>
+				<span className="e__profile-row__currency">{currency}</span>
+				<span className="e__profile-row__amount" aria-hidden="true" />
+				<span className="e__profile-row__value e__profile-row__value--dust">
+					<small className={deltaClass}>
+						{bookmarkDelta?.percentLabel || bookmarkDelta?.label || "--"}
+					</small>
+					<button
+						className="e__profile-row__clear-bookmark"
+						type="button"
+						aria-label={`Remove ${currency} bookmark`}
+						onClick={event => onClearBookmark?.(currency, event)}
+					>
+						<svg viewBox="-8 -8 16 16" aria-hidden="true">
+							<circle r={7} />
+							<path d="M -2.24 -2.24 L 2.24 2.24 M 2.24 -2.24 L -2.24 2.24" />
+						</svg>
+					</button>
+				</span>
+			</>
+		);
+	}
 
 	return (
 		<>
-			<span className="e__profile-row__currency">{balance.currency}</span>
+			<span className="e__profile-row__currency">{currency}</span>
 			<span className="e__profile-row__amount">
 				{isCashBalance
 					? Number.isFinite(availableBalance)
@@ -320,6 +538,7 @@ const BalanceRowContent = ({ balance, getBookmarkDelta }) => {
 };
 
 const BalanceDropdown = ({
+	appBookmarks,
 	balanceHistory,
 	balanceHistoryError,
 	balanceHistoryLoadedPeriod,
@@ -328,17 +547,23 @@ const BalanceDropdown = ({
 	balances,
 	error,
 	getBookmarkDelta,
+	getBookmarkedPrice,
 	isClosing,
+	isHistoryColored,
 	isLoading,
 	isOpen,
+	isRefreshing,
 	isTotalExpanded,
 	onCurrencyClick,
+	onClearBookmark,
+	onHistoryColoredChange,
 	onHistoryPeriodChange,
+	onRefresh,
 	onTotalExpandedChange,
 	onToggle,
 	total,
 }) => {
-	const visibleBalances = getVisibleBalances(balances);
+	const visibleBalances = getVisibleBalances(balances, appBookmarks, getBookmarkedPrice);
 	const totalLabel = Number.isFinite(Number(total)) ? formatUsdCents(total) : "--";
 
 	return (
@@ -358,23 +583,52 @@ const BalanceDropdown = ({
 
 			{(isOpen || isClosing) && (
 				<div className={`e__profile-menu ${isOpen ? "is-open" : "is-closing"}`}>
-					<button
+					<div
 						className="e__profile-menu__head"
-						type="button"
 						onClick={() => onTotalExpandedChange(!isTotalExpanded)}
 					>
-						<span>Total</span>
-						<strong>{totalLabel}</strong>
-						<span className={`e__profile-caret ${isTotalExpanded ? "e__profile-caret--open" : ""}`}>
-							<span className="e__dropdown-icon" aria-hidden="true" />
-						</span>
-					</button>
+						<button
+							className="e__profile-menu__head-label"
+							type="button"
+							aria-label={isTotalExpanded ? "Collapse total balance history" : "Expand total balance history"}
+						>
+							<span>Total</span>
+						</button>
+						<button
+							className="e__profile-menu__refresh"
+							type="button"
+							onPointerDown={event => event.stopPropagation()}
+							onClick={(event) => {
+								event.stopPropagation();
+								onRefresh();
+							}}
+							disabled={isRefreshing}
+							aria-label="Refresh balances"
+							title="Refresh balances"
+						>
+							<span className={isRefreshing ? "e__profile-refresh-icon is-spinning" : "e__profile-refresh-icon"}>
+								↻
+							</span>
+						</button>
+						<button
+							className="e__profile-menu__head-value"
+							type="button"
+							aria-label={isTotalExpanded ? "Collapse total balance history" : "Expand total balance history"}
+						>
+							<strong>{totalLabel}</strong>
+							<span className={`e__profile-caret ${isTotalExpanded ? "e__profile-caret--open" : ""}`}>
+								<span className="e__dropdown-icon" aria-hidden="true" />
+							</span>
+						</button>
+					</div>
 
 					<div className={`e__balance-history-wrap ${isTotalExpanded ? "is-expanded" : ""}`}>
 						<div className="e__balance-history-wrap__inner">
 							<BalanceHistoryPlot
 								error={balanceHistoryError}
+								isColorLine={isHistoryColored}
 								isLoading={balanceHistoryLoading}
+								onColorLineChange={onHistoryColoredChange}
 								onPeriodChange={onHistoryPeriodChange}
 								period={balanceHistoryLoadedPeriod}
 								points={balanceHistory}
@@ -393,17 +647,30 @@ const BalanceDropdown = ({
 					<div className="e__profile-list">
 						{visibleBalances.map(balance => {
 							const isNavigable = balance.currency !== "USD" && balance.product_id;
+							const isDustBookmarkRow = isDustBookmarkBalance(
+								balance,
+								appBookmarks,
+								getBookmarkedPrice,
+							);
+							const rowClassName = [
+								"e__profile-row",
+								!isNavigable ? "e__profile-row--static" : "",
+								isDustBookmarkRow ? "e__profile-row--dust" : "",
+							].filter(Boolean).join(" ");
 							const rowContent = (
 								<BalanceRowContent
+									appBookmarks={appBookmarks}
 									balance={balance}
 									getBookmarkDelta={getBookmarkDelta}
+									getBookmarkedPrice={getBookmarkedPrice}
+									onClearBookmark={onClearBookmark}
 								/>
 							);
 
 							return isNavigable ? (
 								<a
 									key={balance.currency}
-									className="e__profile-row"
+									className={rowClassName}
 									href={`/${balance.currency}`}
 									onClick={event => onCurrencyClick(event, balance.currency)}
 								>
@@ -412,7 +679,7 @@ const BalanceDropdown = ({
 							) : (
 								<div
 									key={balance.currency}
-									className="e__profile-row e__profile-row--static"
+									className={rowClassName}
 								>
 									{rowContent}
 								</div>

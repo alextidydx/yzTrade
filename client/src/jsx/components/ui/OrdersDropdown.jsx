@@ -1,5 +1,3 @@
-import React from "react";
-
 import "../../../styles/ui/dropdownShared.scss";
 import "../../../styles/ui/ordersDropdown.scss";
 

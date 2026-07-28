@@ -13,8 +13,8 @@ class CandlePriceRangeTests(unittest.TestCase):
 
         price_range = app.build_candle_price_range(candles)
 
-        self.assertEqual(price_range["min_price"], 7.09)
-        self.assertEqual(price_range["max_price"], 15.91)
+        self.assertEqual(price_range["min_price"], 8.0 * (1 - app.DEPTH_CHART_PADDING_RATIO))
+        self.assertEqual(price_range["max_price"], 15.0 * (1 + app.DEPTH_CHART_PADDING_RATIO))
 
 
 if __name__ == "__main__":

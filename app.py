@@ -3,6 +3,8 @@ import asyncio
 import base64
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal, ROUND_DOWN, InvalidOperation
+from functools import partial, wraps
+import hashlib
 import json
 import math
 import os
@@ -11,6 +13,7 @@ import shutil
 import ssl
 import subprocess
 import tempfile
+from threading import Lock
 import time
 from typing import Annotated, Optional
 from urllib.error import HTTPError, URLError
@@ -31,7 +34,7 @@ COINBASE_USER_WS_API = "wss://advanced-trade-ws-user.coinbase.com"
 PRODUCT_ID = os.getenv("COINBASE_PRODUCT_ID", "BTC-USD")
 GRANULARITY_SECONDS = 3600
 CANDLE_REQUEST_LIMIT = 300
-DEPTH_CHART_PADDING_RATIO = 0.13
+DEPTH_CHART_PADDING_RATIO = 0.09
 PUBLIC_DIR = os.path.join(os.path.dirname(__file__), "public")
 INDEX_HTML = os.path.join(PUBLIC_DIR, "index.html")
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
@@ -52,6 +55,7 @@ DEFAULT_APP_STATE = {
     "yzTrade": {
         "bookmarks": {},
         "settings": {
+            "balanceHistoryColored": True,
             "balanceHistoryExpanded": False,
             "balanceHistoryPeriod": "week",
         },
@@ -59,6 +63,7 @@ DEFAULT_APP_STATE = {
 }
 USD_PEGGED_CURRENCIES = {"USD", "USDC", "USDT", "DAI", "PYUSD"}
 BALANCE_HISTORY_PERIODS = {"day", "week", "30d", "all"}
+PRE_CONFIRMATION_ORDER_STATUSES = {"PENDING", "QUEUED"}
 DEFAULT_MONITOR_TICKERS = [
     "BTC",
     "ETH",
@@ -147,6 +152,9 @@ def normalize_app_state(raw_state):
     }
     normalized["yzTrade"]["settings"]["balanceHistoryExpanded"] = bool(
         normalized["yzTrade"]["settings"].get("balanceHistoryExpanded")
+    )
+    normalized["yzTrade"]["settings"]["balanceHistoryColored"] = bool(
+        normalized["yzTrade"]["settings"].get("balanceHistoryColored")
     )
     normalized["yzTrade"]["settings"]["balanceHistoryPeriod"] = normalize_balance_history_period(
         normalized["yzTrade"]["settings"].get("balanceHistoryPeriod")
@@ -238,6 +246,9 @@ def set_app_state_settings(settings):
     if "balanceHistoryExpanded" in settings:
         current_settings["balanceHistoryExpanded"] = bool(settings.get("balanceHistoryExpanded"))
 
+    if "balanceHistoryColored" in settings:
+        current_settings["balanceHistoryColored"] = bool(settings.get("balanceHistoryColored"))
+
     if "balanceHistoryPeriod" in settings:
         current_settings["balanceHistoryPeriod"] = normalize_balance_history_period(
             settings.get("balanceHistoryPeriod")
@@ -271,6 +282,20 @@ def normalize_balance_history(raw_history, now=None):
     normalized.sort(key=lambda point: point["time"])
 
     return normalized
+
+
+def serialize_balance_history(history):
+    return [
+        {
+            "time": point["time"],
+            "time_utc": datetime.fromtimestamp(
+                point["time"],
+                timezone.utc,
+            ).strftime("%m/%d/%Y %H:%M"),
+            "total_usd": point["total_usd"],
+        }
+        for point in history
+    ]
 
 
 def load_balance_history_json(path):
@@ -372,7 +397,7 @@ def write_balance_history(history, allow_shrink=False):
 
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as temp_file:
-            json.dump(normalized, temp_file, indent=2, sort_keys=True)
+            json.dump(serialize_balance_history(normalized), temp_file, indent=2, sort_keys=True)
             temp_file.write("\n")
 
         os.replace(temp_path, BALANCE_HISTORY_FILE)
@@ -468,12 +493,20 @@ APP_PORT = int(os.getenv("APP_PORT", "5003"))
 APP_RELOAD = os.getenv("APP_RELOAD", "true").strip().lower() in {"1", "true", "yes", "on"}
 
 app = FastAPI()
+COINBASE_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="coinbase")
 live_client_count = 0
 app_state_clients = set()
 app_state_lock = asyncio.Lock()
+balance_generation = 0
+processed_balance_event_ids = set()
+processed_balance_event_id_queue = []
+usd_price_cache = {}
+usd_price_cache_lock = Lock()
 APP_STATE_HEARTBEAT_SECONDS = 10
 COINBASE_LIVE_STALE_SECONDS = 25
 COINBASE_DEPTH_WS_MAX_SIZE = 16 * 1024 * 1024
+USD_PRICE_CACHE_SECONDS = 60
+BALANCE_EVENT_ID_CACHE_SIZE = 200
 
 app.add_middleware(
     CORSMiddleware,
@@ -482,6 +515,44 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+async def run_coinbase_call(func, *args, **kwargs):
+    loop = asyncio.get_running_loop()
+
+    return await loop.run_in_executor(
+        COINBASE_EXECUTOR,
+        partial(func, *args, **kwargs),
+    )
+
+
+def register_balance_order_event(event_id):
+    global balance_generation
+
+    normalized_event_id = str(event_id or "").strip()
+
+    if normalized_event_id and normalized_event_id in processed_balance_event_ids:
+        return balance_generation
+
+    if normalized_event_id:
+        processed_balance_event_ids.add(normalized_event_id)
+        processed_balance_event_id_queue.append(normalized_event_id)
+
+        if len(processed_balance_event_id_queue) > BALANCE_EVENT_ID_CACHE_SIZE:
+            expired_event_id = processed_balance_event_id_queue.pop(0)
+            processed_balance_event_ids.discard(expired_event_id)
+
+    balance_generation += 1
+    return balance_generation
+
+
+def coinbase_worker_endpoint(func):
+    @wraps(func)
+    async def wrapped(*args, **kwargs):
+        return await run_coinbase_call(func, *args, **kwargs)
+
+    return wrapped
+
 
 if os.path.isdir(os.path.join(PUBLIC_DIR, "assets")):
     app.mount(
@@ -763,6 +834,14 @@ def get_usd_price_for_currency(currency):
     if normalized_currency in USD_PEGGED_CURRENCIES:
         return 1.0
 
+    now = time.monotonic()
+
+    with usd_price_cache_lock:
+        cached = usd_price_cache.get(normalized_currency)
+
+    if cached and now - cached["time"] < USD_PRICE_CACHE_SECONDS:
+        return cached["price"]
+
     try:
         ticker = coinbase_get(f"/products/{normalized_currency}-USD/ticker")
     except HTTPException:
@@ -770,7 +849,16 @@ def get_usd_price_for_currency(currency):
 
     price = parse_float(ticker.get("price"))
 
-    return price if price is not None and price > 0 else None
+    if price is None or price <= 0:
+        return None
+
+    with usd_price_cache_lock:
+        usd_price_cache[normalized_currency] = {
+            "price": price,
+            "time": now,
+        }
+
+    return price
 
 
 def parse_order_price(value):
@@ -1273,17 +1361,14 @@ def build_candle_price_range(candles):
 
     chart_min = min(candle["low"] for candle in candles)
     chart_max = max(candle["high"] for candle in candles)
-    min_span = max(abs(chart_max) * 0.005, 0.01)
-    span = max(chart_max - chart_min, min_span)
-    padding = span * DEPTH_CHART_PADDING_RATIO
 
     return {
-        "min_price": chart_min - padding,
-        "max_price": chart_max + padding,
+        "min_price": chart_min * (1 - DEPTH_CHART_PADDING_RATIO),
+        "max_price": chart_max * (1 + DEPTH_CHART_PADDING_RATIO),
     }
 
 
-def aggregate_candles(candles, bucket_seconds):
+def aggregate_candles(candles, bucket_seconds, time_at_bucket_end=True):
     buckets = {}
 
     for candle in candles:
@@ -1317,7 +1402,7 @@ def aggregate_candles(candles, bucket_seconds):
 
     aggregated = [
         {
-            "time": bucket["time"] + bucket_seconds,
+            "time": bucket["time"] + bucket_seconds if time_at_bucket_end else bucket["time"],
             "open": bucket["open"],
             "high": bucket["high"],
             "low": bucket["low"],
@@ -1412,7 +1497,20 @@ def is_open_order_status(status):
     return not any(marker in normalized for marker in closed_markers)
 
 
+def get_balance_refresh_mode_for_order_status(status):
+    normalized = str(status or "").upper()
+
+    if not normalized or normalized in PRE_CONFIRMATION_ORDER_STATUSES:
+        return None
+
+    if normalized == "PARTIALLY_FILLED" or "PARTIALLY" in normalized:
+        return "debounced"
+
+    return "immediate"
+
+
 @app.get("/api/candles")
+@coinbase_worker_endpoint
 def get_candles(
     product_id: Annotated[str, Query()] = PRODUCT_ID,
     days: Annotated[int, Query(ge=1, le=28)] = 5,
@@ -1421,6 +1519,9 @@ def get_candles(
     limit: Annotated[int, Query(ge=1, le=CANDLE_REQUEST_LIMIT)] = CANDLE_REQUEST_LIMIT,
 ):
     candle_granularity = get_granularity_for_days(days, granularity)
+    # Coinbase Exchange does not expose 4h (14400); fetch 1h and aggregate.
+    four_hour_seconds = 4 * 60 * 60
+    fetch_granularity = 3600 if candle_granularity == four_hour_seconds else candle_granularity
 
     if end_time is not None:
         end = datetime.fromtimestamp(end_time, timezone.utc)
@@ -1429,8 +1530,11 @@ def get_candles(
         end = datetime.now(timezone.utc)
         start = end - timedelta(days=days)
 
-    rows = fetch_coinbase_candles(product_id, start, end, candle_granularity)
+    rows = fetch_coinbase_candles(product_id, start, end, fetch_granularity)
     candles = normalize_candle_rows(rows)
+
+    if candle_granularity == four_hour_seconds:
+        candles = aggregate_candles(candles, four_hour_seconds, time_at_bucket_end=False)
 
     return {
         "candles": candles,
@@ -1439,6 +1543,7 @@ def get_candles(
 
 
 @app.get("/api/product")
+@coinbase_worker_endpoint
 def get_product(
     product_id: Annotated[str, Query()] = PRODUCT_ID,
 ):
@@ -1454,6 +1559,7 @@ def get_product(
 
 
 @app.get("/api/product-stats")
+@coinbase_worker_endpoint
 def get_product_stats(
     product_id: Annotated[str, Query()] = PRODUCT_ID,
 ):
@@ -1476,6 +1582,7 @@ def get_product_stats(
 
 
 @app.get("/api/td-sequential")
+@coinbase_worker_endpoint
 def get_td_sequential(
     product_id: Annotated[str, Query()] = PRODUCT_ID,
     days: Annotated[int, Query(ge=7, le=56)] = 28,
@@ -1514,6 +1621,13 @@ def fetch_monitor_ticker(currency):
             else None
         )
 
+        if last_price is not None and last_price > 0:
+            with usd_price_cache_lock:
+                usd_price_cache[currency] = {
+                    "price": last_price,
+                    "time": time.monotonic(),
+                }
+
         return {
             "currency": currency,
             "product_id": product_id,
@@ -1542,9 +1656,11 @@ def get_monitor_config():
 
 
 @app.get("/api/monitor-tickers")
-def get_monitor_tickers():
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        tickers = list(executor.map(fetch_monitor_ticker, MONITOR_TICKERS))
+async def get_monitor_tickers():
+    tickers = await asyncio.gather(*(
+        run_coinbase_call(fetch_monitor_ticker, currency)
+        for currency in MONITOR_TICKERS
+    ))
 
     return {
         "quote_currency": "USD",
@@ -1554,6 +1670,7 @@ def get_monitor_tickers():
 
 
 @app.get("/api/depth")
+@coinbase_worker_endpoint
 def get_depth(
     product_id: Annotated[str, Query()] = PRODUCT_ID,
     min_price: Annotated[Optional[float], Query()] = None,
@@ -1606,6 +1723,7 @@ def get_depth(
 
 
 @app.get("/api/orders")
+@coinbase_worker_endpoint
 def get_orders(
     product_id: Annotated[str, Query()] = PRODUCT_ID,
     all_products: Annotated[bool, Query()] = False,
@@ -1690,6 +1808,7 @@ def get_orders(
 
 
 @app.post("/api/orders/cancel")
+@coinbase_worker_endpoint
 def cancel_order(
     order_id: Annotated[str, Query()],
 ):
@@ -1735,6 +1854,7 @@ def cancel_order(
 
 
 @app.post("/api/orders/place")
+@coinbase_worker_endpoint
 def place_order(order: dict):
     order_request = build_coinbase_order_request(order, include_client_order_id=True)
     body = order_request["body"]
@@ -1837,6 +1957,7 @@ def normalize_preview_response(response):
 
 
 @app.post("/api/orders/preview")
+@coinbase_worker_endpoint
 def preview_order(order: dict):
     order_request = build_coinbase_order_request(order, include_client_order_id=False)
     body = order_request["body"]
@@ -1893,8 +2014,7 @@ def preview_order(order: dict):
     }
 
 
-@app.get("/api/balances")
-def get_balances():
+def fetch_balances():
     try:
         accounts = []
         cursor = None
@@ -1975,6 +2095,37 @@ def get_balances():
             "product_id": None,
         })
 
+    existing_currencies = {balance["currency"] for balance in balances}
+
+    try:
+        bookmark_currencies = list(
+            ((read_app_state().get("yzTrade") or {}).get("bookmarks") or {}).keys()
+        )
+    except Exception:
+        bookmark_currencies = []
+
+    for raw_currency in bookmark_currencies:
+        currency = str(raw_currency or "").upper()
+
+        if (
+            not currency
+            or currency in existing_currencies
+            or currency in USD_PEGGED_CURRENCIES
+        ):
+            continue
+
+        usd_price = get_usd_price_for_currency(currency)
+        balances.append({
+            "currency": currency,
+            "available": 0.0,
+            "hold": 0.0,
+            "total": 0.0,
+            "usd_price": usd_price,
+            "usd_value": 0.0,
+            "product_id": f"{currency}-USD",
+        })
+        existing_currencies.add(currency)
+
     pinned_currency_order = {
         "USD": 0,
         "USDC": 1,
@@ -2006,6 +2157,20 @@ def get_balances():
         "priced_total": priced_total,
         "unpriced_total": unpriced_total,
         "balances": balances,
+    }
+
+
+@app.get("/api/balances")
+async def get_balances(
+    generation: Annotated[Optional[int], Query(ge=0)] = None,
+):
+    requested_generation = int(generation or 0)
+    required_generation = max(requested_generation, balance_generation)
+    result = await run_coinbase_call(fetch_balances)
+
+    return {
+        **result,
+        "generation": required_generation,
     }
 
 
@@ -2577,14 +2742,38 @@ async def live_market(
 
                 updated_orders = []
                 removed_order_ids = []
+                has_order_event = False
+                balance_refresh_mode = None
+                order_event_states = []
 
                 for event in data.get("events", []):
                     for order in event.get("orders", []):
+                        has_order_event = True
+                        order_id = order.get("order_id")
+                        status = order.get("status")
+                        normalized_status = str(status or "").upper()
+                        order_refresh_mode = get_balance_refresh_mode_for_order_status(
+                            normalized_status
+                        )
+
+                        if order_refresh_mode == "immediate":
+                            balance_refresh_mode = "immediate"
+                        elif order_refresh_mode == "debounced" and balance_refresh_mode is None:
+                            balance_refresh_mode = "debounced"
+
+                        order_event_states.append({
+                            "order_id": order_id,
+                            "product_id": order.get("product_id"),
+                            "status": status,
+                            "filled_size": order.get("filled_size") or order.get("cumulative_quantity"),
+                            "leaves_quantity": order.get("leaves_quantity"),
+                            "completion_percentage": order.get("completion_percentage"),
+                            "order_configuration": order.get("order_configuration"),
+                        })
+
                         if not order_applies_to_product(order, product_id):
                             continue
 
-                        order_id = order.get("order_id")
-                        status = order.get("status")
                         normalized = normalize_order(order)
 
                         if is_open_order_status(status):
@@ -2593,9 +2782,30 @@ async def live_market(
                         elif order_id:
                             removed_order_ids.append(order_id)
 
-                if updated_orders or removed_order_ids:
+                if has_order_event:
+                    event_payload = json.dumps(
+                        sorted(
+                            order_event_states,
+                            key=lambda state: (
+                                str(state.get("order_id") or ""),
+                                str(state.get("status") or ""),
+                            ),
+                        ),
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    event_id = hashlib.sha256(event_payload.encode("utf-8")).hexdigest()
+                    event_generation = (
+                        register_balance_order_event(event_id)
+                        if balance_refresh_mode is not None
+                        else balance_generation
+                    )
                     await send_to_client({
                         "type": "orders_update",
+                        "event_id": event_id,
+                        "balance_generation": event_generation,
+                        "refresh_balances": balance_refresh_mode is not None,
+                        "balance_refresh_mode": balance_refresh_mode,
                         "product_id": product_id,
                         "orders": updated_orders,
                         "removed_order_ids": removed_order_ids,
@@ -2697,7 +2907,7 @@ async def live_market(
 @app.get("/{path:path}")
 @app.get("/trade")
 @app.get("/trade/{path:path}")
-def get_frontend(path: str = ""):
+async def get_frontend(path: str = ""):
     if path.startswith("api/"):
         raise HTTPException(status_code=404, detail="API endpoint not found.")
 

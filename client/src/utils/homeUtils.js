@@ -1,7 +1,12 @@
 import {
 	API_BASE,
 	BOOKMARKED_PRICE_COOKIE,
+	CANDLE_GRANULARITY_COOKIE,
+	CANDLE_GRANULARITY_OPTIONS,
+	CANDLE_GRANULARITY_SECONDS,
 	CHART_TIME_ZONE,
+	DEFAULT_CANDLE_GRANULARITY,
+	DEFAULT_PERIOD_DAYS,
 	PRICE_PRECISION,
 } from "./homeConstants";
 
@@ -60,6 +65,42 @@ export const normalizeBalanceHistoryPeriod = (period, fallback = "week") => {
 	const normalized = String(period || "").trim().toLowerCase();
 
 	return BALANCE_HISTORY_PERIODS.has(normalized) ? normalized : fallback;
+};
+
+export const normalizeCandleGranularity = (value, fallback = DEFAULT_CANDLE_GRANULARITY) => {
+	const numeric = Number(value);
+
+	if (CANDLE_GRANULARITY_SECONDS.has(numeric)) {
+		return numeric;
+	}
+
+	return fallback;
+};
+
+export const getCandleGranularityLabel = (seconds) => {
+	const match = CANDLE_GRANULARITY_OPTIONS.find(option => option.seconds === Number(seconds));
+
+	return match?.label || "5m";
+};
+
+export const getPeriodDaysForGranularity = (seconds) => {
+	const match = CANDLE_GRANULARITY_OPTIONS.find(option => option.seconds === Number(seconds));
+
+	return Number.isFinite(Number(match?.periodDays)) && Number(match.periodDays) > 0
+		? Number(match.periodDays)
+		: DEFAULT_PERIOD_DAYS;
+};
+
+export const getCandleGranularity = () => (
+	normalizeCandleGranularity(getCookie(CANDLE_GRANULARITY_COOKIE))
+);
+
+export const setCandleGranularityCookie = (seconds) => {
+	const normalized = normalizeCandleGranularity(seconds);
+
+	setCookieValue(CANDLE_GRANULARITY_COOKIE, String(normalized));
+
+	return normalized;
 };
 
 export const getBookmarkedPrice = (currency) => {

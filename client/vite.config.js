@@ -25,6 +25,11 @@ export default defineConfig(({ command, mode }) => {
         envDir,
         define: {
             'import.meta.env.TIME_ZONE': JSON.stringify(env.TIME_ZONE || 'America/New_York'),
+            'import.meta.env.CHART_MAX_VISIBLE_DAYS': JSON.stringify(env.CHART_MAX_VISIBLE_DAYS || '20'),
+            'import.meta.env.CHART_LOAD_DAYS_1M': JSON.stringify(env.CHART_LOAD_DAYS_1M || '1'),
+            'import.meta.env.CHART_LOAD_DAYS_5M': JSON.stringify(env.CHART_LOAD_DAYS_5M || '4'),
+            'import.meta.env.CHART_LOAD_DAYS_1H': JSON.stringify(env.CHART_LOAD_DAYS_1H || '7'),
+            'import.meta.env.CHART_LOAD_DAYS_4H': JSON.stringify(env.CHART_LOAD_DAYS_4H || '14'),
         },
 
         plugins: [cleanIndexAssets(), react()],

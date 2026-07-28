@@ -1,21 +1,23 @@
-import React from "react";
-
 import "../../../styles/ui/orderBubble.scss";
 
 import { ORDER_FRACTIONS } from "../../../utils/homeConstants";
 
 const OrderBubble = ({
 	amountUnitLabel,
+	isBalanceRefreshing,
 	isClosing,
+	isMoveDragging = false,
 	isOrderTypeMenuOpen,
 	messageIsSuccess,
 	onAmountBlur,
 	onAmountChange,
 	onAmountKeyDown,
+	onBalanceRefresh,
 	onCancel,
 	onFractionChange,
 	onFractionCommit,
 	onFractionPreset,
+	onMoveDragStart,
 	onOrderTypeMenuToggle,
 	onPriceFieldChange,
 	onPriceFieldFocus,
@@ -52,10 +54,21 @@ const OrderBubble = ({
 
 	return (
 		<div
-			className={`e__order-ticket ${isClosing ? "is-closing" : "is-open"}`}
+			className={`e__order-ticket-shell ${isClosing ? "is-closing" : "is-open"}`}
 			ref={orderTicketRef}
 			style={orderTicketStyle}
 		>
+			<div
+				className={`e__order-ticket-move-handle ${isMoveDragging ? "is-dragging" : ""}`}
+				onPointerDown={onMoveDragStart}
+				role="group"
+				aria-label="Move order form"
+				title="Drag to move form"
+			>
+				<span className="e__order-ticket-move-handle__arrow" aria-hidden="true">▲</span>
+				<span className="e__order-ticket-move-handle__arrow" aria-hidden="true">▼</span>
+			</div>
+			<div className="e__order-ticket">
 			<div className="e__order-ticket__side">
 				<button
 					className={ticketSide === "BUY" ? "e__order-ticket__buy is-active" : "e__order-ticket__buy"}
@@ -129,7 +142,25 @@ const OrderBubble = ({
 			</div>
 
 			<div className="e__order-ticket__balance">
-				<span>Available</span>
+				<span className="e__order-ticket__balance-label">
+					Available
+					<button
+						className="e__profile-refresh e__order-ticket__balance-refresh"
+						type="button"
+						onPointerDown={event => event.stopPropagation()}
+						onClick={(event) => {
+							event.stopPropagation();
+							onBalanceRefresh();
+						}}
+						disabled={isBalanceRefreshing}
+						aria-label="Refresh available balance"
+						title="Refresh available balance"
+					>
+						<span className={isBalanceRefreshing ? "e__profile-refresh-icon is-spinning" : "e__profile-refresh-icon"}>
+							↻
+						</span>
+					</button>
+				</span>
 				<strong>{ticketAvailableLabel}</strong>
 			</div>
 
@@ -204,7 +235,7 @@ const OrderBubble = ({
 			)}
 
 			<label>
-				<span>Amount</span>
+				<span>{isSell && orderTicket.amountMode === "USD" ? "Total" : "Amount"}</span>
 				<div className="e__order-ticket__input-wrap">
 					<input
 						value={Number(orderTicket.amount) === 0 ? "" : orderTicket.amount}
@@ -306,6 +337,7 @@ const OrderBubble = ({
 				<button type="button" onClick={onCancel}>
 					Cancel
 				</button>
+			</div>
 			</div>
 		</div>
 	);

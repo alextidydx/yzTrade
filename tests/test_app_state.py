@@ -25,6 +25,7 @@ class AppStateTests(unittest.TestCase):
 
         self.assertEqual(state["version"], 1)
         self.assertEqual(state["yzTrade"]["bookmarks"], {})
+        self.assertTrue(state["yzTrade"]["settings"]["balanceHistoryColored"])
 
     def test_set_bookmark_persists_currency_price(self):
         self.with_state_file()
@@ -61,6 +62,14 @@ class AppStateTests(unittest.TestCase):
         state = app.read_app_state()
 
         self.assertEqual(state["yzTrade"]["settings"]["balanceHistoryPeriod"], "week")
+
+    def test_balance_history_color_setting_persists(self):
+        self.with_state_file()
+
+        app.set_app_state_settings({"balanceHistoryColored": False})
+        state = app.read_app_state()
+
+        self.assertFalse(state["yzTrade"]["settings"]["balanceHistoryColored"])
 
 
 if __name__ == "__main__":

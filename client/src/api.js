@@ -54,7 +54,10 @@ export const getMonitorConfig = () => get("/api/monitor-config", { _: Date.now()
 
 export const getMonitorTickers = () => get("/api/monitor-tickers", { _: Date.now() });
 
-export const getBalances = () => get("/api/balances", { _: Date.now() });
+export const getBalances = (generation = 0) => get("/api/balances", {
+	generation,
+	_: Date.now(),
+});
 
 export const getBalanceHistory = (params) => get("/api/balance-history", params);
 

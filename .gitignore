@@ -11,3 +11,5 @@ client/dist/
 client/.vite/
 
 .DS_Store
+
+context/

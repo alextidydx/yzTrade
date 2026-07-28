@@ -1,5 +1,3 @@
-import React from "react";
-
 import "../../../styles/ui/dropdownShared.scss";
 import "../../../styles/ui/coinsDropdown.scss";
 
@@ -11,22 +9,22 @@ import {
 const CoinsDropdown = ({
 	baseCurrency,
 	isClosing,
+	isFiltering,
 	isHovered,
-	isLoading,
 	isOpen,
+	monitorQuery,
 	monitorError,
-	onBaseCurrencyChange,
+	onBlur,
 	onHoverChange,
 	onOpen,
+	onQueryChange,
 	onTickerClick,
 	onToggle,
 	tickers,
 }) => {
-	const filter = String(baseCurrency || "").trim().toUpperCase();
-	const hasExactTickerMatch = tickers.some(ticker => (
-		String(ticker.currency || "").toUpperCase() === filter
-	));
-	const filteredTickers = filter && !hasExactTickerMatch
+	const filter = String(monitorQuery || "").trim().toUpperCase();
+	const inputValue = isFiltering ? monitorQuery : baseCurrency;
+	const filteredTickers = filter && isFiltering
 		? tickers.filter(ticker => String(ticker.currency || "").toUpperCase().includes(filter))
 		: tickers;
 
@@ -37,16 +35,15 @@ const CoinsDropdown = ({
 			onPointerLeave={() => onHoverChange(false)}
 		>
 			<input
-				value={baseCurrency}
-				onChange={event => onBaseCurrencyChange(event.target.value.toUpperCase())}
+				value={inputValue}
+				onChange={event => onQueryChange(event.target.value.toUpperCase())}
+				onBlur={onBlur}
 				onFocus={onOpen}
-				disabled={isLoading}
 				aria-label="Base currency"
 			/>
 			<button
 				className={`e__currency-picker__button ${isOpen ? "e__currency-picker__button--open" : ""}`}
 				type="button"
-				disabled={isLoading}
 				onClick={onToggle}
 				aria-label="Open monitor tickers"
 				title={monitorError || "Monitor tickers refresh every 1 minute"}
@@ -68,6 +65,11 @@ const CoinsDropdown = ({
 								key={ticker.currency}
 								className="e__currency-picker__option"
 								href={`/${ticker.currency}`}
+								onPointerDown={event => {
+									// Keep input focus so blur does not clear the filter
+									// before selection (same pattern as Apply).
+									if (event.button === 0) event.preventDefault();
+								}}
 								onClick={event => onTickerClick(event, ticker.currency)}
 							>
 								<span>{ticker.currency}</span>
@@ -80,6 +82,11 @@ const CoinsDropdown = ({
 							</a>
 						);
 					})}
+					{isFiltering && filter && filteredTickers.length === 0 && (
+						<div className="e__currency-picker__empty">
+							No coins found
+						</div>
+					)}
 				</div>
 			)}
 		</div>
