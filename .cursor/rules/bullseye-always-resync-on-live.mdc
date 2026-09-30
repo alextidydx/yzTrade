@@ -1,0 +1,11 @@
+---
+description: Bullseye must keep syncing on every live OHLC update — never propose removing that
+alwaysApply: true
+---
+
+# Bullseye: always resync on live OHLC
+
+- **NEVER** propose, suggest, or implement removing / skipping / throttling `syncBullseyeViewIfActive` (or `frameChartTo24hFocus`) on live OHLC / trade / ticker ticks.
+- Bullseye must stay centered **always** while active — including every live candle update, not only enter / roll / setData / resize.
+- If live updates feel heavy, fix the **cost** of framing/overlay work. Do **not** fix hitch by dropping Bullseye live resync.
+- Do not re-propose “only reframe on enter/roll/setData/resize” as a Bullseye performance idea. That proposal is banned.

@@ -22,6 +22,7 @@ const OrderBubble = ({
 	onPriceFieldChange,
 	onPriceFieldFocus,
 	onSellStopOrderTypeChange,
+	onSellStopOrderTypeSelect,
 	onSideChange,
 	onSubmit,
 	onTypeChange,
@@ -42,15 +43,22 @@ const OrderBubble = ({
 	ticketMarketPriceLabel,
 	ticketOrderType,
 	ticketPrimaryOrderType,
+	ticketStopOrderType,
 	ticketSide,
 	visibleError,
 }) => {
 	if (!orderTicket) return null;
 
 	const isSell = ticketSide === "SELL";
-	const showLimitPrice = ticketOrderType !== "MARKET" && ticketOrderType !== "BRACKET";
+	const isTrailing = ticketOrderType === "TRAILING_MARKET" || ticketOrderType === "TRAILING_LIMIT";
+	const showLimitPrice = (
+		ticketOrderType !== "MARKET"
+		&& ticketOrderType !== "BRACKET"
+		&& !isTrailing
+	);
 	const showStopPrice = ticketOrderType === "STOP_LIMIT";
 	const showBracketPrices = ticketOrderType === "BRACKET";
+	const showTrailPercent = isTrailing;
 
 	return (
 		<div
@@ -103,29 +111,61 @@ const OrderBubble = ({
 				</button>
 				{isSell ? (
 					<div className="e__order-ticket__type-menu-wrap">
-						<button
-							className={ticketPrimaryOrderType === "STOP" ? "is-active e__order-ticket__type-select" : "e__order-ticket__type-select"}
-							type="button"
-							onClick={onOrderTypeMenuToggle}
+						<div
+							className={ticketPrimaryOrderType === "STOP" ? "e__order-ticket__type-select is-active" : "e__order-ticket__type-select"}
 						>
-							{ticketOrderType === "BRACKET" ? "Bracket" : "Stop limit"}
-							<span className="e__order-ticket__type-caret" aria-hidden="true" />
-						</button>
+							<button
+								className="e__order-ticket__type-label"
+								type="button"
+								onClick={onSellStopOrderTypeSelect}
+							>
+								{ticketStopOrderType === "TRAILING_LIMIT"
+									? "Trailing limit"
+									: ticketStopOrderType === "TRAILING_MARKET"
+										? "Trailing market"
+									: ticketStopOrderType === "STOP_LIMIT"
+										? "Stop limit"
+										: "Bracket"}
+							</button>
+							<button
+								className="e__order-ticket__type-caret-btn"
+								type="button"
+								aria-label="Open stop order type menu"
+								aria-expanded={Boolean(isOrderTypeMenuOpen)}
+								onClick={onOrderTypeMenuToggle}
+							>
+								<span className="e__order-ticket__type-caret" aria-hidden="true" />
+							</button>
+						</div>
 						{isOrderTypeMenuOpen && (
 							<div className="e__order-ticket__type-menu">
 								<button
 									type="button"
-									className={ticketOrderType === "STOP_LIMIT" ? "is-active" : ""}
-									onClick={() => onSellStopOrderTypeChange("STOP_LIMIT")}
-								>
-									Stop limit
-								</button>
-								<button
-									type="button"
-									className={ticketOrderType === "BRACKET" ? "is-active" : ""}
+									className={ticketStopOrderType === "BRACKET" ? "is-active" : ""}
 									onClick={() => onSellStopOrderTypeChange("BRACKET")}
 								>
 									Bracket
+								</button>
+								<button
+									type="button"
+									className={ticketStopOrderType === "TRAILING_LIMIT" ? "is-active" : ""}
+									onClick={() => onSellStopOrderTypeChange("TRAILING_LIMIT")}
+								>
+									Trailing limit
+								</button>
+								<button
+									type="button"
+									className={ticketStopOrderType === "TRAILING_MARKET" ? "is-active" : ""}
+									onClick={() => onSellStopOrderTypeChange("TRAILING_MARKET")}
+								>
+									Trailing market
+								</button>
+								<button
+									type="button"
+									className={ticketStopOrderType === "STOP_LIMIT" ? "is-active" : ""}
+									onClick={() => onSellStopOrderTypeChange("STOP_LIMIT")}
+								>
+									Stop limit
 								</button>
 							</div>
 						)}
@@ -234,6 +274,22 @@ const OrderBubble = ({
 				</>
 			)}
 
+			{showTrailPercent && (
+				<label>
+					<span>Trail</span>
+					<div className="e__order-ticket__input-wrap">
+						<input
+							value={orderTicket.trailPercent}
+							inputMode="decimal"
+							pattern="[0-9]*[.,]?[0-9]*"
+							onChange={event => onPriceFieldChange("trailPercent", event.target.value)}
+							onFocus={() => onPriceFieldFocus("trailPercent")}
+						/>
+						<strong>%</strong>
+					</div>
+				</label>
+			)}
+
 			<label>
 				<span>{isSell && orderTicket.amountMode === "USD" ? "Total" : "Amount"}</span>
 				<div className="e__order-ticket__input-wrap">
@@ -329,7 +385,7 @@ const OrderBubble = ({
 				<button
 					className={isSell ? "e__order-ticket__submit e__order-ticket__submit--sell" : "e__order-ticket__submit e__order-ticket__submit--buy"}
 					type="button"
-					disabled={orderTicket.isSubmitting || orderTicket.isPreviewLoading}
+					disabled={orderTicket.isSubmitting}
 					onClick={onSubmit}
 				>
 					{submitLabel}

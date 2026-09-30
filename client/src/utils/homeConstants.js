@@ -8,7 +8,6 @@ const parsePositiveDays = (value, fallback) => {
 };
 
 export const DISTRIBUTION_BINS = 160;
-export const DEPTH_RANGE_PADDING = 1.2;
 export const DEPTH_CHART_PADDING_RATIO = 0.09;
 export const MIN_DEPTH_WIDTH_RATIO = 0.1;
 export const DEFAULT_PERIOD_DAYS = 5;
@@ -37,6 +36,7 @@ export const DROPDOWN_TRANSITION_MS = 160;
 export const ORDER_TICKET_FALLBACK_HEIGHT = 430;
 export const ORDER_TICKET_ANCHOR_OFFSET_Y = ORDER_TICKET_FALLBACK_HEIGHT / 2;
 export const ORDER_TICKET_RIGHT_OFFSET = 113;
+export const OPEN_ORDER_EDIT_ERROR_FLASH_MS = 3000;
 export const MARKET_PREVIEW_POLL_INTERVAL_MS = 3000;
 export const ORDER_FRACTIONS = [
 	{ label: "1/4", value: 0.25 },
@@ -46,16 +46,22 @@ export const ORDER_FRACTIONS = [
 ];
 export const PEAK_THRESHOLD = 0.35;
 export const INDICATOR_COOKIES = {
+	depth: "yztrade_indicator_depth",
 	td: "yztrade_indicator_td",
 	vwap: "yztrade_indicator_vwap",
 	histogram: "yztrade_indicator_histogram",
+	volh: "yztrade_indicator_volh",
+	prch: "yztrade_indicator_prch",
 	r6: "yztrade_indicator_r6",
 	macd: "yztrade_indicator_macd",
 	pvt: "yztrade_indicator_pvt",
 	lims24: "yztrade_indicator_lims24",
+	bag: "yztrade_indicator_bag",
 };
 export const PRICE_SCALE_COOKIES = {
 	logarithmic: "yztrade_price_scale_logarithmic",
 	inverted: "yztrade_price_scale_inverted",
 };
+export const HUD_COOKIE = "yztrade_hud_visible";
 export const BOOKMARKED_PRICE_COOKIE = "yztrade_bookmarked_price";
+export const TRAILING_PERCENT_COOKIE = "yztrade_trailing_percent";

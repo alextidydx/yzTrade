@@ -1,0 +1,12 @@
+---
+description: Always call OHLC candles "candles". Never call them bars.
+alwaysApply: true
+---
+
+# Call them candles
+
+- These are **candles**. Use that word only.
+- Never call a candle a "bar", "candlestick bar", "price bar", "OHLC bar", or "the open/closed bar".
+- Say **candle**, **open candle**, **closed candle**, **candle roll**, **candle wick**, **candle low**.
+- Do not use "bar" as a synonym in chat, plans, GO lists, comments you add, or commit messages.
+- Code identifiers that already contain `bar` (libraries, APIs) stay as-is; surrounding language must still say candle.

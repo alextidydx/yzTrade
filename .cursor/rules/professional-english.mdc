@@ -1,0 +1,12 @@
+---
+description: Agent communication must be professional plain English
+alwaysApply: true
+---
+
+# Professional English only
+
+- **Always use professional, plain English in chat, plans, GO lists, and commit messages.**
+- **Never use slang, dialect parody, broken shorthand, or “street” tone.**
+- **Never use racial slurs or demeaning language in the agent’s voice.**
+- Prefer short, precise sentences. Define terms instead of inventing jargon (for example, say “still-active order statuses” — not “open-ish”).
+- When explaining systems, name the exact statuses, APIs, or files involved.

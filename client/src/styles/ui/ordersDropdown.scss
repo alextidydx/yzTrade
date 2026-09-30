@@ -90,6 +90,57 @@
 	overflow: hidden;
 }
 
+.e__orders-menu__body {
+	flex: 1 1 auto;
+	min-height: 0;
+	overflow-y: auto;
+}
+
+.e__orders-menu__totals {
+	flex: 0 0 auto;
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 12px;
+	padding: 10px 14px;
+	border-top: 1px solid rgba(57, 65, 74, 0.72);
+	background: rgba(0, 1, 5, 0.98);
+}
+
+.e__orders-menu__totals-buy,
+.e__orders-menu__totals-sell {
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	font-size: 12px;
+	font-weight: 850;
+	letter-spacing: 0.02em;
+}
+
+.e__orders-menu__totals-buy {
+	color: #a66dff;
+}
+
+.e__orders-menu__totals-sell {
+	color: #20b28f;
+	text-align: right;
+}
+
+.e__orders-menu__totals-delta {
+	margin-left: 6px;
+	font-size: 11px;
+	font-weight: 750;
+}
+
+.e__orders-menu__totals-delta--up {
+	color: #20b28f;
+}
+
+.e__orders-menu__totals-delta--down {
+	color: #ee5858;
+}
+
 .e__orders-menu__head,
 .e__orders-group__currency {
 	display: flex;
@@ -166,6 +217,7 @@
 }
 
 .e__orders-row__badge {
+	position: relative;
 	height: 20px;
 	display: inline-flex;
 	align-items: center;
@@ -184,6 +236,25 @@
 .e__orders-row .e__orders-row__badge--sell {
 	background: rgba(32, 178, 143, 0.2);
 	color: #20b28f;
+}
+
+.e__orders-row .e__orders-row__badge--error {
+	background: rgba(220, 60, 60, 0.22);
+	color: #e05555;
+}
+
+.e__orders-row__type {
+	position: absolute;
+	top: calc(100% + 2px);
+	left: 0;
+	right: 0;
+	color: #7e8b98;
+	font-size: 8px;
+	font-weight: 850;
+	line-height: 1;
+	letter-spacing: 0.04em;
+	text-align: center;
+	white-space: nowrap;
 }
 
 .e__orders-row__price {

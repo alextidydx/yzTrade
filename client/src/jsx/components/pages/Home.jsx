@@ -17,6 +17,7 @@ import {
 	HistogramSeries,
 	LineSeries,
 	LineType,
+	MismatchDirection,
 	PriceScaleMode,
 } from 'lightweight-charts';
 
@@ -34,11 +35,13 @@ import {
 	ORDER_TICKET_ANCHOR_OFFSET_Y,
 	ORDER_TICKET_FALLBACK_HEIGHT,
 	ORDER_TICKET_RIGHT_OFFSET,
-	PEAK_THRESHOLD,
+	OPEN_ORDER_EDIT_ERROR_FLASH_MS,
 	PRICE_MIN_MOVE,
 	PRICE_SCALE_COOKIES,
+	HUD_COOKIE,
 	TD_REFRESH_RETRY_DELAYS,
 	TD_TIMEFRAME_SECONDS,
+	TRAILING_PERCENT_COOKIE,
 } from "../../../utils/homeConstants";
 
 import {
@@ -47,7 +50,8 @@ import {
 	formatBalanceAmount,
 	formatDisplayPriceWithIncrement,
 	formatMeasurementDuration,
-	formatOrderValue,
+	formatOrderDisplayTotal,
+	getBracketExitUsdValue,
 	formatOverlayPrice,
 	formatPrice,
 	formatPriceWithIncrement,
@@ -60,9 +64,9 @@ import {
 	getBookmarkedPrice,
 	getCandleGranularity,
 	getCandleGranularityLabel,
+	getCookie,
 	getCookieBoolean,
 	getPeriodDaysForGranularity,
-	buildOptimisticOrderFromPlacement,
 	enrichOrderForDisplay,
 	filterOrdersForChartProduct,
 	floorQuoteCurrencyAmount,
@@ -72,12 +76,19 @@ import {
 	getOrderPreviewBaseSize,
 	getOrderErrorLabel,
 	isOpenOrderStatus,
-	isRemovedLiveOrder,
+	isDisplayableOrderStatus,
+	isErrorOrderStatus,
+	getOrderIdentityKey,
+	findOrderEditIndex,
+	uniqueOrdersByOriginalId,
 	mergeOrderFields,
 	normalizeBalanceHistoryPeriod,
 	normalizeBookmarkPrice,
 	normalizeCandleGranularity,
+	getCurrencyFromProductId,
+	getOrderDisplayAmount,
 	getRoutePrefix,
+	getPrecisionFromIncrement,
 	getVwapSessionKey,
 	getWebSocketBase,
 	hasPriceIncrement,
@@ -85,6 +96,7 @@ import {
 	setBookmarkedPrice,
 	setCandleGranularityCookie,
 	setCookieBoolean,
+	setCookieValue,
 } from "../../../utils/homeUtils";
 import {
 	formatChartCrosshairTime,
@@ -100,20 +112,78 @@ const APP_STATE_STALE_TIMEOUT_MS = 15000;
 const LIVE_STALE_TIMEOUT_MS = 60000;
 const LIVE_CONNECT_TIMEOUT_MS = 15000;
 const PROFILE_REFRESH_INTERVAL_MS = 15000;
+const ALL_ORDERS_REFRESH_INTERVAL_MS = 15000;
+// REST polls after a confirmed move that may still return the pre-move price (Coinbase historical lag).
+const POLLS_AFTER_MOVE_MAX = 2;
+const AVG_ENTRY_REFRESH_INTERVAL_MS = 15000;
+const AVG_ENTRY_RETRY_BASE_MS = 1000;
+const AVG_ENTRY_RETRY_MAX_MS = 8000;
+const AVG_ENTRY_RETRY_MAX_ATTEMPTS = 5;
 const PARTIAL_FILL_BALANCE_DEBOUNCE_MS = 500;
+const OLDER_CANDLES_INTERACTION_IDLE_MS = 220;
+const OLDER_CANDLES_BATCH_SIZE = 300;
+const OLDER_CANDLES_RETRY_MS = 1500;
 const BULLSEYE_LOCK_NOTICE_DEBOUNCE_MS = 300;
-const BULLSEYE_LOCK_NOTICE_DURATION_MS = 3000;
+const CHART_NOTICE_DURATION_MS = 3000;
 const MACD_FAST_PERIOD = 12;
 const MACD_SLOW_PERIOD = 26;
 const MACD_SIGNAL_PERIOD = 9;
 const CHART_TIME_SCALE_HEIGHT = 34;
 const DEFAULT_PRICE_SCALE_MARGINS = { top: 0.08, bottom: 0.24 };
 const FRAME_24H_PRICE_SCALE_MARGINS = { top: 1 / 3, bottom: 1 / 3 };
-const BRACKET_DEFAULT_TAKE_PROFIT_FACTOR = 1.06;
-const BRACKET_DEFAULT_STOP_LOSS_FACTOR = 0.98;
-// Match LWC log formula. setVisibleRange writes log-space as-is; getVisibleRange converts.
+const BRACKET_DEFAULT_TAKE_PROFIT_FACTOR = 1.01;
+const BRACKET_DEFAULT_STOP_LOSS_FACTOR = 0.998;
+const TRAILING_DEFAULT_PERCENT = "5";
+// Leave a few cents so MAX $-buys still clear fee/size rounding after base_size place.
+const BUY_USD_MAX_HEADROOM = 0.05;
+const AVG_ENTRY_MIN_USD = 1;
+
+// Continuous price-scale zoom: factor = exp(deltaY * scale), clamped per frame.
+// ~100px (typical mouse notch) ≈ ×1.10; tiny Mac trackpad deltas stay smooth.
+const PRICE_SCALE_WHEEL_DELTA_SCALE = 0.001;
+const PRICE_SCALE_WHEEL_FACTOR_MIN = 0.9;
+const PRICE_SCALE_WHEEL_FACTOR_MAX = 1.1;
+
+const normalizePriceScaleWheelDeltaY = (event) => {
+	const deltaY = Number(event?.deltaY) || 0;
+
+	// 0 = pixel, 1 = line, 2 = page
+	if (event?.deltaMode === 1) return deltaY * 40;
+	if (event?.deltaMode === 2) return deltaY * 800;
+
+	return deltaY;
+};
+
+const priceScaleZoomFactorFromDelta = (normDeltaY) => {
+	if (!Number.isFinite(normDeltaY) || normDeltaY === 0) return null;
+
+	const raw = Math.exp(normDeltaY * PRICE_SCALE_WHEEL_DELTA_SCALE);
+
+	return Math.min(
+		PRICE_SCALE_WHEEL_FACTOR_MAX,
+		Math.max(PRICE_SCALE_WHEEL_FACTOR_MIN, raw),
+	);
+};
+// Match LWC logFormulaForPriceRange (seed freeze only — never recompute mid-zoom).
+
+const spanRatioSuspect = (beforeMin, beforeMax, afterMin, afterMax) => {
+	const beforeSpan = Number(beforeMax) - Number(beforeMin);
+	const afterSpan = Number(afterMax) - Number(afterMin);
+
+	if (!(beforeSpan > 0) || !(afterSpan > 0)) return false;
+
+	const ratio = afterSpan / beforeSpan;
+
+	return ratio >= 8 || ratio <= (1 / 8);
+};
+
 const LWC_LOG_LOGICAL_OFFSET = 4;
 const LWC_LOG_COORD_OFFSET = 0.0001;
+
+const DEFAULT_LWC_LOG_FORMULA = {
+	logicalOffset: LWC_LOG_LOGICAL_OFFSET,
+	coordOffset: LWC_LOG_COORD_OFFSET,
+};
 
 const getLightweightChartsLogFormula = (min, max) => {
 	const diff = Math.abs(Number(max) - Number(min));
@@ -128,10 +198,7 @@ const getLightweightChartsLogFormula = (min, max) => {
 		};
 	}
 
-	return {
-		logicalOffset: LWC_LOG_LOGICAL_OFFSET,
-		coordOffset: LWC_LOG_COORD_OFFSET,
-	};
+	return { ...DEFAULT_LWC_LOG_FORMULA };
 };
 
 const toLightweightChartsLogPrice = (price, formula) => {
@@ -148,6 +215,43 @@ const toLightweightChartsLogPrice = (price, formula) => {
 	return value < 0 ? -logged : logged;
 };
 
+const fromLightweightChartsLogPrice = (logical, formula) => {
+	const value = Number(logical);
+
+	if (!Number.isFinite(value)) return null;
+
+	const magnitude = Math.abs(value);
+
+	if (magnitude < 1e-15) return 0;
+
+	const price = (10 ** (magnitude - formula.logicalOffset)) - formula.coordOffset;
+
+	return value < 0 ? -price : price;
+};
+
+const setPriceScaleLinearVisibleRange = (priceScale, min, max, isLog, formula) => {
+	if (!priceScale || !(max > min)) return false;
+
+	// Do not touch scaleMargins here — zeroing them remaps Y and moves the
+	// price under the cursor on the first wheel tick.
+	priceScale.applyOptions({ autoScale: false });
+
+	if (!isLog) {
+		priceScale.setVisibleRange({ from: min, to: max });
+		return true;
+	}
+
+	if (!(min > 0) || !(max > 0) || !formula) return false;
+
+	const from = toLightweightChartsLogPrice(min, formula);
+	const to = toLightweightChartsLogPrice(max, formula);
+
+	if (!Number.isFinite(from) || !Number.isFinite(to) || !(to > from)) return false;
+
+	priceScale.setVisibleRange({ from, to });
+	return true;
+};
+
 class Home extends React.Component {
 	container = React.createRef();
 	chartRef = React.createRef();
@@ -162,7 +266,6 @@ class Home extends React.Component {
 		historicalCandles: [],
 		currentCandle: null,
 		depth: null,
-		orders: [],
 		allOrders: [],
 		orderStats: null,
 		orderError: "",
@@ -190,6 +293,7 @@ class Home extends React.Component {
 		monitorError: "",
 		defaultBaseCurrency: "",
 		appBookmarks: null,
+		appAvgEntries: null,
 		appSettings: {
 			balanceHistoryColored: true,
 			balanceHistoryExpanded: false,
@@ -207,9 +311,18 @@ class Home extends React.Component {
 		hasMoreOlderCandles: true,
 		isLogPriceScale: getCookieBoolean(PRICE_SCALE_COOKIES.logarithmic, false),
 		isInvertedPriceScale: getCookieBoolean(PRICE_SCALE_COOKIES.inverted, false),
+		showHud: getCookieBoolean(HUD_COOKIE, true),
+		showDepthIndicator: getCookieBoolean(INDICATOR_COOKIES.depth, true),
 		showTdIndicator: getCookieBoolean(INDICATOR_COOKIES.td, true),
 		showVwapIndicator: getCookieBoolean(INDICATOR_COOKIES.vwap, true),
-		showHistogramIndicator: getCookieBoolean(INDICATOR_COOKIES.histogram, true),
+		showVolhIndicator: getCookieBoolean(
+			INDICATOR_COOKIES.volh,
+			getCookieBoolean(INDICATOR_COOKIES.histogram, true),
+		),
+		showPrchIndicator: getCookieBoolean(
+			INDICATOR_COOKIES.prch,
+			getCookieBoolean(INDICATOR_COOKIES.histogram, true),
+		),
 		showMacdIndicator: getCookieBoolean(
 			INDICATOR_COOKIES.macd,
 			getCookieBoolean(INDICATOR_COOKIES.r6, false),
@@ -222,6 +335,7 @@ class Home extends React.Component {
 			),
 		),
 		showLims24Indicator: getCookieBoolean(INDICATOR_COOKIES.lims24, false),
+		showBagValueIndicator: getCookieBoolean(INDICATOR_COOKIES.bag, false),
 		baseCurrency: getBaseCurrencyFromPath(window.location.pathname),
 		monitorQuery: "",
 		periodDays: getPeriodDaysForGranularity(getCandleGranularity()),
@@ -231,8 +345,7 @@ class Home extends React.Component {
 		isCandleGranularityMenuOpen: false,
 		isCandleGranularityMenuClosing: false,
 		isBullseyeViewActive: false,
-		showBullseyeLockNotice: false,
-		isBullseyeLockNoticeClosing: false,
+		chartNotice: null,
 		product: null,
 		productStats: null,
 		chartSize: {
@@ -247,16 +360,20 @@ class Home extends React.Component {
 		measurementDrag: null,
 		orderScaleHover: null,
 		bookmarkedPrice: getBookmarkedPrice(getBaseCurrencyFromPath(window.location.pathname)),
+		avgEntryPrice: null,
 		orderTicket: null,
 		isOrderTicketClosing: false,
 		isOrderTicketPriceDragging: false,
 		isOrderTicketMoveDragging: false,
+		openOrderDrag: null,
+		openOrderEditErrorFlashKey: "",
 		lastOrderSide: "BUY",
 		savedOrderTickets: {
 			BUY: null,
 			SELL: null,
 		},
 		overlayTick: 0,
+		priceOverlayTick: 0,
 	};
 
 	chart = null;
@@ -264,16 +381,35 @@ class Home extends React.Component {
 	volumeSeries = null;
 	tdSequentialSeries = null;
 	vwapSeries = [];
+	chartOrderDisplayByKey = new Map();
+	orderLineDisplayPlace = "renderOverlay";
 	cachedMacdPoints = [];
 	cachedPvtPoints = [];
+	cachedDistribution = null;
+	cachedDistributionKey = null;
+	liveVwapContext = null;
 	overlayFrame = null;
+	priceOverlayFrame = null;
+	pointerMoveFrame = null;
+	pendingPointerMove = null;
 	priceScaleWheelFrame = null;
+	priceScaleMinMoveSyncFrame = null;
 	priceScaleWheelState = null;
+	lastPriceViewportRange = null;
+	lastPriceScaleMinMove = null;
 	priceScaleWheelOverlayTimer = null;
+	priceAxisPanPointer = null;
+	chartPanPointer = null;
+	cachedMacdOverlayModel = null;
+	cachedMacdOverlayKey = null;
 	visibleRangeHandler = null;
+	// !IMPORTANT DO NOT TOUCH. DO NOT OPTIMIZE UNLESS REQUESTED BY USER.
+	// Cold-start log: chart stays Normal until range event, then enter Log.
+	pendingLogPriceScaleResync = false;
 	isCrosshairTimeLabelVisible = false;
 	liveSocket = null;
 	liveProductId = null;
+	liveTradesAfterAtMs = null;
 	liveReconnectTimer = null;
 	liveReconnectAttempt = 0;
 	liveReconnectConfig = null;
@@ -296,11 +432,20 @@ class Home extends React.Component {
 	balanceHistoryRequestId = 0;
 	monitorRefreshTimer = null;
 	productStatsRefreshTimer = null;
+	olderCandlesLoadTimer = null;
+	olderCandlesApplyTimer = null;
+	olderCandlesLoadInFlight = false;
+	pendingOlderCandlesTargetFrom = null;
+	lastVisibleRangeChangeAt = 0;
+	isApplyingOlderCandles = false;
 	tdRefreshTimers = [];
 	lastTdRefreshBoundary = null;
 	tdRefreshInFlight = false;
 	marketRequestId = 0;
-	candleRollRequestId = 0;
+	officialCandlePollTimer = null;
+	officialCandlePollRequestId = 0;
+	officialCandlePollInFlight = false;
+	lastOfficialCandleSyncAt = 0;
 	isMarketTransitioning = false;
 	isDisconnectingLive = false;
 	suppressMeasurementClick = false;
@@ -310,29 +455,48 @@ class Home extends React.Component {
 	partialFillBalanceRefreshTimer = null;
 	processedOrderEventIds = new Set();
 	processedOrderEventIdQueue = [];
-	bullseyeLockNoticeDebounceTimer = null;
-	bullseyeLockNoticeHideTimer = null;
-	bullseyeLockNoticeCloseTimer = null;
+	chartNoticeDebounceTimer = null;
+	chartNoticeHideTimer = null;
+	chartNoticeCloseTimer = null;
 	isApplyingBullseyeFrame = false;
+	bullseyeFrameRaf = null;
 	bullseyePanPointerActive = false;
 	bullseyePriceRange = null;
 	manualPriceRange = null;
-	// Frozen while autoScale is off — must match LWC's frozen log formula.
-	lockedLogFormula = null;
+	// Frozen only while wheel-zooming in LOG — matches LWC; cleared on AUTO.
+	priceScaleLogZoomFormula = null;
 	candleGranularityMenuCloseTimer = null;
 	dropdownCloseTimers = {};
 	orderTicketCloseTimer = null;
 	orderPreviewTimer = null;
+	orderPreviewWaitTimer = null;
 	orderPreviewRequestId = 0;
 	marketPreviewPollTimer = null;
 	lastMarketPreviewAt = 0;
 	marketPreviewRequestPrice = null;
 	overlayTextMeasureContext = null;
 	overlayTextWidthCache = new Map();
+	plottedCandles = [];
+	lastLiveCandleBucketTime = null;
+	marketSubscribeCount = 0;
+	candleBackfillRequestId = 0;
 	isOrderTicketPriceDragging = false;
 	orderTicketPriceDragField = null;
+	orderTicketPriceDragStartPrice = null;
+	orderTicketPriceDragGrabOffsetY = 0;
 	isOrderTicketMoveDragging = false;
 	orderTicketMoveDrag = null;
+	isOpenOrderPriceDragging = false;
+	openOrderPriceDragGrabOffsetY = 0;
+	openOrderDragPointerId = null;
+	openOrderDragCaptureEl = null;
+	openOrderEditErrorFlashTimer = null;
+	allOrdersRequest = null;
+	lastOrdersSocketMergeAt = 0;
+	avgEntryRequestId = 0;
+	avgEntryRefreshTimer = null;
+	avgEntryRetryTimer = null;
+	avgEntryRetryAttempt = 0;
 
 	componentDidMount() {
 		window.addEventListener('resize', this.handleResize);
@@ -350,8 +514,12 @@ class Home extends React.Component {
 		this.bootstrapFromConfig();
 		this.loadBalanceHistory();
 		this.profileRefreshTimer = window.setInterval(this.loadProfile, PROFILE_REFRESH_INTERVAL_MS);
-		this.allOrdersRefreshTimer = window.setInterval(this.loadAllOrders, 5000);
-		this.balanceHistoryRefreshTimer = window.setInterval(this.loadBalanceHistory, 60000);
+		this.restartAllOrdersRefreshTimer();
+		this.avgEntryRefreshTimer = window.setInterval(
+			() => this.loadAvgEntry(),
+			AVG_ENTRY_REFRESH_INTERVAL_MS,
+		);
+		this.balanceHistoryRefreshTimer = window.setInterval(this.loadBalanceHistory, 30000);
 		this.monitorRefreshTimer = window.setInterval(this.loadMonitorTickers, 60000);
 		this.productStatsRefreshTimer = window.setInterval(this.loadProductStats, 30000);
 	}
@@ -409,12 +577,15 @@ class Home extends React.Component {
 		}
 
 		if (
-			prevState.showTdIndicator !== this.state.showTdIndicator
+			prevState.showDepthIndicator !== this.state.showDepthIndicator
+			|| prevState.showTdIndicator !== this.state.showTdIndicator
 			|| prevState.showVwapIndicator !== this.state.showVwapIndicator
-			|| prevState.showHistogramIndicator !== this.state.showHistogramIndicator
+			|| prevState.showVolhIndicator !== this.state.showVolhIndicator
+			|| prevState.showPrchIndicator !== this.state.showPrchIndicator
 			|| prevState.showMacdIndicator !== this.state.showMacdIndicator
 			|| prevState.showPvtIndicator !== this.state.showPvtIndicator
 			|| prevState.showLims24Indicator !== this.state.showLims24Indicator
+			|| prevState.showBagValueIndicator !== this.state.showBagValueIndicator
 		) {
 			this.applyIndicatorVisibility();
 		}
@@ -431,6 +602,14 @@ class Home extends React.Component {
 
 			if (nextTicket && prevState.profile !== this.state.profile && !this.state.isOrderTicketClosing) {
 				this.syncOrderTicketOnBalanceChange(prevState);
+			}
+
+			if (
+				prevState.profile !== this.state.profile
+				|| prevState.candles !== this.state.candles
+				|| prevState.appAvgEntries !== this.state.appAvgEntries
+			) {
+				this.syncAvgEntryPriceForDisplay();
 			}
 
 			return;
@@ -497,8 +676,20 @@ class Home extends React.Component {
 			cancelAnimationFrame(this.overlayFrame);
 		}
 
+		if (this.priceOverlayFrame) {
+			cancelAnimationFrame(this.priceOverlayFrame);
+		}
+
+		if (this.pointerMoveFrame) {
+			cancelAnimationFrame(this.pointerMoveFrame);
+		}
+
 		if (this.priceScaleWheelFrame) {
 			cancelAnimationFrame(this.priceScaleWheelFrame);
+		}
+
+		if (this.priceScaleMinMoveSyncFrame) {
+			cancelAnimationFrame(this.priceScaleMinMoveSyncFrame);
 		}
 
 		if (this.priceScaleWheelOverlayTimer) {
@@ -513,6 +704,18 @@ class Home extends React.Component {
 			window.clearInterval(this.allOrdersRefreshTimer);
 		}
 
+		if (this.avgEntryRefreshTimer) {
+			window.clearInterval(this.avgEntryRefreshTimer);
+			this.avgEntryRefreshTimer = null;
+		}
+
+		this.clearAvgEntryRetry();
+
+		if (this.openOrderEditErrorFlashTimer) {
+			window.clearTimeout(this.openOrderEditErrorFlashTimer);
+			this.openOrderEditErrorFlashTimer = null;
+		}
+
 		if (this.balanceHistoryRefreshTimer) {
 			window.clearInterval(this.balanceHistoryRefreshTimer);
 		}
@@ -521,11 +724,20 @@ class Home extends React.Component {
 			window.clearInterval(this.monitorRefreshTimer);
 		}
 
+		if (this.olderCandlesLoadTimer) {
+			window.clearTimeout(this.olderCandlesLoadTimer);
+		}
+
+		if (this.olderCandlesApplyTimer) {
+			window.clearTimeout(this.olderCandlesApplyTimer);
+		}
+
 		if (this.productStatsRefreshTimer) {
 			window.clearInterval(this.productStatsRefreshTimer);
 		}
 
 		this.clearLiveFlushTimer();
+		this.stopOfficialCandlePoll();
 
 		if (this.candleGranularityMenuCloseTimer) {
 			window.clearTimeout(this.candleGranularityMenuCloseTimer);
@@ -536,25 +748,26 @@ class Home extends React.Component {
 			window.clearTimeout(this.orderTicketCloseTimer);
 		}
 
-		if (this.bullseyeLockNoticeDebounceTimer) {
-			window.clearTimeout(this.bullseyeLockNoticeDebounceTimer);
-			this.bullseyeLockNoticeDebounceTimer = null;
+		if (this.chartNoticeDebounceTimer) {
+			window.clearTimeout(this.chartNoticeDebounceTimer);
+			this.chartNoticeDebounceTimer = null;
 		}
 
-		if (this.bullseyeLockNoticeHideTimer) {
-			window.clearTimeout(this.bullseyeLockNoticeHideTimer);
-			this.bullseyeLockNoticeHideTimer = null;
+		if (this.chartNoticeHideTimer) {
+			window.clearTimeout(this.chartNoticeHideTimer);
+			this.chartNoticeHideTimer = null;
 		}
 
-		if (this.bullseyeLockNoticeCloseTimer) {
-			window.clearTimeout(this.bullseyeLockNoticeCloseTimer);
-			this.bullseyeLockNoticeCloseTimer = null;
+		if (this.chartNoticeCloseTimer) {
+			window.clearTimeout(this.chartNoticeCloseTimer);
+			this.chartNoticeCloseTimer = null;
 		}
 
 		if (this.orderPreviewTimer) {
 			window.clearTimeout(this.orderPreviewTimer);
 		}
 
+		this.stopOrderPreviewWaitTicker();
 		this.stopMarketPreviewPoller();
 
 		this.clearTdRefreshTimers();
@@ -569,8 +782,22 @@ class Home extends React.Component {
 
 		this.overlayFrame = requestAnimationFrame(() => {
 			this.overlayFrame = null;
+			// Full overlay refresh (time/data changes) — invalidates MACD/PVT cache.
+			this.cachedMacdOverlayKey = null;
 			this.setState(prev => ({
 				overlayTick: prev.overlayTick + 1,
+			}));
+		});
+	};
+
+	// Price-axis Y changes only: refresh priceToY overlays, leave MACD/PVT cached.
+	schedulePriceOverlayUpdate = () => {
+		if (this.priceOverlayFrame) return;
+
+		this.priceOverlayFrame = requestAnimationFrame(() => {
+			this.priceOverlayFrame = null;
+			this.setState(prev => ({
+				priceOverlayTick: prev.priceOverlayTick + 1,
 			}));
 		});
 	};
@@ -745,24 +972,51 @@ class Home extends React.Component {
 	};
 
 	handleVisibleLogicalRangeChange = (range) => {
+		// !IMPORTANT DO NOT TOUCH. DO NOT OPTIMIZE UNLESS REQUESTED BY USER.
+		this.applyPendingLogPriceScaleResync();
 		this.scheduleOverlayUpdate();
+		this.lastVisibleRangeChangeAt = performance.now();
+
+		if (range && Number.isFinite(range.from) && range.from > 24) {
+			this.pendingOlderCandlesTargetFrom = null;
+			if (this.olderCandlesLoadTimer) {
+				window.clearTimeout(this.olderCandlesLoadTimer);
+				this.olderCandlesLoadTimer = null;
+			}
+		}
 
 		if (this.state.isBullseyeViewActive) {
-			// Re-snap if the range drifted. Do not show the lock notice here —
-			// candle rolls / live updates also change the range while framing.
-			if (!this.isApplyingBullseyeFrame) {
+			if (
+				!this.isApplyingBullseyeFrame
+				&& range
+				&& Number.isFinite(range.from)
+			) {
 				this.frameChartTo24hFocus();
 			}
 
-			if (!range || !Number.isFinite(range.from) || range.from > 24) return;
+			if (
+				this.isApplyingOlderCandles
+				|| !range
+				|| !Number.isFinite(range.from)
+				|| range.from > 24
+			) {
+				return;
+			}
 
-			this.loadOlderCandles();
+			this.scheduleOlderCandlesLoad(range.from);
 			return;
 		}
 
-		if (!range || !Number.isFinite(range.from) || range.from > 24) return;
+		if (
+			this.isApplyingOlderCandles
+			|| !range
+			|| !Number.isFinite(range.from)
+			|| range.from > 24
+		) {
+			return;
+		}
 
-		this.loadOlderCandles();
+		this.scheduleOlderCandlesLoad(range.from);
 	};
 
 	getChartInteractionOptions = (locked = this.state.isBullseyeViewActive) => ({
@@ -787,57 +1041,93 @@ class Home extends React.Component {
 	});
 
 	applyChartInteractionLock = (locked = this.state.isBullseyeViewActive) => {
-		this.chart?.applyOptions(this.getChartInteractionOptions(locked));
+		this.chart?.applyOptions({
+			...this.getChartInteractionOptions(locked),
+			timeScale: {
+				shiftVisibleRangeOnNewBar: !locked,
+			},
+		});
+	};
+
+	showChartNotice = (message, options = {}) => {
+		const text = String(message || "").trim();
+		if (!text) return;
+
+		const tone = options.tone || "info";
+		const debounceMs = Number.isFinite(Number(options.debounceMs))
+			? Math.max(0, Number(options.debounceMs))
+			: 0;
+		const durationMs = Number.isFinite(Number(options.durationMs))
+			? Math.max(0, Number(options.durationMs))
+			: CHART_NOTICE_DURATION_MS;
+
+		if (this.chartNoticeDebounceTimer) {
+			window.clearTimeout(this.chartNoticeDebounceTimer);
+			this.chartNoticeDebounceTimer = null;
+		}
+
+		const reveal = () => {
+			this.chartNoticeDebounceTimer = null;
+
+			if (this.chartNoticeCloseTimer) {
+				window.clearTimeout(this.chartNoticeCloseTimer);
+				this.chartNoticeCloseTimer = null;
+			}
+
+			this.setState({
+				chartNotice: {
+					message: text,
+					tone,
+					closing: false,
+				},
+			});
+
+			if (this.chartNoticeHideTimer) {
+				window.clearTimeout(this.chartNoticeHideTimer);
+			}
+
+			this.chartNoticeHideTimer = window.setTimeout(() => {
+				this.chartNoticeHideTimer = null;
+				this.closeChartNotice();
+			}, durationMs);
+		};
+
+		if (debounceMs > 0) {
+			this.chartNoticeDebounceTimer = window.setTimeout(reveal, debounceMs);
+			return;
+		}
+
+		reveal();
 	};
 
 	notifyBullseyeInteractionLocked = () => {
 		if (!this.state.isBullseyeViewActive) return;
 
-		if (this.bullseyeLockNoticeDebounceTimer) {
-			window.clearTimeout(this.bullseyeLockNoticeDebounceTimer);
-		}
-
-		this.bullseyeLockNoticeDebounceTimer = window.setTimeout(() => {
-			this.bullseyeLockNoticeDebounceTimer = null;
-
-			if (this.bullseyeLockNoticeCloseTimer) {
-				window.clearTimeout(this.bullseyeLockNoticeCloseTimer);
-				this.bullseyeLockNoticeCloseTimer = null;
-			}
-
-			this.setState({
-				showBullseyeLockNotice: true,
-				isBullseyeLockNoticeClosing: false,
-			});
-
-			if (this.bullseyeLockNoticeHideTimer) {
-				window.clearTimeout(this.bullseyeLockNoticeHideTimer);
-			}
-
-			this.bullseyeLockNoticeHideTimer = window.setTimeout(() => {
-				this.bullseyeLockNoticeHideTimer = null;
-				this.closeBullseyeLockNotice();
-			}, BULLSEYE_LOCK_NOTICE_DURATION_MS);
-		}, BULLSEYE_LOCK_NOTICE_DEBOUNCE_MS);
+		this.showChartNotice("Pan and zoom disabled in Bullseye view", {
+			debounceMs: BULLSEYE_LOCK_NOTICE_DEBOUNCE_MS,
+		});
 	};
 
-	closeBullseyeLockNotice = () => {
-		if (!this.state.showBullseyeLockNotice || this.state.isBullseyeLockNoticeClosing) {
+	closeChartNotice = () => {
+		const notice = this.state.chartNotice;
+		if (!notice || notice.closing) {
 			return;
 		}
 
-		this.setState({ isBullseyeLockNoticeClosing: true });
+		this.setState({
+			chartNotice: {
+				...notice,
+				closing: true,
+			},
+		});
 
-		if (this.bullseyeLockNoticeCloseTimer) {
-			window.clearTimeout(this.bullseyeLockNoticeCloseTimer);
+		if (this.chartNoticeCloseTimer) {
+			window.clearTimeout(this.chartNoticeCloseTimer);
 		}
 
-		this.bullseyeLockNoticeCloseTimer = window.setTimeout(() => {
-			this.bullseyeLockNoticeCloseTimer = null;
-			this.setState({
-				showBullseyeLockNotice: false,
-				isBullseyeLockNoticeClosing: false,
-			});
+		this.chartNoticeCloseTimer = window.setTimeout(() => {
+			this.chartNoticeCloseTimer = null;
+			this.setState({ chartNotice: null });
 		}, DROPDOWN_TRANSITION_MS);
 	};
 
@@ -883,7 +1173,6 @@ class Home extends React.Component {
 
 		this.chartInteractionEvents = [
 			"pointerdown",
-			"pointermove",
 			"pointerup",
 			"pointerleave",
 			"touchmove",
@@ -893,18 +1182,21 @@ class Home extends React.Component {
 			el.addEventListener(eventName, this.scheduleOverlayUpdate, { passive: true });
 		});
 
-		el.addEventListener("pointermove", this.handleFreeCrosshairMove, { passive: true });
-		el.addEventListener("mousemove", this.handleFreeCrosshairMove, { passive: true });
 		el.addEventListener("pointerleave", this.handleFreeCrosshairLeave, { passive: true });
 		el.addEventListener("mouseleave", this.handleFreeCrosshairLeave, { passive: true });
 		el.addEventListener("wheel", this.handlePriceScaleWheel, { passive: false, capture: true });
 		el.addEventListener("wheel", this.handleBullseyeLockWheel, { passive: false, capture: true });
+		el.addEventListener("pointerdown", this.handlePriceAxisPanPointerDown, { passive: true });
 		el.addEventListener("pointerdown", this.handleBullseyeLockPointerDown, { passive: true });
 		el.addEventListener("pointermove", this.handleBullseyeLockPointerMove, { passive: true });
+		el.addEventListener("pointerup", this.handlePriceAxisPanPointerUp, { passive: true });
+		el.addEventListener("pointercancel", this.handlePriceAxisPanPointerUp, { passive: true });
 		el.addEventListener("pointerup", this.handleBullseyeLockPointerUp, { passive: true });
 		el.addEventListener("pointercancel", this.handleBullseyeLockPointerUp, { passive: true });
 		el.addEventListener("pointerleave", this.handleBullseyeLockPointerUp, { passive: true });
 		el.addEventListener("click", this.handleMeasurementClick);
+		window.addEventListener("pointerup", this.handlePriceAxisPanPointerUp);
+		window.addEventListener("pointercancel", this.handlePriceAxisPanPointerUp);
 	};
 
 	removeChartInteractionListeners = () => {
@@ -915,54 +1207,89 @@ class Home extends React.Component {
 			el.removeEventListener(eventName, this.scheduleOverlayUpdate);
 		});
 
-		el.removeEventListener("pointermove", this.handleFreeCrosshairMove);
-		el.removeEventListener("mousemove", this.handleFreeCrosshairMove);
 		el.removeEventListener("pointerleave", this.handleFreeCrosshairLeave);
 		el.removeEventListener("mouseleave", this.handleFreeCrosshairLeave);
 		el.removeEventListener("wheel", this.handlePriceScaleWheel, true);
 		el.removeEventListener("wheel", this.handleBullseyeLockWheel, true);
+		el.removeEventListener("pointerdown", this.handlePriceAxisPanPointerDown);
 		el.removeEventListener("pointerdown", this.handleBullseyeLockPointerDown);
 		el.removeEventListener("pointermove", this.handleBullseyeLockPointerMove);
+		el.removeEventListener("pointerup", this.handlePriceAxisPanPointerUp);
+		el.removeEventListener("pointercancel", this.handlePriceAxisPanPointerUp);
 		el.removeEventListener("pointerup", this.handleBullseyeLockPointerUp);
 		el.removeEventListener("pointercancel", this.handleBullseyeLockPointerUp);
 		el.removeEventListener("pointerleave", this.handleBullseyeLockPointerUp);
 		el.removeEventListener("click", this.handleMeasurementClick);
+		window.removeEventListener("pointerup", this.handlePriceAxisPanPointerUp);
+		window.removeEventListener("pointercancel", this.handlePriceAxisPanPointerUp);
+		this.priceAxisPanPointer = null;
+		this.chartPanPointer = null;
 	};
 
 	handleKeyDown = (event) => {
 		if (event.key !== "Escape") return;
+
+		if (this.isOpenOrderPriceDragging || this.state.openOrderDrag) {
+			event.preventDefault();
+			this.cancelOpenOrderPriceDrag();
+			return;
+		}
+
+		if (this.isOrderTicketPriceDragging) {
+			event.preventDefault();
+			this.cancelOrderTicketPriceDrag();
+			return;
+		}
 
 		if (this.state.isCandleGranularityMenuOpen || this.state.isCandleGranularityMenuClosing) {
 			this.closeCandleGranularityMenu();
 			return;
 		}
 
-		if (this.state.orderTicket && !this.state.isOrderTicketClosing) {
-			this.closeOrderTicket();
+		// In-progress only (1st point set, awaiting 2nd). Locked measurements clear via × only.
+		const measurementInProgress = Boolean(
+			this.state.measurementStart && !this.state.measurementEnd,
+		);
+
+		if (measurementInProgress) {
+			this.clearMeasurement();
 			return;
 		}
 
-		if (this.state.measurementStart || this.state.measurementEnd) {
-			this.setState({
-				measurementStart: null,
-				measurementEnd: null,
-				measurementDrag: null,
-			});
+		if (this.state.orderTicket && !this.state.isOrderTicketClosing) {
+			this.closeOrderTicket();
 		}
+	};
+
+	clearMeasurement = () => {
+		this.measurementMoveOrigin = null;
+		this.measurementMoveSnapshot = null;
+		this.setState({
+			measurementStart: null,
+			measurementEnd: null,
+			measurementDrag: null,
+		});
+	};
+
+	handleMeasurementClear = (event) => {
+		event?.preventDefault?.();
+		event?.stopPropagation?.();
+		this.clearMeasurement();
 	};
 
 	getMeasurementPointFromCoordinates = (x, y) => {
 		if (!this.chart || !this.candleSeries) return null;
 
-		const logical = this.chart.timeScale().coordinateToLogical?.(x);
 		const price = this.candleSeries.coordinateToPrice(y);
+		if (!Number.isFinite(price)) return null;
 
-		if (!Number.isFinite(logical) || !Number.isFinite(price)) return null;
+		const time = this.measurementXToTime(x);
+
+		if (!Number.isFinite(time)) return null;
 
 		return {
-			logical,
 			price,
-			time: this.logicalToTime(logical),
+			time,
 		};
 	};
 
@@ -1081,10 +1408,14 @@ class Home extends React.Component {
 				isOrderTicketClosing: false,
 				lastOrderSide: side,
 			}), () => {
-				this.loadProfile();
+				this.refreshBalancesManually("order_overlay_open");
 				this.scheduleOrderPreview();
 			});
 
+			return true;
+		}
+
+		if (this.isSellTrailingOrderTicket(ticket)) {
 			return true;
 		}
 
@@ -1133,12 +1464,81 @@ class Home extends React.Component {
 		event.stopPropagation();
 
 		this.suppressMeasurementClick = true;
+		this.measurementMoveOrigin = null;
+		this.measurementMoveSnapshot = null;
 		this.setState({ measurementDrag: endpoint });
+	};
+
+	handleMeasurementMoveDragStart = (event) => {
+		if (event.button != null && event.button !== 0) return;
+		if (!this.state.measurementStart || !this.state.measurementEnd) return;
+
+		const el = this.chartRef.current;
+		if (!el || !this.chart || !this.candleSeries) return;
+
+		event.preventDefault();
+		event.stopPropagation();
+
+		const rect = el.getBoundingClientRect();
+		const startX = this.measurementTimeToX(this.state.measurementStart.time);
+		const startY = this.priceToY(this.state.measurementStart.price);
+		const endX = this.measurementTimeToX(this.state.measurementEnd.time);
+		const endY = this.priceToY(this.state.measurementEnd.price);
+
+		if (
+			!Number.isFinite(startX)
+			|| !Number.isFinite(startY)
+			|| !Number.isFinite(endX)
+			|| !Number.isFinite(endY)
+		) {
+			return;
+		}
+
+		this.suppressMeasurementClick = true;
+		this.measurementMoveOrigin = {
+			clientX: event.clientX,
+			clientY: event.clientY,
+			rectLeft: rect.left,
+			rectTop: rect.top,
+		};
+		this.measurementMoveSnapshot = {
+			startX,
+			startY,
+			endX,
+			endY,
+		};
+		this.setState({ measurementDrag: "move" });
 	};
 
 	handleMeasurementDragMove = (event) => {
 		const { measurementDrag } = this.state;
 		if (!measurementDrag) return;
+
+		if (measurementDrag === "move") {
+			const origin = this.measurementMoveOrigin;
+			const snapshot = this.measurementMoveSnapshot;
+
+			if (!origin || !snapshot) return;
+
+			const dx = event.clientX - origin.clientX;
+			const dy = event.clientY - origin.clientY;
+			const nextStart = this.getMeasurementPointFromCoordinates(
+				snapshot.startX + dx,
+				snapshot.startY + dy,
+			);
+			const nextEnd = this.getMeasurementPointFromCoordinates(
+				snapshot.endX + dx,
+				snapshot.endY + dy,
+			);
+
+			if (!nextStart || !nextEnd) return;
+
+			this.setState({
+				measurementStart: nextStart,
+				measurementEnd: nextEnd,
+			});
+			return;
+		}
 
 		const point = this.getMeasurementPointFromEvent(event);
 		if (!point) return;
@@ -1151,10 +1551,60 @@ class Home extends React.Component {
 	handleMeasurementDragEnd = () => {
 		if (!this.state.measurementDrag) return;
 
+		this.measurementMoveOrigin = null;
+		this.measurementMoveSnapshot = null;
 		this.setState({ measurementDrag: null });
 		window.setTimeout(() => {
 			this.suppressMeasurementClick = false;
 		}, 0);
+	};
+
+	isPointerOverPriceScale = (event) => {
+		if (!this.chart) return false;
+
+		const el = this.chartRef.current;
+		if (!el) return false;
+
+		const rect = el.getBoundingClientRect();
+		const priceScaleWidth = Math.max(this.chart.priceScale("right")?.width?.() || 0, 76);
+		const x = event.clientX - rect.left;
+
+		return x >= rect.width - priceScaleWidth && x <= rect.width;
+	};
+
+	handlePriceAxisPanPointerDown = (event) => {
+		if (event.button != null && event.button !== 0) return;
+
+		this.chartPanPointer = {
+			pointerId: event.pointerId,
+			x: event.clientX,
+			y: event.clientY,
+		};
+
+		if (!this.isPointerOverPriceScale(event)) return;
+
+		this.priceAxisPanPointer = {
+			pointerId: event.pointerId,
+			x: event.clientX,
+			y: event.clientY,
+		};
+	};
+
+	handlePriceAxisPanPointerUp = (event) => {
+		const chartStart = this.chartPanPointer;
+		const axisStart = this.priceAxisPanPointer;
+
+		if (
+			chartStart
+			&& (event.pointerId == null || chartStart.pointerId === event.pointerId)
+		) {
+			this.chartPanPointer = null;
+		}
+
+		if (!axisStart) return;
+		if (event.pointerId != null && axisStart.pointerId !== event.pointerId) return;
+
+		this.priceAxisPanPointer = null;
 	};
 
 	handlePriceScaleWheel = (event) => {
@@ -1182,9 +1632,11 @@ class Home extends React.Component {
 		event.stopImmediatePropagation?.();
 
 		const y = event.clientY - rect.top;
+		const deltaY = normalizePriceScaleWheelDeltaY(event);
+
 		this.priceScaleWheelState = {
-			deltaY: (this.priceScaleWheelState?.deltaY || 0) + event.deltaY,
 			y,
+			normDeltaY: (this.priceScaleWheelState?.normDeltaY || 0) + deltaY,
 		};
 
 		if (this.priceScaleWheelFrame) return;
@@ -1199,73 +1651,171 @@ class Home extends React.Component {
 		if (!this.chart || !this.candleSeries || !this.priceScaleWheelState) return;
 
 		const priceScale = this.getMainPriceScale();
-		const range = priceScale?.getVisibleRange?.();
-		const { deltaY, y } = this.priceScaleWheelState;
+		const el = this.chartRef.current;
+		const { y, normDeltaY } = this.priceScaleWheelState;
 
 		this.priceScaleWheelState = null;
 
-		if (!priceScale || !range || !Number.isFinite(range.from) || !Number.isFinite(range.to) || deltaY === 0) {
+		if (!priceScale || !el) return;
+
+		const zoomFactor = priceScaleZoomFactorFromDelta(normDeltaY);
+
+		if (zoomFactor == null || zoomFactor === 1) return;
+
+		const paneHeight = Number(this.chart.paneSize?.(0)?.height);
+		const height = Number.isFinite(paneHeight) && paneHeight > 2
+			? paneHeight
+			: Math.max(2, el.clientHeight - CHART_TIME_SCALE_HEIGHT);
+
+		if (!(height > 2)) return;
+		if (y < 0 || y > height) return;
+
+		const isLog = Boolean(this.state.isLogPriceScale);
+		const viewport = this.getPriceViewportRange();
+		const vanishing = this.candleSeries.coordinateToPrice(y);
+
+		if (!viewport || !Number.isFinite(vanishing)) {
 			return;
 		}
 
-		const lower = Math.min(range.from, range.to);
-		const upper = Math.max(range.from, range.to);
-		if (!(upper > lower)) return;
-		if (this.state.isLogPriceScale && (!(lower > 0) || !(upper > 0))) return;
+		const beforeMin = viewport.min;
+		const beforeMax = viewport.max;
 
-		const zoomFactor = Math.exp(Math.sign(deltaY) * Math.min(Math.abs(deltaY), 180) / 1600);
-		const rawAnchor = this.candleSeries.coordinateToPrice(y);
-		let anchor = Number(rawAnchor);
+		this.manualPriceRange = null;
 
-		let nextFrom;
-		let nextTo;
+		let nextMin;
+		let nextMax;
+		let formula = null;
 
-		if (this.state.isLogPriceScale) {
-			if (!(anchor > 0)) anchor = Math.sqrt(lower * upper);
-			anchor = Math.min(upper, Math.max(lower, anchor));
-			if (!(anchor > 0)) return;
+		if (isLog) {
+			if (!(beforeMin > 0) || !(beforeMax > 0) || !(vanishing > 0)) return;
 
-			const logLower = Math.log10(lower);
-			const logUpper = Math.log10(upper);
-			const logAnchor = Math.log10(anchor);
-			nextFrom = 10 ** (logAnchor - (logAnchor - logLower) * zoomFactor);
-			nextTo = 10 ** (logAnchor + (logUpper - logAnchor) * zoomFactor);
+			if (!this.priceScaleLogZoomFormula) {
+				this.priceScaleLogZoomFormula = getLightweightChartsLogFormula(beforeMin, beforeMax);
+			}
+
+			formula = this.priceScaleLogZoomFormula;
+
+			const logFrom = toLightweightChartsLogPrice(beforeMin, formula);
+			const logTo = toLightweightChartsLogPrice(beforeMax, formula);
+			const logVanishing = toLightweightChartsLogPrice(vanishing, formula);
+
+			if (
+				!Number.isFinite(logFrom)
+				|| !Number.isFinite(logTo)
+				|| !Number.isFinite(logVanishing)
+			) {
+				return;
+			}
+
+			const newLogFrom = logVanishing + (logFrom - logVanishing) * zoomFactor;
+			const newLogTo = logVanishing + (logTo - logVanishing) * zoomFactor;
+			nextMin = fromLightweightChartsLogPrice(Math.min(newLogFrom, newLogTo), formula);
+			nextMax = fromLightweightChartsLogPrice(Math.max(newLogFrom, newLogTo), formula);
 		} else {
-			if (!Number.isFinite(anchor)) anchor = (lower + upper) / 2;
-			anchor = Math.min(upper, Math.max(lower, anchor));
-			nextFrom = anchor - (anchor - lower) * zoomFactor;
-			nextTo = anchor + (upper - anchor) * zoomFactor;
+			const newFrom = vanishing + (beforeMin - vanishing) * zoomFactor;
+			const newTo = vanishing + (beforeMax - vanishing) * zoomFactor;
+			nextMin = Math.min(newFrom, newTo);
+			nextMax = Math.max(newFrom, newTo);
 		}
 
-		if (!Number.isFinite(nextFrom) || !Number.isFinite(nextTo) || !(nextTo > nextFrom)) return;
-
-		if (this.state.isLogPriceScale) {
-			if (!(nextFrom > 0) || !(nextTo > 0)) return;
-			nextFrom = Math.max(nextFrom, lower / 1e4, nextTo / 1e6);
-			if (!(nextTo > nextFrom)) return;
+		if (
+			!Number.isFinite(nextMin)
+			|| !Number.isFinite(nextMax)
+			|| !(nextMax > nextMin)
+		) {
+			return;
 		}
 
-		// Freeze formula from the *current* range; encode the *next* range with it.
-		this.lockMainPriceVisibleRange(nextFrom, nextTo, {
-			formulaMin: lower,
-			formulaMax: upper,
-		});
+		if (!setPriceScaleLinearVisibleRange(priceScale, nextMin, nextMax, isLog, formula)) {
+			return;
+		}
+
+		// Pin vanishing price to the same Y — correct any apply/mapping drift.
+		for (let pass = 0; pass < 3; pass += 1) {
+			const yAfter = this.candleSeries.priceToCoordinate(vanishing);
+
+			if (!Number.isFinite(yAfter) || Math.abs(yAfter - y) < 0.35) {
+				break;
+			}
+
+			const priceAtCursor = this.candleSeries.coordinateToPrice(y);
+
+			if (!Number.isFinite(priceAtCursor)) break;
+
+			if (isLog) {
+				if (!(priceAtCursor > 0) || !(vanishing > 0) || !formula) break;
+
+				const logShift = toLightweightChartsLogPrice(vanishing, formula)
+					- toLightweightChartsLogPrice(priceAtCursor, formula);
+
+				if (!Number.isFinite(logShift)) break;
+
+				const logMin = toLightweightChartsLogPrice(nextMin, formula) + logShift;
+				const logMax = toLightweightChartsLogPrice(nextMax, formula) + logShift;
+
+				nextMin = fromLightweightChartsLogPrice(Math.min(logMin, logMax), formula);
+				nextMax = fromLightweightChartsLogPrice(Math.max(logMin, logMax), formula);
+			} else {
+				const shift = vanishing - priceAtCursor;
+				nextMin += shift;
+				nextMax += shift;
+			}
+
+			if (
+				!Number.isFinite(nextMin)
+				|| !Number.isFinite(nextMax)
+				|| !(nextMax > nextMin)
+			) {
+				break;
+			}
+
+			if (!setPriceScaleLinearVisibleRange(priceScale, nextMin, nextMax, isLog, formula)) {
+				break;
+			}
+		}
+
+		this.lastPriceViewportRange = { min: nextMin, max: nextMax };
+
+		// If formula mismatch ×10'd on first log tick, switch to span formula and retry once.
+		if (
+			isLog
+			&& spanRatioSuspect(beforeMin, beforeMax, nextMin, nextMax)
+			&& this.priceScaleLogZoomFormula?.logicalOffset === DEFAULT_LWC_LOG_FORMULA.logicalOffset
+		) {
+			this.priceScaleLogZoomFormula = getLightweightChartsLogFormula(beforeMin, beforeMax);
+			formula = this.priceScaleLogZoomFormula;
+
+			const logFrom = toLightweightChartsLogPrice(beforeMin, formula);
+			const logTo = toLightweightChartsLogPrice(beforeMax, formula);
+			const logVanishing = toLightweightChartsLogPrice(vanishing, formula);
+			const newLogFrom = logVanishing + (logFrom - logVanishing) * zoomFactor;
+			const newLogTo = logVanishing + (logTo - logVanishing) * zoomFactor;
+
+			nextMin = fromLightweightChartsLogPrice(Math.min(newLogFrom, newLogTo), formula);
+			nextMax = fromLightweightChartsLogPrice(Math.max(newLogFrom, newLogTo), formula);
+
+			if (Number.isFinite(nextMin) && Number.isFinite(nextMax) && nextMax > nextMin) {
+				setPriceScaleLinearVisibleRange(priceScale, nextMin, nextMax, true, formula);
+				this.lastPriceViewportRange = { min: nextMin, max: nextMax };
+			}
+		}
 
 		if (this.priceScaleWheelOverlayTimer) {
 			window.clearTimeout(this.priceScaleWheelOverlayTimer);
 			this.priceScaleWheelOverlayTimer = null;
 		}
 
-		this.scheduleOverlayUpdate();
+		this.schedulePriceOverlayUpdate();
 	};
 
-	// Same lock path everywhere: linear → setVisibleRange; log → freeze formula → toLog → setVisibleRange.
 	lockMainPriceVisibleRange = (min, max, options = {}) => {
 		const priceScale = this.getMainPriceScale();
 		if (!priceScale || !(max > min)) return false;
 
 		const isLog = options.isLog ?? this.state.isLogPriceScale;
 		const scaleMargins = options.scaleMargins;
+		const syncMinMove = options.syncMinMove !== false;
 
 		this.manualPriceRange = null;
 
@@ -1273,54 +1823,45 @@ class Home extends React.Component {
 			priceScale.applyOptions({ scaleMargins });
 		}
 
-		if (!isLog) {
-			this.lockedLogFormula = null;
-			priceScale.setVisibleRange({ from: min, to: max });
-			return true;
+		if (isLog && !this.priceScaleLogZoomFormula) {
+			this.priceScaleLogZoomFormula = getLightweightChartsLogFormula(min, max);
 		}
 
-		if (!(min > 0) || !(max > 0)) return false;
+		const applied = setPriceScaleLinearVisibleRange(
+			priceScale,
+			min,
+			max,
+			isLog,
+			isLog ? (this.priceScaleLogZoomFormula || getLightweightChartsLogFormula(min, max)) : null,
+		);
 
-		if (!this.lockedLogFormula) {
-			const formulaMin = options.formulaMin ?? min;
-			const formulaMax = options.formulaMax ?? max;
-			this.lockedLogFormula = getLightweightChartsLogFormula(formulaMin, formulaMax);
-		}
+		if (applied && syncMinMove) this.syncPriceScaleMinMoveFromViewport();
 
-		const from = toLightweightChartsLogPrice(min, this.lockedLogFormula);
-		const to = toLightweightChartsLogPrice(max, this.lockedLogFormula);
-		if (!Number.isFinite(from) || !Number.isFinite(to) || !(to > from)) return false;
-
-		priceScale.setVisibleRange({ from, to });
-		return true;
+		return applied;
 	};
 
-	applyManualPriceRange = (min, max) => {
+	// Tick/minMove only — never writes setVisibleRange.
+	applyPriceScaleMinMoveForCurrentRange = (min, max) => {
 		if (!(max > min)) return;
 
-		this.lockedLogFormula = null;
-		this.manualPriceRange = {
-			min: this.state.isLogPriceScale ? Math.max(min, Number.EPSILON) : min,
-			max,
-		};
+		if (this.priceScaleMinMoveSyncFrame) {
+			cancelAnimationFrame(this.priceScaleMinMoveSyncFrame);
+			this.priceScaleMinMoveSyncFrame = null;
+		}
 
-		this.getMainPriceScale()?.applyOptions({
-			autoScale: true,
-			scaleMargins: { top: 0, bottom: 0 },
-		});
-		this.candleSeries?.applyOptions({});
+		this.lastPriceViewportRange = { min, max };
+		this.applyPriceSeriesFormat();
 	};
 
 	enablePriceAutoScale = () => {
 		this.manualPriceRange = null;
-		this.lockedLogFormula = null;
+		this.priceScaleLogZoomFormula = null;
 
 		if (this.state.isBullseyeViewActive) {
 			this.bullseyePriceRange = null;
 			this.setState({
 				isBullseyeViewActive: false,
-				showBullseyeLockNotice: false,
-				isBullseyeLockNoticeClosing: false,
+				chartNotice: null,
 			}, () => {
 				this.applyChartInteractionLock(false);
 				this.getMainPriceScale()?.applyOptions({
@@ -1329,6 +1870,7 @@ class Home extends React.Component {
 				});
 				this.candleSeries?.applyOptions({});
 				this.scheduleOverlayUpdate();
+				this.syncPriceScaleMinMoveFromViewport();
 			});
 			return;
 		}
@@ -1338,6 +1880,60 @@ class Home extends React.Component {
 			scaleMargins: { ...DEFAULT_PRICE_SCALE_MARGINS },
 		});
 		this.candleSeries?.applyOptions({});
+		this.scheduleOverlayUpdate();
+		this.syncPriceScaleMinMoveFromViewport();
+	};
+
+	// !IMPORTANT DO NOT TOUCH. DO NOT OPTIMIZE UNLESS REQUESTED BY USER.
+	// Cookie wants Log, but create stays Normal until real candle data has a
+	// visible time range (same end state as Linear → AUTO → Log). No timers —
+	// enter Log on the visible-logical-range event after setData/default range.
+	armLogPriceScaleResyncAfterData = () => {
+		if (!this.state.isLogPriceScale || !this.candleSeries) {
+			this.pendingLogPriceScaleResync = false;
+			return;
+		}
+
+		const priceScale = this.getMainPriceScale();
+		if (!priceScale) return;
+
+		this.manualPriceRange = null;
+		this.priceScaleLogZoomFormula = null;
+		this.pendingLogPriceScaleResync = true;
+
+		priceScale.applyOptions({
+			mode: PriceScaleMode.Normal,
+			autoScale: true,
+			scaleMargins: { ...DEFAULT_PRICE_SCALE_MARGINS },
+		});
+		this.candleSeries.applyOptions({});
+	};
+
+	// !IMPORTANT DO NOT TOUCH. DO NOT OPTIMIZE UNLESS REQUESTED BY USER.
+	applyPendingLogPriceScaleResync = () => {
+		if (!this.pendingLogPriceScaleResync) return;
+
+		if (!this.state.isLogPriceScale || !this.candleSeries) {
+			this.pendingLogPriceScaleResync = false;
+			return;
+		}
+
+		const priceScale = this.getMainPriceScale();
+		if (!priceScale) {
+			this.pendingLogPriceScaleResync = false;
+			return;
+		}
+
+		this.pendingLogPriceScaleResync = false;
+		this.manualPriceRange = null;
+		this.priceScaleLogZoomFormula = null;
+
+		priceScale.applyOptions({
+			mode: PriceScaleMode.Logarithmic,
+			autoScale: true,
+		});
+		this.candleSeries.applyOptions({});
+		this.syncPriceScaleMinMoveFromViewport();
 		this.scheduleOverlayUpdate();
 	};
 
@@ -1352,30 +1948,42 @@ class Home extends React.Component {
 			const priceScale = this.getMainPriceScale();
 			const wasAutoScale = priceScale?.options?.()?.autoScale !== false;
 
+			// Capture the current linear window BEFORE mode switch (getVisibleRange
+			// after switching with autoScale on loses the panned/zoomed range).
+			let restoreMin = null;
+			let restoreMax = null;
+			const range = priceScale?.getVisibleRange?.();
+
+			if (
+				range
+				&& Number.isFinite(range.from)
+				&& Number.isFinite(range.to)
+			) {
+				restoreMin = Math.min(range.from, range.to);
+				restoreMax = Math.max(range.from, range.to);
+			}
+
 			this.manualPriceRange = null;
-			this.lockedLogFormula = null;
+			this.priceScaleLogZoomFormula = null;
 			priceScale?.applyOptions({
 				mode: isLogPriceScale ? PriceScaleMode.Logarithmic : PriceScaleMode.Normal,
 				autoScale: true,
 			});
 			this.candleSeries?.applyOptions({});
 
-			// Autoscale once for the new mode, then restore prior auto on/off.
-			if (!this.state.isBullseyeViewActive && !wasAutoScale) {
-				const range = priceScale?.getVisibleRange?.();
+			// Autoscale once for the new mode, then restore prior auto on/off + range.
+			if (
+				!this.state.isBullseyeViewActive
+				&& !wasAutoScale
+				&& Number.isFinite(restoreMin)
+				&& Number.isFinite(restoreMax)
+				&& restoreMax > restoreMin
+			) {
 				if (
-					range
-					&& Number.isFinite(range.from)
-					&& Number.isFinite(range.to)
+					!this.lockMainPriceVisibleRange(restoreMin, restoreMax, {
+						isLog: isLogPriceScale,
+					})
 				) {
-					const from = Math.min(range.from, range.to);
-					const to = Math.max(range.from, range.to);
-					if (
-						!this.lockMainPriceVisibleRange(from, to, { isLog: isLogPriceScale })
-					) {
-						priceScale?.applyOptions({ autoScale: false });
-					}
-				} else {
 					priceScale?.applyOptions({ autoScale: false });
 				}
 			}
@@ -1463,46 +2071,59 @@ class Home extends React.Component {
 		}, this.loadMarket);
 	};
 
-	getHoveredCandleIndexFromX = (x) => {
-		const { candles } = this.state;
+	/**
+	 * Candle under cursor: same series bar LWC uses for the time label, then map
+	 * that bar's chart time onto state.candles. Never treat logical range bounds as
+	 * candles[] indexes — that window can miss the real bar and highlight a neighbor.
+	 */
+	resolveCandleIndexFromX = (x) => {
+		const stateCandles = this.state.candles;
 
-		if (!this.chart || !Array.isArray(candles) || !candles.length || !Number.isFinite(x)) {
+		if (
+			!this.chart
+			|| !this.candleSeries
+			|| !Array.isArray(stateCandles)
+			|| !stateCandles.length
+			|| !Number.isFinite(x)
+		) {
 			return null;
 		}
 
-		let bestIndex = null;
-		let bestDistance = Infinity;
-		const visibleLogicalRange = this.chart.timeScale().getVisibleLogicalRange?.();
-		const from = visibleLogicalRange && Number.isFinite(visibleLogicalRange.from)
-			? Math.max(0, Math.floor(visibleLogicalRange.from) - 2)
-			: 0;
-		const to = visibleLogicalRange && Number.isFinite(visibleLogicalRange.to)
-			? Math.min(candles.length - 1, Math.ceil(visibleLogicalRange.to) + 2)
-			: candles.length - 1;
+		const logicalIndex = this.chart.timeScale().coordinateToLogical?.(x);
 
-		for (let index = from; index <= to; index++) {
-			const candleX = this.timeToX(candles[index].time);
+		if (!Number.isFinite(logicalIndex)) return null;
 
-			if (!Number.isFinite(candleX)) continue;
+		const bar = (
+			this.candleSeries.dataByIndex(logicalIndex, MismatchDirection.None)
+			|| this.candleSeries.dataByIndex(logicalIndex, MismatchDirection.NearestLeft)
+			|| this.candleSeries.dataByIndex(logicalIndex, MismatchDirection.NearestRight)
+		);
 
-			const distance = Math.abs(candleX - x);
+		if (!bar) return null;
 
-			if (distance < bestDistance) {
-				bestDistance = distance;
-				bestIndex = index;
-			}
-		}
+		const chartTs = Number(
+			bar.time != null && typeof bar.time === "object"
+				? NaN
+				: bar.time
+		);
 
-		return bestIndex;
+		if (!Number.isFinite(chartTs)) return null;
+
+		return this.findNearestCandleIndexByChartTime(stateCandles, chartTs);
 	};
+
+	getHoveredCandleIndexFromX = (x) => this.resolveCandleIndexFromX(x);
 
 	getCrosshairTimeFromX = (x) => {
 		const candles = this.state.candles;
 		const fallbackTime = candles[candles.length - 1]?.time;
-		const logical = this.chart?.timeScale?.().coordinateToLogical?.(x);
-		const time = this.logicalToTime(logical);
+		const index = this.resolveCandleIndexFromX(x);
 
-		return Number.isFinite(time) ? time : fallbackTime;
+		if (index != null && candles[index]) {
+			return Number(candles[index].time);
+		}
+
+		return fallbackTime;
 	};
 
 	syncNativeCrosshair = (price, x) => {
@@ -1533,12 +2154,65 @@ class Home extends React.Component {
 	};
 
 	handleFreeCrosshairMove = (event) => {
+		this.pendingPointerMove = {
+			clientX: event.clientX,
+			clientY: event.clientY,
+		};
+
+		if (this.pointerMoveFrame) return;
+
+		this.pointerMoveFrame = window.requestAnimationFrame(() => {
+			this.pointerMoveFrame = null;
+			const pending = this.pendingPointerMove;
+			this.pendingPointerMove = null;
+
+			if (pending) {
+				this.applyFreeCrosshairMove(pending);
+			}
+		});
+	};
+
+	applyFreeCrosshairMove = ({ clientX, clientY }) => {
 		const el = this.chartRef.current;
 		if (!el) return;
 
 		const rect = el.getBoundingClientRect();
-		const x = event.clientX - rect.left;
-		const y = event.clientY - rect.top;
+		const x = clientX - rect.left;
+		const y = clientY - rect.top;
+
+		if (x < 0 || x > rect.width) {
+			this.handleFreeCrosshairLeave();
+			return;
+		}
+
+		// In-progress MT (1st point only): skip candle hover / order-scale chrome
+		// so the preview stays light. Locked MT keeps normal scale hover so
+		// Bookmark / Add Order still appear.
+		const measurementInProgress = Boolean(
+			this.state.measurementStart && !this.state.measurementEnd,
+		);
+
+		if (measurementInProgress) {
+			if (this.state.hoveredVolumeIndex !== null) {
+				this.syncVolumeSeries(this.state.candles, null);
+			}
+
+			this.setState(prev => (
+				Math.abs((prev.freeCrosshairX ?? -9999) - x) < 0.5
+				&& Math.abs((prev.pointerPosition?.y ?? -9999) - y) < 0.5
+				&& prev.hoveredVolumeIndex === null
+				&& prev.orderScaleHover === null
+					? null
+					: {
+						freeCrosshairX: x,
+						pointerPosition: { x, y },
+						hoveredVolumeIndex: null,
+						orderScaleHover: null,
+					}
+			));
+			return;
+		}
+
 		const priceScaleWidth = Math.max(this.chart?.priceScale('right')?.width?.() || 0, 76);
 		const scaleLeft = rect.width - priceScaleWidth;
 		const hover = this.state.orderScaleHover;
@@ -1567,9 +2241,10 @@ class Home extends React.Component {
 			}
 			: null;
 
-		if (x < 0 || x > rect.width) {
-			this.handleFreeCrosshairLeave();
-			return;
+		if (orderScaleHover) {
+			this.syncNativeCrosshair(orderScaleHover.price, Math.min(x, scaleLeft - 1));
+		} else if (isMovingTowardOrderHover && Number.isFinite(bridgePrice)) {
+			this.syncNativeCrosshair(bridgePrice, hover.x);
 		}
 
 		this.setCrosshairTimeLabelVisible(isOverCandleZone);
@@ -1580,12 +2255,6 @@ class Home extends React.Component {
 
 		if (nextHoveredVolumeIndex !== this.state.hoveredVolumeIndex) {
 			this.syncVolumeSeries(this.state.candles, nextHoveredVolumeIndex);
-		}
-
-		if (orderScaleHover) {
-			this.syncNativeCrosshair(orderScaleHover.price, Math.min(x, scaleLeft - 1));
-		} else if (isMovingTowardOrderHover && Number.isFinite(bridgePrice)) {
-			this.syncNativeCrosshair(bridgePrice, hover.x);
 		}
 
 		this.setState(prev => (
@@ -1617,6 +2286,11 @@ class Home extends React.Component {
 		if (event?.relatedTarget?.closest?.(".e__scale-hover-actions")) return;
 		if (this.isPointerOnOrderPlus) return;
 
+		if (this.pointerMoveFrame) {
+			cancelAnimationFrame(this.pointerMoveFrame);
+			this.pointerMoveFrame = null;
+		}
+		this.pendingPointerMove = null;
 		this.setCrosshairTimeLabelVisible(false);
 
 		if (this.state.hoveredVolumeIndex !== null) {
@@ -1708,6 +2382,7 @@ class Home extends React.Component {
 
 		this.chart.applyOptions({ width, height });
 		this.chart.timeScale().applyOptions(this.getTimeScaleBarSpacingOptions(width));
+		this.syncPriceScaleMinMoveFromViewport();
 		this.setState({ chartSize: { width, height } }, () => {
 			if (this.state.isBullseyeViewActive) {
 				this.frameChartTo24hFocus();
@@ -1727,7 +2402,10 @@ class Home extends React.Component {
 	};
 
 	restoreVisibleRange = (snapshot) => {
-		if (!this.chart || !snapshot) return false;
+		if (this.state.isBullseyeViewActive) {
+			this.frameChartTo24hFocus();
+			return true;
+		}
 
 		const timeScale = this.chart.timeScale();
 
@@ -1744,45 +2422,6 @@ class Home extends React.Component {
 		return false;
 	};
 
-	restoreVisibleTimeframeByDates = (snapshot, candles) => {
-		if (!this.chart || !snapshot?.timeRange || !Array.isArray(candles) || !candles.length) return false;
-
-		const requestedFrom = Number(snapshot.timeRange.from);
-		const requestedTo = Number(snapshot.timeRange.to);
-		const duration = requestedTo - requestedFrom;
-		const loadedFrom = toChartTime(candles[0].time);
-		const loadedTo = toChartTime(candles[candles.length - 1].time);
-
-		if (
-			!Number.isFinite(requestedFrom)
-			|| !Number.isFinite(requestedTo)
-			|| !Number.isFinite(duration)
-			|| duration <= 0
-			|| !Number.isFinite(loadedFrom)
-			|| !Number.isFinite(loadedTo)
-			|| !this.chart.timeScale().setVisibleRange
-		) {
-			return false;
-		}
-
-		let from = requestedFrom;
-		let to = requestedTo;
-
-		if (to > loadedTo) {
-			to = loadedTo;
-			from = to - duration;
-		}
-
-		if (from < loadedFrom) {
-			from = loadedFrom;
-			to = Math.min(loadedTo, from + duration);
-		}
-
-		this.chart.timeScale().setVisibleRange({ from, to });
-
-		return true;
-	};
-
 	getLoadedCandleGranularity = () => {
 		if (this.state.loadedPeriodGranularity) {
 			return Number(this.state.loadedPeriodGranularity);
@@ -1791,24 +2430,34 @@ class Home extends React.Component {
 		return Number(this.state.loadedPeriodDays) <= DEFAULT_PERIOD_DAYS ? 3600 : 21600;
 	};
 
-	findCandleIndexByTime = (candles, time) => {
-		const targetTime = Number(time);
+	// Series bars store toChartTime(...); match against that on the full candles array.
+	findNearestCandleIndexByChartTime = (candles, chartTime) => {
+		const targetTime = Number(chartTime);
 
-		if (!Array.isArray(candles) || !Number.isFinite(targetTime)) return -1;
+		if (!Array.isArray(candles) || !candles.length || !Number.isFinite(targetTime)) {
+			return null;
+		}
 
 		let low = 0;
 		let high = candles.length - 1;
 
 		while (low <= high) {
 			const middle = Math.floor((low + high) / 2);
-			const candleTime = Number(candles[middle].time);
+			const candleChartTime = Number(toChartTime(candles[middle].time));
 
-			if (candleTime === targetTime) return middle;
-			if (candleTime < targetTime) low = middle + 1;
+			if (candleChartTime === targetTime) return middle;
+			if (candleChartTime < targetTime) low = middle + 1;
 			else high = middle - 1;
 		}
 
-		return -1;
+		const right = Math.min(candles.length - 1, low);
+		const left = Math.max(0, right - 1);
+		const leftTime = Number(toChartTime(candles[left].time));
+		const rightTime = Number(toChartTime(candles[right].time));
+		const leftDistance = Math.abs(leftTime - targetTime);
+		const rightDistance = Math.abs(rightTime - targetTime);
+
+		return leftDistance <= rightDistance ? left : right;
 	};
 
 	buildDisplayCandles = (historicalCandles, currentCandle) => {
@@ -1845,9 +2494,12 @@ class Home extends React.Component {
 		}, callback);
 	};
 
-	fetchOfficialRecentCandles = (endTime, limit = 3) => {
+	fetchOfficialRecentCandles = (endTime, options = {}) => {
 		const baseCurrency = this.state.baseCurrency.trim().toUpperCase();
 		const granularity = this.getLoadedCandleGranularity();
+		const startTime = Number(options.startTime);
+		const limit = Number(options.limit);
+		const hasStartTime = Number.isFinite(startTime) && startTime > 0;
 
 		if (!baseCurrency || !Number.isFinite(Number(endTime))) {
 			return Promise.resolve([]);
@@ -1858,144 +2510,233 @@ class Home extends React.Component {
 			days: Number(this.state.loadedPeriodDays) || DEFAULT_PERIOD_DAYS,
 			granularity,
 			end_time: Math.max(0, Math.floor(Number(endTime))),
-			limit: Math.max(1, Math.min(300, limit)),
+			...(hasStartTime
+				? { start_time: Math.floor(startTime) }
+				: { limit: Math.max(1, Math.min(300, Number.isFinite(limit) ? limit : 3)) }),
 			_: Date.now(),
 		}).then(response => this.parseCandlesResponse(response.data).candles)
 			.catch(() => []);
 	};
 
-	mergeOfficialIntoHistorical = (historicalCandles, officialCandles, beforeTime) => {
-		const byTime = new Map();
+	rememberLiveCandleBucketTime = (time) => {
+		const bucket = Number(time);
 
-		(Array.isArray(historicalCandles) ? historicalCandles : []).forEach(candle => {
-			byTime.set(Number(candle.time), candle);
-		});
+		if (!Number.isFinite(bucket) || bucket <= 0) return;
 
-		(Array.isArray(officialCandles) ? officialCandles : []).forEach(candle => {
-			const time = Number(candle.time);
-
-			if (Number.isFinite(time) && time < beforeTime) {
-				byTime.set(time, candle);
-			}
-		});
-
-		return [...byTime.values()].sort((left, right) => Number(left.time) - Number(right.time));
+		if (
+			!Number.isFinite(Number(this.lastLiveCandleBucketTime))
+			|| bucket > Number(this.lastLiveCandleBucketTime)
+		) {
+			this.lastLiveCandleBucketTime = bucket;
+		}
 	};
 
-	finalizeBucketRolls = (historicalCandles, rolls) => {
-		if (!Array.isArray(rolls) || !rolls.length) {
-			return Promise.resolve(historicalCandles);
+	backfillCandlesAfterReconnect = () => {
+		const granularity = this.getLoadedCandleGranularity();
+		const fromTime = Number(this.lastLiveCandleBucketTime);
+
+		if (!Number.isFinite(fromTime) || fromTime <= 0) {
+			const fallback = Number(
+				this.state.currentCandle?.time
+				?? this.state.historicalCandles?.[this.state.historicalCandles.length - 1]?.time
+			);
+			if (Number.isFinite(fallback) && fallback > 0) {
+				this.lastLiveCandleBucketTime = fallback;
+			} else {
+				return;
+			}
 		}
 
-		const rollRequestId = ++this.candleRollRequestId;
-		const newestOpenBucket = Number(rolls[rolls.length - 1].openBucketTime);
-		const endTime = newestOpenBucket - 1;
+		const startTime = Number(this.lastLiveCandleBucketTime);
+		if (!Number.isFinite(granularity) || granularity <= 0 || !Number.isFinite(startTime)) {
+			return;
+		}
 
-		return this.fetchOfficialRecentCandles(endTime, rolls.length + 5).then(officialCandles => {
-			if (rollRequestId !== this.candleRollRequestId) {
-				return historicalCandles;
-			}
+		const endTime = Math.floor(Date.now() / 1000);
+		const bucketCount = Math.floor((endTime - startTime) / granularity) + 3;
+		const limit = Math.max(2, Math.min(300, bucketCount));
+		const requestId = ++this.candleBackfillRequestId;
 
-			return this.mergeOfficialIntoHistorical(
-				historicalCandles,
-				officialCandles,
-				newestOpenBucket,
-			);
+		this.fetchOfficialRecentCandles(endTime, { limit }).then((officialCandles) => {
+			if (requestId !== this.candleBackfillRequestId) return;
+			this.applyOfficialCoinbaseCandles(officialCandles);
 		});
 	};
 
-	mergeTradeIntoCurrentCandle = (currentCandle, trade) => {
-		const price = Number(trade.price);
-		const size = Number(trade.size) || 0;
-		const source = String(trade.source || "");
-		const isTickerUpdate = source === "ticker" || source === "ticker_batch";
+	officialCandleSeriesChanged = (previousCandles, nextCandles) => {
+		const previous = Array.isArray(previousCandles) ? previousCandles : [];
+		const next = Array.isArray(nextCandles) ? nextCandles : [];
 
-		return {
-			...currentCandle,
-			high: Math.max(currentCandle.high, price),
-			low: Math.min(currentCandle.low, price),
-			close: price,
-			volume: isTickerUpdate
-				? currentCandle.volume
-				: (currentCandle.volume || 0) + size,
-		};
+		if (previous.length !== next.length) return true;
+
+		for (let index = 0; index < next.length; index += 1) {
+			const left = previous[index];
+			const right = next[index];
+
+			if (
+				Number(left?.time) !== Number(right?.time)
+				|| Number(left?.open) !== Number(right?.open)
+				|| Number(left?.high) !== Number(right?.high)
+				|| Number(left?.low) !== Number(right?.low)
+				|| Number(left?.close) !== Number(right?.close)
+				|| Number(left?.volume) !== Number(right?.volume)
+			) {
+				return true;
+			}
+		}
+
+		return false;
 	};
 
-	createCurrentCandleFromTrade = (trade, priorClose) => {
-		const price = Number(trade.price);
-		const size = Number(trade.size) || 0;
-		const time = Number(trade.time);
-		const source = String(trade.source || "");
-		const isTickerUpdate = source === "ticker" || source === "ticker_batch";
-		const openPrice = isTickerUpdate
-			? (Number.isFinite(Number(priorClose)) ? Number(priorClose) : price)
-			: price;
+	applyOfficialCoinbaseCandles = (officialCandles) => {
+		const incoming = Array.isArray(officialCandles) ? officialCandles : [];
 
-		return {
-			time,
-			open: openPrice,
-			high: Math.max(openPrice, price),
-			low: Math.min(openPrice, price),
-			close: price,
-			volume: isTickerUpdate ? 0 : size,
-		};
-	};
+		if (!incoming.length) return;
 
-	processLiveTradeBatch = (historicalCandles, currentCandle, trades) => {
-		let current = currentCandle ? { ...currentCandle } : null;
-		const rolls = [];
-		let changed = false;
-		let didStartNewCandle = false;
-		let latestCandleTime = null;
-		let latestPrice = null;
+		const previousCandles = this.buildDisplayCandles(
+			this.state.historicalCandles,
+			this.state.currentCandle,
+		);
+		const previousLastTime = Number(previousCandles[previousCandles.length - 1]?.time);
 
-		trades.forEach(trade => {
-			const price = Number(trade.price);
-			const time = Number(trade.time);
-			const source = String(trade.source || "");
-			const isTickerUpdate = source === "ticker" || source === "ticker_batch";
+		// Previous candles: Coinbase only. Overwrite matching times with official
+		// OHLC/volume; add missing official times. Keep local live if Coinbase did
+		// not return that time yet (socket still owns live ticks between syncs).
+		const byTime = new Map();
 
-			if (!Number.isFinite(price) || !Number.isFinite(time)) return;
+		(Array.isArray(previousCandles) ? previousCandles : []).forEach(candle => {
+			const time = Number(candle?.time);
 
-			latestPrice = price;
+			if (!Number.isFinite(time) || time <= 0) return;
 
-			if (!current) {
-				if (isTickerUpdate) return;
-
-				current = this.createCurrentCandleFromTrade(trade, null);
-				changed = true;
-				latestCandleTime = time;
-				return;
-			}
-
-			if (time < current.time) return;
-
-			if (time === current.time) {
-				current = this.mergeTradeIntoCurrentCandle(current, trade);
-				changed = true;
-				latestCandleTime = time;
-				return;
-			}
-
-			rolls.push({
-				closedBucketTime: current.time,
-				openBucketTime: time,
-			});
-			didStartNewCandle = true;
-			changed = true;
-			latestCandleTime = time;
-			current = this.createCurrentCandleFromTrade(trade, current.close);
+			byTime.set(time, candle);
 		});
 
-		return {
-			historicalCandles,
-			currentCandle: current,
-			rolls,
-			changed,
-			didStartNewCandle,
-			latestCandleTime,
-			latestPrice,
-		};
+		incoming.forEach(candle => {
+			const time = Number(candle?.time);
+
+			if (!Number.isFinite(time) || time <= 0) return;
+
+			byTime.set(time, candle);
+		});
+
+		const merged = [...byTime.values()].sort(
+			(left, right) => Number(left.time) - Number(right.time),
+		);
+
+		if (!merged.length || !this.officialCandleSeriesChanged(previousCandles, merged)) {
+			return;
+		}
+
+		const nextLastTime = Number(merged[merged.length - 1]?.time);
+		const addedNewTime = Number.isFinite(nextLastTime)
+			&& (!Number.isFinite(previousLastTime) || nextLastTime > previousLastTime);
+		const onlyCurrentUpdated = (
+			!addedNewTime
+			&& previousCandles.length === merged.length
+			&& Number(previousCandles[previousCandles.length - 1]?.time) === nextLastTime
+			&& !this.officialCandleSeriesChanged(
+				previousCandles.slice(0, -1),
+				merged.slice(0, -1),
+			)
+		);
+		const split = this.splitCandlesFromApi(merged);
+
+		this.setState({
+			historicalCandles: split.historicalCandles,
+			currentCandle: split.currentCandle,
+			candles: merged,
+		}, () => {
+			this.rememberLiveCandleBucketTime(split.currentCandle?.time);
+
+			if (onlyCurrentUpdated) {
+				this.updateCurrentCandleOnChart(split.currentCandle);
+				this.updateCurrentVwapPoint(split.currentCandle);
+			} else {
+				this.syncCandleSeries(this.state.candles);
+				this.syncVwapSeries(this.state.candles);
+			}
+
+			if (addedNewTime) {
+				this.refreshTdSequentialAfterClosedCandle(nextLastTime);
+				this.refreshDepthRangeFromFirstLoad();
+				this.schedulePriceOverlayUpdate();
+			}
+
+			this.syncBullseyeViewIfActive();
+		});
+	};
+
+	stopOfficialCandlePoll = () => {
+		this.officialCandlePollRequestId += 1;
+		this.officialCandlePollInFlight = false;
+		this.lastOfficialCandleSyncAt = 0;
+
+		if (this.officialCandlePollTimer) {
+			window.clearTimeout(this.officialCandlePollTimer);
+			this.officialCandlePollTimer = null;
+		}
+	};
+
+	maybeSyncOfficialLiveCandles = () => {
+		if (
+			this.officialCandlePollInFlight
+			|| this.officialCandlePollTimer
+			|| this.state.isLoading
+		) {
+			return;
+		}
+
+		const granularity = Number(this.getLoadedCandleGranularity());
+		const currentCandleTime = Number(this.state.currentCandle?.time);
+
+		if (!Number.isFinite(granularity) || granularity <= 0) return;
+		if (!Number.isFinite(currentCandleTime) || currentCandleTime <= 0) return;
+
+		const nowSec = Math.floor(Date.now() / 1000);
+		const nowBucket = Math.floor(nowSec / granularity) * granularity;
+		if (!(nowBucket > currentCandleTime)) return;
+
+		const lastSync = Number(this.lastOfficialCandleSyncAt) || 0;
+		if (nowSec - lastSync < granularity) return;
+
+		this.lastOfficialCandleSyncAt = nowSec;
+		// Wait ≥1s after the bucket rolls so Coinbase can settle closed candles.
+		this.officialCandlePollTimer = window.setTimeout(() => {
+			this.officialCandlePollTimer = null;
+			this.fetchOfficialCandlesOnNewLiveTime();
+		}, 1000);
+	};
+
+	fetchOfficialCandlesOnNewLiveTime = () => {
+		if (this.officialCandlePollInFlight || this.state.isLoading) return;
+
+		const endTime = Math.floor(Date.now() / 1000);
+		if (!Number.isFinite(endTime) || endTime <= 0) return;
+
+		const series = this.buildDisplayCandles(
+			this.state.historicalCandles,
+			this.state.currentCandle,
+		);
+		// FROM = time of the candle 4 from the end. Sparse Coinbase buckets mean
+		// a wall-clock window can return fewer candles than the count implies.
+		const fromIndex = Math.max(0, series.length - 4);
+		const startTime = Number(series[fromIndex]?.time);
+
+		if (!Number.isFinite(startTime) || startTime <= 0 || startTime >= endTime) return;
+
+		const requestId = ++this.officialCandlePollRequestId;
+		this.officialCandlePollInFlight = true;
+		console.log(`[candle] fetch from=${startTime} to=${endTime}`);
+
+		this.fetchOfficialRecentCandles(endTime, { startTime }).then(officialCandles => {
+			if (requestId !== this.officialCandlePollRequestId) return;
+			this.applyOfficialCoinbaseCandles(officialCandles);
+		}).finally(() => {
+			if (requestId === this.officialCandlePollRequestId) {
+				this.officialCandlePollInFlight = false;
+			}
+		});
 	};
 
 	buildDepthStateFromMessage = (prev, depthMessage, latestPrice) => {
@@ -2021,8 +2762,8 @@ class Home extends React.Component {
 				&& (!Number.isFinite(minPrice) || levelPrice >= minPrice)
 				&& (!Number.isFinite(maxPrice) || levelPrice <= maxPrice);
 		};
-		const bids = this.mergeDepthLevels(prev.depth.bids, depthMessage.depth.bids.filter(isInRange));
-		const asks = this.mergeDepthLevels(prev.depth.asks, depthMessage.depth.asks.filter(isInRange));
+		const bids = depthMessage.depth.bids.filter(isInRange);
+		const asks = depthMessage.depth.asks.filter(isInRange);
 
 		if (!bids.length && !asks.length) return prev.depth;
 
@@ -2040,43 +2781,158 @@ class Home extends React.Component {
 		};
 	};
 
-	updateCurrentCandleOnChart = (currentCandle, highlightedIndex = this.state.hoveredVolumeIndex) => {
+	updateCurrentCandleOnChart = (
+		currentCandle,
+		highlightedIndex = this.state.hoveredVolumeIndex,
+		candles = this.state.candles,
+	) => {
 		if (!currentCandle || !this.candleSeries) return;
 
 		this.candleSeries.update(toChartPoint(currentCandle));
 
-		if (!this.volumeSeries) return;
+		if (this.volumeSeries) {
+			const resolvedHighlightIndex = Number.isFinite(highlightedIndex)
+				? highlightedIndex
+				: candles.length - 1;
 
-		this.volumeSeries.update({
-			time: toChartTime(currentCandle.time),
-			value: this.getCandleVolumeUsd(currentCandle),
-			color: this.getVolumeBarColor(
-				currentCandle,
-				highlightedIndex === this.state.candles.length - 1,
-			),
-		});
-		this.syncBullseyeViewIfActive();
+			this.volumeSeries.update({
+				time: toChartTime(currentCandle.time),
+				value: this.getCandleVolumeUsd(currentCandle),
+				color: this.getVolumeBarColor(
+					currentCandle,
+					resolvedHighlightIndex === candles.length - 1,
+				),
+			});
+		}
 	};
 
 	syncCandleSeries = (candles = this.state.candles) => {
 		if (!Array.isArray(candles) || !candles.length) return;
 
 		this.candleSeries?.setData(toChartData(candles));
+		this.plottedCandles = candles;
 		this.syncVolumeSeries(candles);
 		this.syncMacdOverlay(candles);
 		this.syncBullseyeViewIfActive();
+
+		if (this.state.measurementStart) {
+			this.scheduleOverlayUpdate();
+		}
 	};
 
 	syncMacdOverlay = (candles = this.state.candles) => {
 		this.cachedMacdPoints = this.buildMacdData(candles);
 		this.cachedPvtPoints = this.buildPvtSeriesData(candles);
+		this.cachedMacdOverlayKey = null;
+		this.cachedMacdOverlayModel = null;
 	};
 
-	loadOlderCandles = () => {
+	scheduleOlderCandlesLoad = (
+		targetFrom,
+		delay = OLDER_CANDLES_INTERACTION_IDLE_MS,
+	) => {
+		if (!Number.isFinite(targetFrom)) return;
+
+		this.pendingOlderCandlesTargetFrom = targetFrom;
+
+		if (this.olderCandlesLoadTimer) {
+			window.clearTimeout(this.olderCandlesLoadTimer);
+			this.olderCandlesLoadTimer = null;
+		}
+
+		if (this.olderCandlesLoadInFlight) return;
+
+		this.olderCandlesLoadTimer = window.setTimeout(() => {
+			this.olderCandlesLoadTimer = null;
+			this.pendingOlderCandlesTargetFrom = null;
+			this.loadOlderCandles();
+		}, delay);
+	};
+
+	finishOlderCandlesLoad = (callback, nextLoadDelay = OLDER_CANDLES_INTERACTION_IDLE_MS) => {
+		this.olderCandlesLoadInFlight = false;
+		this.setState({ isLoadingOlderCandles: false }, () => {
+			callback?.();
+
+			const range = this.chart?.timeScale()?.getVisibleLogicalRange?.();
+			if (
+				this.state.hasMoreOlderCandles
+				&& range
+				&& Number.isFinite(range.from)
+				&& range.from <= 24
+			) {
+				this.scheduleOlderCandlesLoad(range.from, nextLoadDelay);
+			}
+		});
+	};
+
+	applyOlderCandlesWhenIdle = ({
+		baseCurrency,
+		candles,
+		hasMore,
+		requestId,
+	}) => {
+		const idleFor = performance.now() - this.lastVisibleRangeChangeAt;
+
+		if (idleFor < OLDER_CANDLES_INTERACTION_IDLE_MS) {
+			if (this.olderCandlesApplyTimer) {
+				window.clearTimeout(this.olderCandlesApplyTimer);
+			}
+
+			this.olderCandlesApplyTimer = window.setTimeout(() => {
+				this.olderCandlesApplyTimer = null;
+				this.applyOlderCandlesWhenIdle({
+					baseCurrency,
+					candles,
+					hasMore,
+					requestId,
+				});
+			}, OLDER_CANDLES_INTERACTION_IDLE_MS - idleFor);
+			return;
+		}
+
 		if (
-			this.isMarketTransitioning
+			requestId !== this.marketRequestId
+			|| baseCurrency !== this.state.baseCurrency
+		) {
+			this.finishOlderCandlesLoad();
+			return;
+		}
+
+		if (!candles.length) {
+			this.setState({ hasMoreOlderCandles: hasMore }, () => {
+				this.finishOlderCandlesLoad();
+			});
+			return;
+		}
+
+		const candlesByTime = new Map();
+		[...candles, ...this.state.historicalCandles].forEach(candle => {
+			candlesByTime.set(Number(candle.time), candle);
+		});
+		const historicalCandles = [...candlesByTime.values()]
+			.sort((left, right) => Number(left.time) - Number(right.time));
+
+		this.isApplyingOlderCandles = true;
+		this.setCandleData(historicalCandles, this.state.currentCandle, null, () => {
+			this.syncCandleSeries(this.state.candles);
+			this.syncVwapSeries(this.state.candles);
+			this.syncTdSequentialSeries(this.state.tdSequential, this.state.candles);
+			this.refreshDepthRangeFromFirstLoad();
+			this.scheduleOverlayUpdate();
+			this.setState({ hasMoreOlderCandles: hasMore }, () => {
+				this.isApplyingOlderCandles = false;
+				this.syncBullseyeViewIfActive();
+				this.finishOlderCandlesLoad();
+			});
+		});
+	};
+
+	loadOlderCandles = async () => {
+		if (
+			this.olderCandlesLoadInFlight
+			|| this.isMarketTransitioning
 			|| this.state.isLoading
-			|| this.state.isLoadingOlderCandles
 			|| !this.state.hasMoreOlderCandles
 			|| !this.state.candles.length
 		) {
@@ -2091,65 +2947,44 @@ class Home extends React.Component {
 
 		if (!baseCurrency || !Number.isFinite(oldestTime) || !Number.isFinite(granularity)) return;
 
+		this.olderCandlesLoadInFlight = true;
 		this.setState({ isLoadingOlderCandles: true });
 
-		api.getCandles({
-			product_id: `${baseCurrency}-USD`,
-			days: Number(this.state.loadedPeriodDays) || DEFAULT_PERIOD_DAYS,
-			granularity,
-			end_time: Math.max(0, oldestTime - 1),
-			limit: 300,
-			_: Date.now(),
-		}).then(response => {
-			if (requestId !== this.marketRequestId || baseCurrency !== this.state.baseCurrency) return;
+		try {
+			const response = await api.getCandles({
+				product_id: `${baseCurrency}-USD`,
+				days: Number(this.state.loadedPeriodDays) || DEFAULT_PERIOD_DAYS,
+				granularity,
+				end_time: Math.max(0, oldestTime - 1),
+				limit: OLDER_CANDLES_BATCH_SIZE,
+				_: Date.now(),
+			});
+
+			if (
+				requestId !== this.marketRequestId
+				|| baseCurrency !== this.state.baseCurrency
+			) {
+				this.finishOlderCandlesLoad();
+				return;
+			}
 
 			const olderCandles = this.parseCandlesResponse(response.data).candles
 				.filter(candle => Number(candle.time) < oldestTime);
 
-			if (!olderCandles.length) {
-				this.setState({
-					isLoadingOlderCandles: false,
-					hasMoreOlderCandles: false,
-				});
+			this.applyOlderCandlesWhenIdle({
+				baseCurrency,
+				candles: olderCandles,
+				hasMore: olderCandles.length > 0,
+				requestId,
+			});
+		} catch {
+			if (requestId !== this.marketRequestId) {
+				this.finishOlderCandlesLoad();
 				return;
 			}
 
-			const candlesByTime = new Map();
-
-			[...olderCandles, ...this.state.historicalCandles].forEach(candle => {
-				candlesByTime.set(Number(candle.time), candle);
-			});
-
-			const historicalCandles = [...candlesByTime.values()]
-				.sort((a, b) => Number(a.time) - Number(b.time));
-
-			this.setCandleData(historicalCandles, this.state.currentCandle, null, () => {
-				this.syncCandleSeries(this.state.candles);
-				this.syncVwapSeries(this.state.candles);
-				this.syncTdSequentialSeries(this.state.tdSequential, this.state.candles);
-
-				window.requestAnimationFrame(() => {
-					this.setState({
-						isLoadingOlderCandles: false,
-					}, () => {
-						this.scheduleOverlayUpdate();
-
-						const nextRange = this.chart?.timeScale().getVisibleLogicalRange?.();
-
-						if (nextRange && Number.isFinite(nextRange.from) && nextRange.from < 24) {
-							window.setTimeout(this.loadOlderCandles, 0);
-						}
-					});
-				});
-			});
-		}).catch(() => {
-			if (requestId !== this.marketRequestId) return;
-
-			this.setState({
-				isLoadingOlderCandles: false,
-				hasMoreOlderCandles: false,
-			});
-		});
+			this.finishOlderCandlesLoad(null, OLDER_CANDLES_RETRY_MS);
+		}
 	};
 
 	getDefaultViewportLogicalRange = (candles) => {
@@ -2165,19 +3000,6 @@ class Home extends React.Component {
 			from: firstIndex,
 			to: lastIndex + timelinePaddingBars,
 		};
-	};
-
-	getCandlesForDefaultViewport = (candles) => {
-		if (!Array.isArray(candles) || !candles.length) return candles;
-
-		const periodDays = Number(this.state.loadedPeriodDays || this.state.periodDays) || DEFAULT_PERIOD_DAYS;
-		const loadedTo = Number(candles[candles.length - 1].time);
-
-		if (!Number.isFinite(loadedTo)) return candles;
-
-		const fromTime = loadedTo - periodDays * 24 * 3600;
-
-		return candles.filter(candle => Number(candle.time) >= fromTime);
 	};
 
 	getDepthRangeForCandles = (candles) => {
@@ -2199,8 +3021,7 @@ class Home extends React.Component {
 	};
 
 	refreshDepthRangeFromFirstLoad = () => {
-		const candles = this.getCandlesForDefaultViewport(this.state.candles);
-		const depthRange = this.getDepthRangeForCandles(candles);
+		const depthRange = this.getDepthRangeForCandles(this.state.candles);
 		const baseCurrency = this.state.baseCurrency.trim().toUpperCase();
 
 		if (!depthRange || !baseCurrency) {
@@ -2268,36 +3089,6 @@ class Home extends React.Component {
 		return { candles, priceRange };
 	};
 
-	getPinnedMarketDepthRange = () => this.pinnedMarketDepthRange;
-
-	mergeDepthLevels = (previousLevels, nextLevels) => {
-		const merged = new Map();
-
-		(Array.isArray(previousLevels) ? previousLevels : []).forEach(level => {
-			const price = Number(level?.price);
-
-			if (Number.isFinite(price)) {
-				merged.set(price, level);
-			}
-		});
-
-		(Array.isArray(nextLevels) ? nextLevels : []).forEach(level => {
-			const price = Number(level?.price);
-			const size = Number(level?.size);
-
-			if (!Number.isFinite(price)) return;
-
-			if (!Number.isFinite(size) || size <= 0) {
-				merged.delete(price);
-				return;
-			}
-
-			merged.set(price, level);
-		});
-
-		return Array.from(merged.values());
-	};
-
 	applyDefaultVisibleRange = (candles = this.state.candles) => {
 		if (this.state.isBullseyeViewActive) {
 			this.frameChartTo24hFocus();
@@ -2310,8 +3101,7 @@ class Home extends React.Component {
 
 		if (!logicalRange || !this.chart.timeScale().setVisibleLogicalRange) return false;
 
-		// Autoscale changes LWC's log formula — drop any wheel freeze.
-		this.lockedLogFormula = null;
+		this.priceScaleLogZoomFormula = null;
 		this.getMainPriceScale()?.applyOptions({
 			autoScale: true,
 			scaleMargins: { ...DEFAULT_PRICE_SCALE_MARGINS },
@@ -2323,23 +3113,12 @@ class Home extends React.Component {
 		requestAnimationFrame(() => {
 			if (!this.chart) return;
 
-			this.lockedLogFormula = null;
 			this.getMainPriceScale()?.applyOptions({ autoScale: true });
 			this.scheduleOverlayUpdate();
+			this.syncPriceScaleMinMoveFromViewport();
 		});
 
 		return true;
-	};
-
-	refitViewport = () => {
-		if (this.applyDefaultVisibleRange()) return;
-
-		if (!this.chart) return;
-
-		this.lockedLogFormula = null;
-		this.chart.priceScale('right').applyOptions({ autoScale: true });
-		this.chart.timeScale().fitContent();
-		this.scheduleOverlayUpdate();
 	};
 
 	frameChartTo24hFocus = () => {
@@ -2347,29 +3126,36 @@ class Home extends React.Component {
 
 		if (!this.chart || !Array.isArray(candles) || !candles.length) return;
 
-		const lastIndex = candles.length - 1;
-		const latestTime = Number(candles[lastIndex].time);
+		const granularity = Number(this.getLoadedCandleGranularity());
+		const nowSec = Date.now() / 1000;
+		const nowBucket = Number.isFinite(granularity) && granularity > 0
+			? Math.floor(nowSec / granularity) * granularity
+			: nowSec;
 
-		if (!Number.isFinite(latestTime)) return;
+		let lastIndex = candles.length - 1;
 
-		const cutoff24 = latestTime - 24 * 60 * 60;
-		let first24Index = 0;
-
-		for (let index = lastIndex; index >= 0; index -= 1) {
-			if (Number(candles[index].time) < cutoff24) {
-				first24Index = index + 1;
-				break;
-			}
+		while (lastIndex > 0 && Number(candles[lastIndex].time) > nowBucket) {
+			lastIndex -= 1;
 		}
 
-		const bars24 = Math.max(1, lastIndex - first24Index + 1);
-		// Center the 24h block in the middle third: one third before, one third after.
-		const from = first24Index - bars24;
-		const to = lastIndex + bars24;
+		const now = Number(candles[lastIndex].time);
 
-		this.isApplyingBullseyeFrame = true;
-		this.chart.timeScale().applyOptions({ rightOffset: 0 });
-		this.chart.timeScale().setVisibleLogicalRange?.({ from, to });
+		if (!Number.isFinite(now)) return;
+
+		const cutoff24 = now - 24 * 60 * 60;
+		let n = 0;
+
+		for (let index = lastIndex; index >= 0; index -= 1) {
+			if (Number(candles[index].time) < cutoff24) break;
+			n += 1;
+		}
+
+		if (n < 1) return;
+
+		const nPlusNIndex = lastIndex - n - n + 1;
+		const from = nPlusNIndex;
+		const to = from + n + n + n - 1;
+		const first24Index = nPlusNIndex >= 0 ? nPlusNIndex + n : lastIndex - n + 1;
 
 		let min = Infinity;
 		let max = -Infinity;
@@ -2399,35 +3185,40 @@ class Home extends React.Component {
 			max = Math.max(max, min * 1.000001);
 		}
 
-		// Use the chart's own autoscale path (works for both linear and log).
-		// scaleMargins put 24h high/low in the middle third without expanding
-		// the labeled range into absurdly low log prices.
 		this.manualPriceRange = null;
-		this.lockedLogFormula = null;
+		this.priceScaleLogZoomFormula = null;
 		this.bullseyePriceRange = { min, max };
 
 		const priceScale = this.getMainPriceScale();
+		const current = this.chart.timeScale().getVisibleLogicalRange?.();
+		const rangeNeedsUpdate = (
+			!current
+			|| Math.abs(current.from - from) > 1e-4
+			|| Math.abs(current.to - to) > 1e-4
+		);
 
+		if (this.bullseyeFrameRaf != null) {
+			window.cancelAnimationFrame(this.bullseyeFrameRaf);
+			this.bullseyeFrameRaf = null;
+		}
+
+		this.isApplyingBullseyeFrame = true;
 		priceScale?.applyOptions({
 			autoScale: true,
 			scaleMargins: { ...FRAME_24H_PRICE_SCALE_MARGINS },
 			mode: this.state.isLogPriceScale ? PriceScaleMode.Logarithmic : PriceScaleMode.Normal,
 		});
-
-		// Nudge the series so autoscaleInfoProvider is re-evaluated.
 		this.candleSeries?.applyOptions({});
-
-		this.scheduleOverlayUpdate();
-		requestAnimationFrame(() => {
-			this.lockedLogFormula = null;
-			priceScale?.applyOptions({
-				autoScale: true,
-				scaleMargins: { ...FRAME_24H_PRICE_SCALE_MARGINS },
+		if (rangeNeedsUpdate) {
+			this.chart.timeScale().setVisibleLogicalRange?.({ from, to });
+		}
+		this.bullseyeFrameRaf = window.requestAnimationFrame(() => {
+			this.bullseyeFrameRaf = window.requestAnimationFrame(() => {
+				this.bullseyeFrameRaf = null;
+				this.isApplyingBullseyeFrame = false;
 			});
-			this.candleSeries?.applyOptions({});
-			this.isApplyingBullseyeFrame = false;
-			this.scheduleOverlayUpdate();
 		});
+		this.scheduleOverlayUpdate();
 	};
 
 	setBullseyeViewActive = (isActive) => {
@@ -2436,8 +3227,6 @@ class Home extends React.Component {
 		if (nextActive) {
 			this.setState({
 				isBullseyeViewActive: true,
-				showBullseyeLockNotice: this.state.showBullseyeLockNotice,
-				isBullseyeLockNoticeClosing: this.state.isBullseyeLockNoticeClosing,
 			}, () => {
 				this.applyChartInteractionLock(true);
 				this.frameChartTo24hFocus();
@@ -2453,22 +3242,33 @@ class Home extends React.Component {
 		const scaleMargins = priceScale?.options?.()?.scaleMargins
 			? { ...priceScale.options().scaleMargins }
 			: null;
+		const isLog = this.state.isLogPriceScale;
+		const bullseyeRange = (
+			this.bullseyePriceRange
+			&& Number.isFinite(this.bullseyePriceRange.min)
+			&& Number.isFinite(this.bullseyePriceRange.max)
+			&& this.bullseyePriceRange.max > this.bullseyePriceRange.min
+		)
+			? { min: this.bullseyePriceRange.min, max: this.bullseyePriceRange.max }
+			: null;
 
 		let lockedLinearFrom = null;
 		let lockedLinearTo = null;
 
+		const visFrom = Number(visibleRange?.from);
+		const visTo = Number(visibleRange?.to);
+
 		if (
-			visibleRange
-			&& Number.isFinite(visibleRange.from)
-			&& Number.isFinite(visibleRange.to)
+			Number.isFinite(visFrom)
+			&& Number.isFinite(visTo)
+			&& visTo !== visFrom
 		) {
-			lockedLinearFrom = Math.min(visibleRange.from, visibleRange.to);
-			lockedLinearTo = Math.max(visibleRange.from, visibleRange.to);
-			// Bullseye used autoScale — LWC formula may have changed; refreeze from current range.
-			this.lockedLogFormula = null;
+			lockedLinearFrom = Math.min(visFrom, visTo);
+			lockedLinearTo = Math.max(visFrom, visTo);
 			if (
 				!this.lockMainPriceVisibleRange(lockedLinearFrom, lockedLinearTo, {
-					isLog: this.state.isLogPriceScale,
+					isLog,
+					syncMinMove: false,
 					...(scaleMargins ? { scaleMargins } : {}),
 				})
 			) {
@@ -2478,13 +3278,32 @@ class Home extends React.Component {
 			priceScale?.applyOptions({ autoScale: false });
 		}
 
+		// Tick from the current span only — do not write setVisibleRange again.
+		const tickMin = (
+			lockedLinearFrom != null
+			&& lockedLinearTo != null
+			&& lockedLinearTo > lockedLinearFrom
+		)
+			? lockedLinearFrom
+			: bullseyeRange?.min;
+		const tickMax = (
+			lockedLinearFrom != null
+			&& lockedLinearTo != null
+			&& lockedLinearTo > lockedLinearFrom
+		)
+			? lockedLinearTo
+			: bullseyeRange?.max;
+
+		if (Number.isFinite(tickMin) && Number.isFinite(tickMax) && tickMax > tickMin) {
+			this.applyPriceScaleMinMoveForCurrentRange(tickMin, tickMax);
+		}
+
 		this.manualPriceRange = null;
 		this.bullseyePriceRange = null;
 
 		this.setState({
 			isBullseyeViewActive: false,
-			showBullseyeLockNotice: false,
-			isBullseyeLockNoticeClosing: false,
+			chartNotice: null,
 		}, () => {
 			this.applyChartInteractionLock(false);
 
@@ -2494,9 +3313,14 @@ class Home extends React.Component {
 				&& lockedLinearTo > lockedLinearFrom
 			) {
 				this.lockMainPriceVisibleRange(lockedLinearFrom, lockedLinearTo, {
-					isLog: this.state.isLogPriceScale,
+					isLog,
+					syncMinMove: false,
 					...(scaleMargins ? { scaleMargins } : {}),
 				});
+			}
+
+			if (Number.isFinite(tickMin) && Number.isFinite(tickMax) && tickMax > tickMin) {
+				this.applyPriceScaleMinMoveForCurrentRange(tickMin, tickMax);
 			}
 
 			if (
@@ -2507,19 +3331,19 @@ class Home extends React.Component {
 				this.chart?.timeScale()?.setVisibleLogicalRange?.(logicalRange);
 			}
 
-			if (this.bullseyeLockNoticeDebounceTimer) {
-				window.clearTimeout(this.bullseyeLockNoticeDebounceTimer);
-				this.bullseyeLockNoticeDebounceTimer = null;
+			if (this.chartNoticeDebounceTimer) {
+				window.clearTimeout(this.chartNoticeDebounceTimer);
+				this.chartNoticeDebounceTimer = null;
 			}
 
-			if (this.bullseyeLockNoticeHideTimer) {
-				window.clearTimeout(this.bullseyeLockNoticeHideTimer);
-				this.bullseyeLockNoticeHideTimer = null;
+			if (this.chartNoticeHideTimer) {
+				window.clearTimeout(this.chartNoticeHideTimer);
+				this.chartNoticeHideTimer = null;
 			}
 
-			if (this.bullseyeLockNoticeCloseTimer) {
-				window.clearTimeout(this.bullseyeLockNoticeCloseTimer);
-				this.bullseyeLockNoticeCloseTimer = null;
+			if (this.chartNoticeCloseTimer) {
+				window.clearTimeout(this.chartNoticeCloseTimer);
+				this.chartNoticeCloseTimer = null;
 			}
 
 			this.scheduleOverlayUpdate();
@@ -2552,25 +3376,189 @@ class Home extends React.Component {
 		return getBookmarkedPrice(normalizedCurrency);
 	};
 
+	getCachedAvgEntryPrice = (currency, avgEntries = this.state.appAvgEntries) => {
+		const normalizedCurrency = String(currency || "").trim().toUpperCase();
+
+		if (!normalizedCurrency || !avgEntries || typeof avgEntries !== "object") {
+			return null;
+		}
+
+		const avgPrice = Number(avgEntries[normalizedCurrency]?.avgPrice);
+
+		return Number.isFinite(avgPrice) && avgPrice > 0 ? avgPrice : null;
+	};
+
+	getProfileBalanceForCurrency = (currency, profile = this.state.profile) => {
+		const normalizedCurrency = String(currency || "").trim().toUpperCase();
+
+		if (!normalizedCurrency) return null;
+
+		const balances = Array.isArray(profile?.balances) ? profile.balances : [];
+
+		return balances.find(item => (
+			String(item?.currency || "").trim().toUpperCase() === normalizedCurrency
+		)) || null;
+	};
+
+	hasMaterialAvgEntryBalance = (currency, state = this.state) => {
+		const balance = this.getProfileBalanceForCurrency(currency, state.profile);
+
+		if (!balance) return false;
+
+		const value = this.getBalanceUsdValueForDisplay(balance, state);
+
+		return Number.isFinite(value) && value >= AVG_ENTRY_MIN_USD;
+	};
+
+	getAvgEntryPriceForDisplay = (
+		currency,
+		state = this.state,
+		avgEntries = state.appAvgEntries,
+	) => {
+		if (!this.hasMaterialAvgEntryBalance(currency, state)) {
+			return null;
+		}
+
+		return this.getCachedAvgEntryPrice(currency, avgEntries);
+	};
+
+	syncAvgEntryPriceForDisplay = () => {
+		const currency = String(this.state.baseCurrency || "").trim().toUpperCase();
+		const nextPrice = this.getAvgEntryPriceForDisplay(currency);
+
+		if (this.state.avgEntryPrice === nextPrice) return;
+
+		this.setState({ avgEntryPrice: nextPrice }, this.scheduleOverlayUpdate);
+	};
+
+	getBalanceUsdValueForDisplay = (balance, state = this.state) => {
+		const currency = String(balance?.currency || "").trim().toUpperCase();
+
+		if (currency === "USD" || currency === "USDC") {
+			return Number(balance?.total);
+		}
+
+		const baseCurrency = String(state.baseCurrency || "").trim().toUpperCase();
+		const amount = Number(balance?.total);
+
+		if (currency === baseCurrency) {
+			const livePrice = Number(this.getOverlayMarketPrice(state));
+
+			if (
+				Number.isFinite(livePrice)
+				&& livePrice > 0
+				&& Number.isFinite(amount)
+				&& amount > 0
+			) {
+				return amount * livePrice;
+			}
+		}
+
+		return Number(balance?.usd_value);
+	};
+
+	getSellOrderCoinsUsdValue = (order, state = this.state) => {
+		const currency = getCurrencyFromProductId(order?.product_id);
+		const size = Number(getOrderDisplayAmount(order));
+
+		if (!currency || !(size > 0)) return NaN;
+
+		const avgPrice = this.getCachedAvgEntryPrice(currency, state.appAvgEntries);
+
+		if (!Number.isFinite(avgPrice) || avgPrice <= 0) return NaN;
+
+		return size * avgPrice;
+	};
+
+	/** Selected chart coin wallet size × live price (mark-to-market USD). */
+	getSelectedCoinBagUsdNotional = (state = this.state) => {
+		const currency = String(state.baseCurrency || "").trim().toUpperCase();
+
+		if (!currency || currency === "USD" || currency === "USDC") {
+			return null;
+		}
+
+		const balances = Array.isArray(state.profile?.balances) ? state.profile.balances : [];
+		const match = balances.find(item => (
+			String(item?.currency || "").trim().toUpperCase() === currency
+		));
+		const amount = Number(match?.total);
+		const livePrice = Number(this.getOverlayMarketPrice(state));
+		const candleClose = Number(state.candles?.[state.candles.length - 1]?.close);
+		const price = (
+			Number.isFinite(livePrice) && livePrice > 0
+				? livePrice
+				: candleClose
+		);
+
+		if (!(Number.isFinite(amount) && amount > 0 && Number.isFinite(price) && price > 0)) {
+			return null;
+		}
+
+		return amount * price;
+	};
+
+	getProfileTotalUsdForDisplay = (state = this.state) => {
+		const profile = state.profile;
+		const apiTotal = Number(profile?.total_usd);
+		const balances = Array.isArray(profile?.balances) ? profile.balances : [];
+		const baseCurrency = String(state.baseCurrency || "").trim().toUpperCase();
+		const livePrice = Number(this.getOverlayMarketPrice(state));
+
+		if (!balances.length || !Number.isFinite(apiTotal)) {
+			return apiTotal;
+		}
+
+		if (!Number.isFinite(livePrice) || livePrice <= 0) {
+			return apiTotal;
+		}
+
+		const match = balances.find(item => (
+			String(item?.currency || "").trim().toUpperCase() === baseCurrency
+		));
+
+		if (!match) return apiTotal;
+
+		const amount = Number(match.total);
+		const staleValue = Number(match.usd_value);
+
+		if (!Number.isFinite(amount) || amount <= 0 || !Number.isFinite(staleValue)) {
+			return apiTotal;
+		}
+
+		const liveValue = amount * livePrice;
+
+		return Number.isFinite(liveValue) ? apiTotal - staleValue + liveValue : apiTotal;
+	};
+
 	getBalanceBookmarkDelta = (balance) => {
 		const currency = String(balance?.currency || "").trim().toUpperCase();
 
 		if (!currency || currency === "USD" || currency === "USDC") return null;
 
 		const bookmarkedPrice = this.getBookmarkedPriceForCurrency(currency);
+		const avgPrice = this.getCachedAvgEntryPrice(currency);
+		const referencePrice = (
+			Number.isFinite(bookmarkedPrice) && bookmarkedPrice > 0
+				? bookmarkedPrice
+				: avgPrice
+		);
 		let currentPrice = Number(balance?.usd_price);
+		const baseCurrency = String(this.state.baseCurrency || "").trim().toUpperCase();
 
-		if (!Number.isFinite(currentPrice) || currentPrice <= 0) {
-			const baseCurrency = String(this.state.baseCurrency || "").trim().toUpperCase();
+		if (currency === baseCurrency) {
+			const livePrice = Number(this.getOverlayMarketPrice());
 
-			if (currency === baseCurrency) {
-				currentPrice = Number(this.getOverlayMarketPrice());
+			if (Number.isFinite(livePrice) && livePrice > 0) {
+				currentPrice = livePrice;
 			}
+		} else if (!Number.isFinite(currentPrice) || currentPrice <= 0) {
+			currentPrice = NaN;
 		}
 
 		if (
-			!Number.isFinite(bookmarkedPrice) ||
-			bookmarkedPrice <= 0 ||
+			!Number.isFinite(referencePrice) ||
+			referencePrice <= 0 ||
 			!Number.isFinite(currentPrice) ||
 			currentPrice <= 0
 		) {
@@ -2578,8 +3566,8 @@ class Home extends React.Component {
 		}
 
 		const balanceAmount = Number(balance?.total);
-		const deltaPerUnit = currentPrice - bookmarkedPrice;
-		const deltaPercent = (deltaPerUnit / bookmarkedPrice) * 100;
+		const deltaPerUnit = currentPrice - referencePrice;
+		const deltaPercent = (deltaPerUnit / referencePrice) * 100;
 
 		if (!Number.isFinite(deltaPercent)) return null;
 
@@ -2588,6 +3576,7 @@ class Home extends React.Component {
 
 		return {
 			isPositive: deltaPercent >= 0,
+			fromBookmark: Number.isFinite(bookmarkedPrice) && bookmarkedPrice > 0,
 			label: Number.isFinite(deltaUsd)
 				? `${formatSignedUsdCents(deltaUsd)} (${formatSignedPercent(deltaPercent)})`
 				: formatSignedPercent(deltaPercent),
@@ -2595,7 +3584,7 @@ class Home extends React.Component {
 		};
 	};
 
-	applyAppState = (appState) => {
+	applyAppState = (appState, change = null) => {
 		const bookmarks = appState?.yzTrade?.bookmarks;
 		const appBookmarks = bookmarks && typeof bookmarks === "object" && !Array.isArray(bookmarks)
 			? Object.fromEntries(
@@ -2604,8 +3593,60 @@ class Home extends React.Component {
 					.filter(([currency, price]) => currency && price !== null)
 			)
 			: {};
+		const rawAvgEntries = appState?.yzTrade?.avgEntries;
+		let appAvgEntries = rawAvgEntries && typeof rawAvgEntries === "object" && !Array.isArray(rawAvgEntries)
+			? Object.fromEntries(
+				Object.entries(rawAvgEntries)
+					.map(([currency, entry]) => {
+						const normalizedCurrency = String(currency || "").trim().toUpperCase();
+						if (!normalizedCurrency || !entry || typeof entry !== "object") return null;
+
+						const avgPrice = Number(entry.avgPrice);
+						const qty = Number(entry.qty);
+						const nullDate = String(entry.nullDate || "").trim() || null;
+
+						return [
+							normalizedCurrency,
+							{
+								nullDate,
+								avgPrice: Number.isFinite(avgPrice) && avgPrice > 0 ? avgPrice : null,
+								qty: Number.isFinite(qty) && qty > 0 ? qty : 0,
+							},
+						];
+					})
+					.filter(Boolean)
+			)
+			: {};
+
+		// Live avg pushes land in change; merge so the chart updates even if state is briefly stale.
+		if (
+			change
+			&& typeof change === "object"
+			&& String(change.type || "") === "avg_entry_updated"
+		) {
+			const changeCurrency = String(change.currency || "").trim().toUpperCase();
+			const changeAvg = Number(change.avg_price);
+			const changeQty = Number(change.qty);
+
+			if (changeCurrency) {
+				appAvgEntries = {
+					...appAvgEntries,
+					[changeCurrency]: {
+						nullDate: String(change.null_date || "").trim() || null,
+						avgPrice: Number.isFinite(changeAvg) && changeAvg > 0 ? changeAvg : null,
+						qty: Number.isFinite(changeQty) && changeQty > 0 ? changeQty : 0,
+					},
+				};
+			}
+		}
+
 		const currency = this.state.baseCurrency;
 		const bookmarkedPrice = this.getBookmarkedPriceForCurrency(currency);
+		const cachedAvgEntryPrice = this.getAvgEntryPriceForDisplay(
+			currency,
+			{ ...this.state, appAvgEntries },
+			appAvgEntries,
+		);
 		const settings = appState?.yzTrade?.settings;
 		const balanceHistoryPeriod = normalizeBalanceHistoryPeriod(
 			settings?.balanceHistoryPeriod,
@@ -2622,8 +3663,10 @@ class Home extends React.Component {
 
 		this.setState({
 			appBookmarks,
+			appAvgEntries,
 			appSettings,
 			bookmarkedPrice,
+			avgEntryPrice: cachedAvgEntryPrice,
 			...(periodChanged
 				? {
 					balanceHistoryPeriod,
@@ -2657,7 +3700,7 @@ class Home extends React.Component {
 		api.getAppState().then(response => {
 			this.applyAppState(response.data);
 		}).catch(() => {
-			this.setState({ appBookmarks: null });
+			this.setState({ appBookmarks: null, appAvgEntries: null });
 		})
 	);
 
@@ -2757,7 +3800,7 @@ class Home extends React.Component {
 			if (message.type === "heartbeat") return;
 			if (message.type !== "app_state") return;
 
-			this.applyAppState(message.state);
+			this.applyAppState(message.state, message.change);
 		};
 
 		socket.onerror = () => {
@@ -2778,12 +3821,18 @@ class Home extends React.Component {
 	disconnectLiveMarket = () => {
 		this.isDisconnectingLive = true;
 		this.clearTdRefreshTimers();
+		this.stopOfficialCandlePoll();
 
 		if (this.liveReconnectTimer) {
 			window.clearTimeout(this.liveReconnectTimer);
 			this.liveReconnectTimer = null;
 		}
 
+		this.rememberLiveCandleBucketTime(
+			this.state.currentCandle?.time
+			?? this.state.historicalCandles?.[this.state.historicalCandles.length - 1]?.time
+		);
+		this.marketSubscribeCount = 0;
 		this.liveReconnectAttempt = 0;
 		this.liveReconnectConfig = null;
 		this.closeLiveSocketOnly();
@@ -2809,6 +3858,7 @@ class Home extends React.Component {
 		const socket = this.liveSocket;
 		this.liveSocket = null;
 		this.liveProductId = null;
+		this.liveTradesAfterAtMs = null;
 		socket.onopen = null;
 		socket.onmessage = null;
 		socket.onerror = null;
@@ -2833,8 +3883,6 @@ class Home extends React.Component {
 		this.scheduleLiveWatchdog();
 	};
 
-	getLiveLogTimestamp = () => new Date().toISOString();
-
 	scheduleLiveWatchdog = () => {
 		if (this.isDisconnectingLive || !this.liveSocket) return;
 
@@ -2850,12 +3898,6 @@ class Home extends React.Component {
 				return;
 			}
 
-			console.warn("[live] market watchdog stale; closing socket to reconnect", {
-				timestamp: this.getLiveLogTimestamp(),
-				productId: this.liveProductId,
-				elapsed,
-				timeout: LIVE_STALE_TIMEOUT_MS,
-			});
 			socket.close();
 		}, LIVE_STALE_TIMEOUT_MS);
 	};
@@ -2872,12 +3914,6 @@ class Home extends React.Component {
 		const jitter = Math.floor(Math.random() * 500);
 		const delay = baseDelay + jitter;
 
-		console.warn("[live] reconnect scheduled", {
-			timestamp: this.getLiveLogTimestamp(),
-			productId: this.liveReconnectConfig?.productId,
-			attempt: this.liveReconnectAttempt + 1,
-			delay,
-		});
 		this.liveReconnectAttempt += 1;
 		this.liveReconnectTimer = window.setTimeout(() => {
 			const config = this.liveReconnectConfig;
@@ -2886,11 +3922,6 @@ class Home extends React.Component {
 
 			if (!config) return;
 
-			console.warn("[live] reconnecting", {
-				timestamp: this.getLiveLogTimestamp(),
-				productId: config.productId,
-				attempt: this.liveReconnectAttempt,
-			});
 			this.openLiveSocket(config);
 		}, delay);
 	};
@@ -2946,11 +3977,6 @@ class Home extends React.Component {
 				return;
 			}
 
-			console.warn("[live] connect timeout; closing socket to reconnect", {
-				timestamp: this.getLiveLogTimestamp(),
-				productId,
-				readyState: socket.readyState,
-			});
 			socket.close();
 		}, LIVE_CONNECT_TIMEOUT_MS);
 
@@ -2961,10 +3987,6 @@ class Home extends React.Component {
 					this.liveConnectTimeout = null;
 				}
 
-				console.info("[live] socket open", {
-					timestamp: this.getLiveLogTimestamp(),
-					productId,
-				});
 				this.liveReconnectAttempt = 0;
 				this.scheduleLiveWatchdog();
 			}
@@ -2989,22 +4011,19 @@ class Home extends React.Component {
 
 			if (message.type === "subscribed") {
 				if (message.stream === "market") {
-					console.info("[live] market subscribed", {
-						timestamp: this.getLiveLogTimestamp(),
-						productId: message.product_id,
-					});
+					const cutoffMs = Date.parse(message.coinbase_time);
+
+					if (Number.isFinite(cutoffMs)) {
+						this.liveTradesAfterAtMs = cutoffMs;
+					}
+
 					this.markLiveConnected();
+					this.marketSubscribeCount += 1;
+					if (this.marketSubscribeCount > 1) {
+						this.backfillCandlesAfterReconnect();
+					}
 				} else if (message.stream === "orders") {
-					console.info("[live] orders subscribed", {
-						timestamp: this.getLiveLogTimestamp(),
-						productId: message.product_id,
-					});
 					this.setState({ orderError: "" });
-				} else if (message.stream === "depth") {
-					console.info("[live] depth subscribed", {
-						timestamp: this.getLiveLogTimestamp(),
-						productId: message.product_id,
-					});
 				}
 			} else if (message.type === "trade") {
 				this.markLiveConnected();
@@ -3022,13 +4041,10 @@ class Home extends React.Component {
 					orderError: message.message || "Live order stream failed.",
 				});
 			} else if (message.type === "error") {
-				console.error("[live] backend stream error", {
-					timestamp: message.timestamp || this.getLiveLogTimestamp(),
-					productId: message.product_id,
-					stream: message.stream,
-					message: message.message,
-					reconnectIn: message.reconnect_in,
-				});
+				this.rememberLiveCandleBucketTime(
+					this.state.currentCandle?.time
+					?? this.state.historicalCandles?.[this.state.historicalCandles.length - 1]?.time
+				);
 				this.setState({ isLive: false });
 			}
 		};
@@ -3036,10 +4052,6 @@ class Home extends React.Component {
 		socket.onerror = () => {
 			if (socket !== this.liveSocket) return;
 
-			console.error("[live] socket error", {
-				timestamp: this.getLiveLogTimestamp(),
-				productId,
-			});
 			this.setState({
 				error: "Live stream connection failed.",
 				isLive: false,
@@ -3058,11 +4070,11 @@ class Home extends React.Component {
 				this.liveConnectTimeout = null;
 			}
 
-			console.warn("[live] socket closed", {
-				timestamp: this.getLiveLogTimestamp(),
-				productId,
-			});
 			this.clearLiveWatchdog();
+			this.rememberLiveCandleBucketTime(
+				this.state.currentCandle?.time
+				?? this.state.historicalCandles?.[this.state.historicalCandles.length - 1]?.time
+			);
 			this.liveSocket = null;
 			this.setState({ isLive: false });
 
@@ -3110,6 +4122,8 @@ class Home extends React.Component {
 			this.applyLiveDepth(depth);
 		}
 
+		this.maybeSyncOfficialLiveCandles();
+
 		if (this.pendingLiveTrades.length || this.pendingLiveDepth) {
 			this.scheduleLiveFlush();
 		}
@@ -3137,25 +4151,12 @@ class Home extends React.Component {
 					&& (!Number.isFinite(minPrice) || price >= minPrice)
 					&& (!Number.isFinite(maxPrice) || price <= maxPrice);
 			};
-			const bids = this.mergeDepthLevels(prev.depth.bids, depth.bids.filter(isInRange));
-			const asks = this.mergeDepthLevels(prev.depth.asks, depth.asks.filter(isInRange));
+			const bids = depth.bids.filter(isInRange);
+			const asks = depth.asks.filter(isInRange);
 
 			if (!bids.length && !asks.length) return null;
 
-			let currentCandle = prev.currentCandle;
-
-			if (currentCandle && Number.isFinite(currentPrice)) {
-				currentCandle = {
-					...currentCandle,
-					high: Math.max(currentCandle.high, currentPrice),
-					low: Math.min(currentCandle.low, currentPrice),
-					close: currentPrice,
-				};
-			}
-
 			return {
-				currentCandle,
-				candles: this.buildDisplayCandles(prev.historicalCandles, currentCandle),
 				depth: {
 					...prev.depth,
 					min_price: minPrice,
@@ -3168,12 +4169,8 @@ class Home extends React.Component {
 				},
 			};
 		}, () => {
-			if (this.state.currentCandle) {
-				this.updateCurrentCandleOnChart(this.state.currentCandle);
-				this.syncVwapSeries(this.state.candles);
-			}
-
 			this.scheduleOverlayUpdate();
+			this.syncBullseyeViewIfActive();
 		});
 	};
 
@@ -3201,133 +4198,197 @@ class Home extends React.Component {
 			balanceGeneration,
 		);
 
-		if (this.isDuplicateOrderEvent(message.event_id)) return;
+		// event_id is a hash of the Coinbase event states, not of all_orders: it may
+		// only gate the balance refresh. all_orders is always merged.
+		const isDuplicateEvent = this.isDuplicateOrderEvent(message.event_id);
+		const incomingCount = Array.isArray(message.all_orders) ? message.all_orders.length : 0;
+		console.log("[orders_update]", JSON.stringify({
+			place: "applyLiveOrders.receive",
+			event_id: message.event_id || null,
+			product_id: message.product_id || null,
+			snapshot: Boolean(message.snapshot),
+			order_count: incomingCount,
+			duplicate_event: isDuplicateEvent,
+			balance_refresh_mode: message.balance_refresh_mode || null,
+			refresh_balances: Boolean(message.refresh_balances),
+		}));
 
-		const updatedOrders = Array.isArray(message.orders) ? message.orders : [];
-		const removedOrderIds = new Set(Array.isArray(message.removed_order_ids) ? message.removed_order_ids : []);
-
-		this.setState(prev => {
-			return {
-				orders: this.mergeOrderUpdates(prev.orders, updatedOrders, removedOrderIds),
-				allOrders: this.mergeOrderUpdates(prev.allOrders, updatedOrders, removedOrderIds),
-				orderError: "",
-				allOrdersError: "",
-			};
-		}, () => {
-			this.scheduleOverlayUpdate();
+		const refreshBalances = () => {
+			if (isDuplicateEvent) return;
 			const refreshMode = message.balance_refresh_mode;
 
 			if (refreshMode === "immediate") {
 				this.cancelPendingPartialFillBalanceRefresh();
 				this.loadProfile({
 					generation: balanceGeneration,
+					forceAvgEntry: true,
 				});
 			} else if (refreshMode === "debounced") {
 				this.schedulePartialFillBalanceRefresh(balanceGeneration);
 			}
+
+			this.loadAvgEntry({ force: true });
+		};
+
+		if (!Array.isArray(message.all_orders)) {
+			console.log("[orders_update]", JSON.stringify({
+				place: "applyLiveOrders.handle",
+				case: "none_no_all_orders",
+				duplicate_event: isDuplicateEvent,
+			}));
+			refreshBalances();
+			return;
+		}
+
+		const incomingOrders = message.all_orders;
+		this.lastOrdersSocketMergeAt = Date.now();
+		this.restartAllOrdersRefreshTimer();
+		let notices = [];
+		let mergeCases = [];
+
+		this.setState(prev => {
+			const adopted = this.adoptIncomingOrders(
+				prev.allOrders,
+				incomingOrders,
+				"applyLiveOrders.orders_update",
+			);
+			notices = adopted.notices;
+			mergeCases = adopted.mergeCases || [];
+
+			return {
+				allOrders: adopted.allOrders,
+				openOrderDrag: prev.openOrderDrag,
+				orderError: "",
+				allOrdersError: "",
+			};
+		}, () => {
+			console.log("[orders_update]", JSON.stringify({
+				place: "applyLiveOrders.handle",
+				case: mergeCases.length ? "merge_rows" : "none",
+				rows: mergeCases,
+				notice_count: notices.length,
+			}));
+			this.showMergeNotices(notices);
+			if (this.isOpenOrderPriceDragging) {
+				this.schedulePriceOverlayUpdate();
+			} else {
+				this.scheduleOverlayUpdate();
+			}
+			refreshBalances();
 		});
 	};
 
-	mergeOrderUpdates = (orders, updatedOrders, removedOrderIds) => {
-		const ordersById = new Map();
+	mergeOrderUpdates = (orders, updatedOrders) => {
+		const ordersByKey = new Map();
 
 		(Array.isArray(orders) ? orders : []).forEach(order => {
 			if (
-				order?.id
-				&& !isRemovedLiveOrder(order, removedOrderIds)
-				&& isOpenOrderStatus(order.status)
+				order?.original_id
+				&& isDisplayableOrderStatus(order.status)
 			) {
-				ordersById.set(order.id, enrichOrderForDisplay(order));
+				const key = getOrderIdentityKey(order);
+				if (key) ordersByKey.set(key, enrichOrderForDisplay(order));
 			}
 		});
 
 		updatedOrders.forEach(order => {
-			if (!order?.id) return;
+			if (!order?.original_id) return;
 
-			if (!isOpenOrderStatus(order.status) || isRemovedLiveOrder(order, removedOrderIds)) {
-				ordersById.delete(order.id);
+			const incomingKey = getOrderIdentityKey(order);
+			const existing = incomingKey ? ordersByKey.get(incomingKey) : null;
+
+			if (!isDisplayableOrderStatus(order.status)) {
+				if (incomingKey) ordersByKey.delete(incomingKey);
 				return;
 			}
 
-			const existing = ordersById.get(order.id);
-			ordersById.set(order.id, mergeOrderFields(existing, order));
+			const merged = mergeOrderFields(existing, order);
+			const mergedKey = getOrderIdentityKey(merged) || incomingKey;
+			if (mergedKey) ordersByKey.set(mergedKey, merged);
 		});
 
-		return Array.from(ordersById.values());
-	};
-
-	applyLiveTrade = (trade, depthMessage = null) => {
-		this.applyLiveTrades([trade], depthMessage);
+		return uniqueOrdersByOriginalId(Array.from(ordersByKey.values()));
 	};
 
 	applyLiveTrades = (trades, depthMessage = null) => {
 		if (!Array.isArray(trades) || !trades.length) return;
 
-		const sortedTrades = [...trades].sort((left, right) => Number(left.time) - Number(right.time));
-		const processed = this.processLiveTradeBatch(
-			this.state.historicalCandles,
-			this.state.currentCandle,
-			sortedTrades,
+		const sortedTrades = [...trades].sort(
+			(left, right) => Number(left.time) - Number(right.time),
 		);
-		const depth = this.buildDepthStateFromMessage(this.state, depthMessage, processed.latestPrice);
-		const depthChanged = depth !== this.state.depth;
+		let latestPrice = null;
+		let marketVolume = 0;
 
-		if (!processed.changed && !depthChanged) return;
+		sortedTrades.forEach(trade => {
+			const price = Number(trade?.price);
+			const size = Number(trade?.size) || 0;
+			const source = String(trade?.source || "");
+			const isTicker = source === "ticker" || source === "ticker_batch";
 
-		const finishUpdate = (historicalCandles, currentCandle, didStartNewCandle, latestCandleTime, chartChanged) => {
-			const depthState = depthChanged
-				? {
-					depth: {
-						...depth,
-						current_price: Number.isFinite(processed.latestPrice)
-							? processed.latestPrice
-							: depth.current_price,
-					},
+			if (!Number.isFinite(price)) return;
+
+			latestPrice = price;
+
+			if (!isTicker && size > 0) {
+				const tradeAtMs = Date.parse(trade?.trade_time);
+				const cutoffMs = Number(this.liveTradesAfterAtMs);
+
+				if (
+					Number.isFinite(cutoffMs)
+					&& Number.isFinite(tradeAtMs)
+					&& tradeAtMs > cutoffMs
+				) {
+					marketVolume += size;
 				}
-				: null;
+			}
+		});
 
-			this.setCandleData(historicalCandles, currentCandle, depthState, () => {
-				if (currentCandle && chartChanged) {
-					if (didStartNewCandle) {
-						this.syncCandleSeries(this.state.candles);
-					} else {
-						this.updateCurrentCandleOnChart(currentCandle);
-					}
+		const current = this.state.currentCandle;
+		const depth = this.buildDepthStateFromMessage(this.state, depthMessage, latestPrice);
+		const nextDepth = depth
+			? {
+				...depth,
+				current_price: Number.isFinite(latestPrice) ? latestPrice : depth.current_price,
+			}
+			: depth;
 
-					this.syncVwapSeries(this.state.candles);
-
-					if (didStartNewCandle) {
-						this.refreshTdSequentialAfterClosedCandle(latestCandleTime);
-						this.refreshDepthRangeFromFirstLoad();
-					}
-				} else if (depthChanged) {
-					this.syncVwapSeries(this.state.candles);
-				}
-
-				this.scheduleOverlayUpdate();
-			});
-		};
-
-		if (!processed.rolls.length) {
-			finishUpdate(
-				processed.historicalCandles,
-				processed.currentCandle,
-				false,
-				processed.latestCandleTime,
-				processed.changed,
-			);
+		if (!current || this.state.isLoading) {
+			if (nextDepth !== this.state.depth) {
+				this.setState({ depth: nextDepth }, this.scheduleOverlayUpdate);
+			}
+			this.syncBullseyeViewIfActive();
 			return;
 		}
 
-		this.finalizeBucketRolls(processed.historicalCandles, processed.rolls).then(historicalCandles => {
-			finishUpdate(
-				historicalCandles,
-				processed.currentCandle,
-				processed.didStartNewCandle,
-				processed.latestCandleTime,
-				true,
-			);
+		const currentHigh = Number(current.high);
+		const currentLow = Number(current.low);
+		const currentVolume = Number(current.volume);
+		const liveCandle = {
+			...current,
+			high: Number.isFinite(latestPrice)
+				? Math.max(Number.isFinite(currentHigh) ? currentHigh : latestPrice, latestPrice)
+				: current.high,
+			low: Number.isFinite(latestPrice)
+				? Math.min(Number.isFinite(currentLow) ? currentLow : latestPrice, latestPrice)
+				: current.low,
+			close: Number.isFinite(latestPrice) ? latestPrice : current.close,
+			volume: (Number.isFinite(currentVolume) ? currentVolume : 0) + marketVolume,
+		};
+		const candles = this.buildDisplayCandles(this.state.historicalCandles, liveCandle);
+		const depthChanged = nextDepth !== this.state.depth;
+
+		this.setState({
+			...(depthChanged ? { depth: nextDepth } : {}),
+			currentCandle: liveCandle,
+			candles,
+		}, () => {
+			this.updateCurrentCandleOnChart(liveCandle);
+			this.updateCurrentVwapPoint(liveCandle);
+			this.schedulePriceOverlayUpdate();
+			this.scheduleOverlayUpdate();
 		});
+
+		this.syncBullseyeViewIfActive();
 	};
 
 	refreshTdSequentialAfterClosedCandle = (newCandleTime) => {
@@ -3402,7 +4463,7 @@ class Home extends React.Component {
 		this.syncCurrencyPath(baseCurrency);
 
 		const requestId = ++this.marketRequestId;
-		this.candleRollRequestId += 1;
+		this.stopOfficialCandlePoll();
 		this.isMarketTransitioning = true;
 		const rangeSnapshot = this.getVisibleRangeSnapshot();
 		const shouldPreserveRange =
@@ -3427,15 +4488,18 @@ class Home extends React.Component {
 			orderStats: null,
 			tdSequential: null,
 			tdSequentialError: "",
-			orders: [],
 			hoveredVolumeIndex: null,
 			freeCrosshairX: null,
 			pointerPosition: null,
 			bookmarkedPrice: this.getBookmarkedPriceForCurrency(baseCurrency),
+			avgEntryPrice: this.getAvgEntryPriceForDisplay(baseCurrency),
 		});
 		this.disconnectLiveMarket();
 		this.pinnedMarketDepthRange = null;
+		this.cachedDistribution = null;
+		this.cachedDistributionKey = null;
 		this.candleSeries?.setData([]);
+		this.plottedCandles = [];
 		this.volumeSeries?.setData([]);
 		this.cachedMacdPoints = [];
 		this.cachedPvtPoints = [];
@@ -3451,7 +4515,7 @@ class Home extends React.Component {
 			.then((candlesResponse) => {
 				if (requestId !== this.marketRequestId) return;
 
-				const { candles: normalizedCandles, priceRange } = this.parseCandlesResponse(
+				const { candles: normalizedCandles } = this.parseCandlesResponse(
 					candlesResponse.data,
 				);
 
@@ -3460,10 +4524,14 @@ class Home extends React.Component {
 				}
 
 				const { historicalCandles, currentCandle } = this.splitCandlesFromApi(normalizedCandles);
-				const loadedMarketCandles = this.buildDisplayCandles(historicalCandles, currentCandle);
-				this.pinnedMarketDepthRange = priceRange;
+				const candles = this.buildDisplayCandles(
+					historicalCandles,
+					currentCandle,
+				);
+				this.pinnedMarketDepthRange = this.getDepthRangeForCandles(candles);
 				const depthRange = this.pinnedMarketDepthRange;
-				const candles = loadedMarketCandles;
+
+				this.lastOfficialCandleSyncAt = Math.floor(Date.now() / 1000);
 
 				this.setState({
 					candles,
@@ -3479,18 +4547,23 @@ class Home extends React.Component {
 				}, () => {
 					if (requestId !== this.marketRequestId) return;
 
+					this.rememberLiveCandleBucketTime(currentCandle?.time
+						?? historicalCandles?.[historicalCandles.length - 1]?.time);
+
 					if (!shouldPreserveRange) {
-						this.lockedLogFormula = null;
 						this.getMainPriceScale()?.applyOptions({ autoScale: true });
 					}
 
 					this.candleSeries.setData(toChartData(candles));
-					this.applyPriceSeriesFormat();
+					this.plottedCandles = candles;
 					this.syncVolumeSeries(candles);
 					this.syncMacdOverlay(candles);
 					this.syncVwapSeries(candles);
 					this.syncTdSequentialSeries(null, candles);
 					this.handleResize();
+
+					// !IMPORTANT DO NOT TOUCH. DO NOT OPTIMIZE UNLESS REQUESTED BY USER.
+					this.armLogPriceScaleResyncAfterData();
 
 					const didRestoreView = shouldPreserveRange
 						? this.restoreVisibleRange(rangeSnapshot)
@@ -3500,11 +4573,17 @@ class Home extends React.Component {
 						this.applyDefaultVisibleRange(candles);
 					}
 
+					// !IMPORTANT DO NOT TOUCH. DO NOT OPTIMIZE UNLESS REQUESTED BY USER.
+					// Range restore/default should fire the logical-range event; if not, apply now.
+					this.applyPendingLogPriceScaleResync();
+					this.syncPriceScaleMinMoveFromViewport();
+
 					this.syncCurrencyPath(baseCurrency);
 					this.loadProductStats(productId);
 					this.connectLiveMarket(productId, periodDays, periodGranularity, depthRange);
 					this.isMarketTransitioning = false;
 					this.scheduleOverlayUpdate();
+					this.loadAvgEntry();
 					this.loadMarketDetails({
 						requestId,
 						productId,
@@ -3528,7 +4607,6 @@ class Home extends React.Component {
 					historicalCandles: [],
 					currentCandle: null,
 					depth: null,
-					orders: [],
 					orderStats: null,
 					tdSequential: null,
 					tdSequentialError: "",
@@ -3569,25 +4647,37 @@ class Home extends React.Component {
 
 		api.getOrders({
 			product_id: productId,
+			all_products: true,
 			_: Date.now(),
 		}).then(ordersResponse => {
 			if (requestId !== this.marketRequestId) return;
 
-			this.setState({
-				orders: Array.isArray(ordersResponse.data?.orders) ? ordersResponse.data.orders : [],
-				orderStats: {
-					openTotal: ordersResponse.data?.open_total,
-					applicableTotal: ordersResponse.data?.applicable_total,
-					drawableTotal: ordersResponse.data?.drawable_total,
-					skippedTotal: ordersResponse.data?.skipped_total,
-				},
-				orderError: "",
+			const fetched = Array.isArray(ordersResponse.data?.orders)
+				? ordersResponse.data.orders
+				: [];
+			this.setState(prev => {
+				const adopted = this.adoptIncomingOrders(
+					prev.allOrders,
+					fetched,
+					"loadMarket.orders",
+				);
+				const chartOrders = this.getChartOrders(adopted.allOrders);
+
+				return {
+					allOrders: adopted.allOrders,
+					orderStats: {
+						openTotal: ordersResponse.data?.open_total,
+						applicableTotal: chartOrders.length,
+						drawableTotal: chartOrders.length,
+						skippedTotal: ordersResponse.data?.skipped_total,
+					},
+					orderError: "",
+				};
 			}, this.scheduleOverlayUpdate);
 		}).catch(error => {
 			if (requestId !== this.marketRequestId) return;
 
 			this.setState({
-				orders: [],
 				orderStats: null,
 				orderError: error.response?.data?.detail || error.message || "Unable to load Coinbase orders.",
 			});
@@ -3734,13 +4824,168 @@ class Home extends React.Component {
 		}
 	};
 
+	clearAvgEntryRetry = () => {
+		if (this.avgEntryRetryTimer) {
+			window.clearTimeout(this.avgEntryRetryTimer);
+			this.avgEntryRetryTimer = null;
+		}
+
+		this.avgEntryRetryAttempt = 0;
+	};
+
+	scheduleAvgEntryRetry = (options = {}) => {
+		if (this.avgEntryRetryAttempt >= AVG_ENTRY_RETRY_MAX_ATTEMPTS) {
+			this.clearAvgEntryRetry();
+			return;
+		}
+
+		const attempt = this.avgEntryRetryAttempt;
+		const delay = Math.min(
+			AVG_ENTRY_RETRY_MAX_MS,
+			AVG_ENTRY_RETRY_BASE_MS * (2 ** attempt),
+		);
+
+		this.avgEntryRetryAttempt = attempt + 1;
+
+		if (this.avgEntryRetryTimer) {
+			window.clearTimeout(this.avgEntryRetryTimer);
+		}
+
+		this.avgEntryRetryTimer = window.setTimeout(() => {
+			this.avgEntryRetryTimer = null;
+			this.loadAvgEntry({
+				...options,
+				isRetry: true,
+			});
+		}, delay);
+	};
+
+	loadAvgEntry = (options = {}) => {
+		const currency = String(this.state.baseCurrency || "").trim().toUpperCase();
+		const force = Boolean(options.force);
+		const isRetry = Boolean(options.isRetry);
+
+		if (!isRetry) {
+			if (this.avgEntryRetryTimer) {
+				window.clearTimeout(this.avgEntryRetryTimer);
+				this.avgEntryRetryTimer = null;
+			}
+
+			this.avgEntryRetryAttempt = 0;
+		}
+
+		if (!currency || currency === "USD" || currency === "USDC") {
+			this.clearAvgEntryRetry();
+
+			if (this.state.avgEntryPrice !== null) {
+				this.setState({ avgEntryPrice: null }, this.scheduleOverlayUpdate);
+			}
+			return;
+		}
+
+		const cachedPrice = this.getAvgEntryPriceForDisplay(currency);
+		if (!force && cachedPrice !== null && this.state.avgEntryPrice !== cachedPrice) {
+			this.setState({ avgEntryPrice: cachedPrice }, this.scheduleOverlayUpdate);
+		} else if (!force && cachedPrice === null && this.state.avgEntryPrice !== null) {
+			this.setState({ avgEntryPrice: null }, this.scheduleOverlayUpdate);
+		}
+
+		const requestId = ++this.avgEntryRequestId;
+
+		api.getAvgEntry(currency, force ? { force: true } : undefined)
+			.then((response) => {
+				if (requestId !== this.avgEntryRequestId) return;
+				if (String(this.state.baseCurrency || "").trim().toUpperCase() !== currency) return;
+
+				this.clearAvgEntryRetry();
+
+				const avgPrice = Number(response.data?.avg_price);
+				const tracked = Boolean(response.data?.tracked);
+				const reason = String(response.data?.reason || "");
+				const isDust = reason === "dust";
+				const computedPrice = tracked && Number.isFinite(avgPrice) && avgPrice > 0
+					? avgPrice
+					: null;
+
+				this.setState(prev => {
+					const nextAvgEntries = { ...(prev.appAvgEntries || {}) };
+					const prevEntry = nextAvgEntries[currency] || {};
+					const prevCached = Number(prevEntry.avgPrice);
+					const prevCachedPrice = Number.isFinite(prevCached) && prevCached > 0
+						? prevCached
+						: null;
+					const responseQty = Number(response.data?.qty);
+					const responseQtyValue = Number.isFinite(responseQty) && responseQty > 0
+						? responseQty
+						: 0;
+					// On order/fill force refresh: only clear avg for dust.
+					// Failed recompute must not blank the line or wipe local avgEntries.
+					const rawNextPrice = computedPrice !== null
+						? computedPrice
+						: (isDust ? null : prevCachedPrice);
+					const nextPrice = (
+						rawNextPrice !== null && this.hasMaterialAvgEntryBalance(currency, prev)
+					)
+						? rawNextPrice
+						: null;
+
+					if (isDust) {
+						nextAvgEntries[currency] = {
+							nullDate: response.data?.null_date || null,
+							avgPrice: null,
+							qty: 0,
+						};
+					} else {
+						nextAvgEntries[currency] = {
+							nullDate: response.data?.null_date || prevEntry.nullDate || null,
+							avgPrice: computedPrice !== null
+								? computedPrice
+								: (prevEntry.avgPrice ?? null),
+							qty: responseQtyValue > 0
+								? responseQtyValue
+								: (Number(prevEntry.qty) || 0),
+						};
+					}
+
+					const nextState = {
+						appAvgEntries: nextAvgEntries,
+					};
+
+					if (prev.avgEntryPrice !== nextPrice) {
+						nextState.avgEntryPrice = nextPrice;
+					}
+
+					return nextState;
+				}, this.scheduleOverlayUpdate);
+			})
+			.catch(() => {
+				if (requestId !== this.avgEntryRequestId) return;
+				if (String(this.state.baseCurrency || "").trim().toUpperCase() !== currency) return;
+
+				if (!force) {
+					const fallbackPrice = this.getAvgEntryPriceForDisplay(currency);
+
+					this.setState(prev => (
+						prev.avgEntryPrice === fallbackPrice
+							? null
+							: { avgEntryPrice: fallbackPrice }
+					), this.scheduleOverlayUpdate);
+				}
+
+				// Always retry failed loads (including force) so a blank chart recovers.
+				this.scheduleAvgEntryRetry({ force, isRetry: true });
+			});
+	};
+
 	loadProfile = (options = {}) => {
 		const requestedGeneration = Number(options.generation) || 0;
 		const generation = Math.max(
 			requestedGeneration,
 			this.latestBalanceGeneration,
 		);
-		const requestKey = String(generation);
+		const forcePrices = Boolean(options.forcePrices);
+		const forceAvgEntry = Boolean(options.forceAvgEntry) || forcePrices;
+		const requestKey = `${generation}:${forcePrices ? "force" : "cached"}`;
 		const activeRequest = this.profileLoadPromises.get(requestKey);
 
 		if (activeRequest) return activeRequest;
@@ -3750,7 +4995,7 @@ class Home extends React.Component {
 			profileError: "",
 		});
 
-		const request = api.getBalances(generation).then(response => {
+		const request = api.getBalances(generation, { forcePrices }).then(response => {
 			const profile = response.data;
 			const responseGeneration = Number(profile?.generation) || 0;
 			this.latestBalanceGeneration = Math.max(
@@ -3766,6 +5011,10 @@ class Home extends React.Component {
 				profile,
 				profileError: "",
 				isProfileLoading: false,
+			}, () => {
+				this.scheduleOverlayUpdate();
+				this.syncAvgEntryPriceForDisplay();
+				this.loadAvgEntry(forceAvgEntry ? { force: true } : undefined);
 			});
 
 			return profile;
@@ -3817,38 +5066,222 @@ class Home extends React.Component {
 		}, PARTIAL_FILL_BALANCE_DEBOUNCE_MS);
 	};
 
-	loadOrders = () => {
-		const baseCurrency = this.state.baseCurrency.trim().toUpperCase();
-		const productId = `${baseCurrency}-USD`;
+	getChartOrders = (allOrders = this.state.allOrders) => {
+		const productId = `${this.state.baseCurrency.trim().toUpperCase()}-USD`;
 
-		if (!baseCurrency) return Promise.resolve();
+		return filterOrdersForChartProduct(
+			uniqueOrdersByOriginalId(Array.isArray(allOrders) ? allOrders : [])
+				.filter(order => String(order?.order_type || "").toUpperCase() !== "MARKET"),
+			productId,
+		);
+	};
 
-		return api.getOrders({
-			product_id: productId,
-			_: Date.now(),
-		}).then(response => {
-			const orders = Array.isArray(response.data?.orders)
-				? response.data.orders.map(enrichOrderForDisplay)
-				: [];
+	logChartOrderLine = (action, place, order, extra = null) => {
+		const payload = {
+			action,
+			place,
+			orderId: String(order?.originalId || order?.original_id || ""),
+			originalId: String(order?.originalId || order?.original_id || ""),
+			role: order?.role || "limit",
+			price: Number(order?.price),
+			...(extra && typeof extra === "object" ? extra : {}),
+		};
 
-			this.setState({
-				orders,
-				orderStats: {
-					openTotal: response.data?.open_total,
-					applicableTotal: response.data?.applicable_total,
-					drawableTotal: response.data?.drawable_total,
-					skippedTotal: response.data?.skipped_total,
-				},
-				orderError: "",
+		// console.log("[chart-order-line]", JSON.stringify(payload));
+		void payload;
+	};
+
+	setOrderLineDisplayPlace = (place) => {
+		this.orderLineDisplayPlace = place || "renderOverlay";
+	};
+
+	noteDragOwnerIfChanged = (place, nextDrag, prevDrag = this.state.openOrderDrag) => {
+		const fromId = String(prevDrag?.orderId || "").trim();
+		const toId = nextDrag == null ? "" : String(nextDrag.orderId || "").trim();
+		if (fromId === toId) return;
+
+		// console.log("[order-drag]", JSON.stringify({
+		// 	place,
+		// 	original_id: toId || null,
+		// 	previous_id: fromId || null,
+		// }));
+		void place;
+	};
+
+	logChartOrderDisplayIfChanged = (orderLines) => {
+		const next = new Map();
+
+		(Array.isArray(orderLines) ? orderLines : []).forEach(line => {
+			const originalId = String(line?.original_id || "").trim();
+			if (!originalId) return;
+
+			const role = String(line?.role || "limit").toLowerCase() || "limit";
+			const price = Number(line?.price);
+			const pollsAfterMove = Number(line?.pollsAfterMove);
+
+			next.set(`${originalId}:${role}`, {
+				original_id: originalId,
+				pollsAfterMove: Number.isFinite(pollsAfterMove) ? pollsAfterMove : null,
+				price,
 			});
-		}).catch(error => {
-			this.setState({
-				orderError: error.response?.data?.detail || error.message || "Unable to load Coinbase orders.",
+		});
+
+		const prev = this.chartOrderDisplayByKey;
+		const place = this.orderLineDisplayPlace || "renderOverlay";
+
+		next.forEach((row, key) => {
+			const before = prev.get(key);
+			if (before && before.price === row.price) return;
+
+			// console.log("[order-line-display]", JSON.stringify({
+			// 	place,
+			// 	original_id: row.original_id,
+			// 	pollsAfterMove: row.pollsAfterMove,
+			// 	price: row.price,
+			// 	...(before ? { fromPrice: before.price } : { added: true }),
+			// }));
+			void place;
+			void row;
+			void before;
+		});
+
+		prev.forEach((row, key) => {
+			if (next.has(key)) return;
+
+			// console.log("[order-line-display]", JSON.stringify({
+			// 	place,
+			// 	original_id: row.original_id,
+			// 	pollsAfterMove: row.pollsAfterMove,
+			// 	price: row.price,
+			// 	removed: true,
+			// }));
+			void row;
+		});
+
+		this.chartOrderDisplayByKey = next;
+	};
+
+	getChartOrderLineSnapshot = (allOrders) => {
+		const lines = new Map();
+
+		this.getChartOrders(allOrders)
+			.filter(order => isDisplayableOrderStatus(order?.status))
+			.forEach((order) => {
+				const expanded = (
+					Array.isArray(order.bracket_legs) && order.bracket_legs.length
+						? order.bracket_legs.map(leg => ({
+							...order,
+							...leg,
+							original_id: order.original_id,
+						}))
+						: [order]
+				);
+
+				expanded.forEach((line) => {
+					const role = String(line?.role || "limit").toLowerCase() || "limit";
+					const identity = getOrderIdentityKey(line) || String(line?.id || "");
+					if (!identity) return;
+
+					const price = Number(line?.price);
+					if (!Number.isFinite(price) || price <= 0) return;
+
+					lines.set(`${identity}:${role}`, {
+						orderId: String(line?.original_id || ""),
+						originalId: String(line?.original_id || ""),
+						role,
+						price,
+						status: line?.status,
+					});
+				});
 			});
+
+		return lines;
+	};
+
+	diffChartOrderLines = (prevAllOrders, nextAllOrders, place) => {
+		const prev = this.getChartOrderLineSnapshot(prevAllOrders);
+		const next = this.getChartOrderLineSnapshot(nextAllOrders);
+
+		prev.forEach((prevLine, key) => {
+			const nextLine = next.get(key);
+
+			if (!nextLine) {
+				this.logChartOrderLine("remove", place, prevLine, {
+					removedPrice: prevLine.price,
+				});
+				return;
+			}
+
+			if (prevLine.price !== nextLine.price) {
+				this.logChartOrderLine("move", place, nextLine, {
+					fromPrice: prevLine.price,
+					toPrice: nextLine.price,
+				});
+			}
 		});
 	};
 
-	loadAllOrders = () => {
+	/** Confirmed USD on a row: ORIGINAL / order total / quote — never invent from bad size×price. */
+	getOrderConfirmedUsdNotional = (order) => {
+		if (!order || typeof order !== "object") return null;
+
+		for (const candidate of [
+			order.original_value_usd,
+			order.order_total,
+			order.total_value,
+			order.quote_size,
+		]) {
+			const value = Number(candidate);
+			if (Number.isFinite(value) && value > 0) return value;
+		}
+
+		return null;
+	};
+
+	/** Live $ while dragging: SELL/TP/SL = size × price; BUY limit = frozen confirmed $. */
+	getLiveDragNotionalUsd = (size, price) => {
+		const qty = Number(size);
+		const value = Number(price);
+
+		if (!Number.isFinite(qty) || qty <= 0 || !Number.isFinite(value) || value <= 0) {
+			return null;
+		}
+
+		return qty * value;
+	};
+
+	getDragDisplayNotionalUsd = (drag, order = null) => {
+		if (!drag) return null;
+
+		const kind = String(drag.kind || "limit").toLowerCase();
+		const side = String(drag.side || order?.side || "").toUpperCase();
+		const isBuyLimit = kind === "limit" && side === "BUY";
+
+		if (isBuyLimit) {
+			const frozen = Number(drag.confirmedUsd);
+			if (Number.isFinite(frozen) && frozen > 0) return frozen;
+			return this.getOrderConfirmedUsdNotional(order);
+		}
+
+		return this.getLiveDragNotionalUsd(drag.size, order?.price);
+	};
+
+	/** Orders list rows from allOrders only. */
+	getOrdersForListDisplay = (orders = this.state.allOrders) => (
+		Array.isArray(orders) ? orders : []
+	);
+
+	restartAllOrdersRefreshTimer = () => {
+		if (this.allOrdersRefreshTimer) {
+			window.clearInterval(this.allOrdersRefreshTimer);
+		}
+		this.allOrdersRefreshTimer = window.setInterval(this.loadAllOrders, ALL_ORDERS_REFRESH_INTERVAL_MS);
+	};
+
+	loadAllOrders = (options = {}) => {
+		// Only one orders refresh at a time.
+		if (this.allOrdersRequest) return this.allOrdersRequest;
+
 		const baseCurrency = this.state.baseCurrency.trim().toUpperCase();
 		const productId = `${baseCurrency}-USD`;
 
@@ -3857,46 +5290,102 @@ class Home extends React.Component {
 			allOrdersError: "",
 		});
 
-		return api.getOrders({
+		const params = {
 			product_id: productId,
 			all_products: true,
 			_: Date.now(),
-		}).then(response => {
-			const allOrders = Array.isArray(response.data?.orders)
-				? response.data.orders.map(enrichOrderForDisplay)
-				: [];
-			const chartOrders = filterOrdersForChartProduct(allOrders, productId);
+		};
 
-			this.setState({
-				allOrders,
-				orders: chartOrders,
-				orderStats: {
-					openTotal: response.data?.open_total,
-					applicableTotal: chartOrders.length,
-					drawableTotal: chartOrders.length,
-					skippedTotal: response.data?.skipped_total,
-				},
-				allOrdersError: "",
-				orderError: "",
-				isOrdersLoading: false,
-			}, this.scheduleOverlayUpdate);
+		if (options.force) {
+			params.force = true;
+		}
+
+		const sentAt = Date.now();
+
+		this.allOrdersRequest = api.getOrders(params).then(response => {
+			this.allOrdersRequest = null;
+
+			// A socket orders_update merged after this poll was sent is newer than its response.
+			if (this.lastOrdersSocketMergeAt > sentAt) {
+				this.setState({ isOrdersLoading: false });
+				return;
+			}
+
+			const fetchedOrders = Array.isArray(response.data?.orders)
+				? response.data.orders
+				: [];
+			const replaceLocal = Boolean(options.replaceLocal);
+			let notices = [];
+
+			this.setState(prev => {
+				const adopted = this.adoptIncomingOrders(
+					prev.allOrders,
+					fetchedOrders,
+					replaceLocal ? "loadAllOrders.replaceLocal" : "loadAllOrders.reconcile",
+				);
+				notices = adopted.notices;
+				const chartOrders = this.getChartOrders(adopted.allOrders);
+
+				if (replaceLocal) {
+					this.isOpenOrderPriceDragging = false;
+					this.openOrderPriceDragGrabOffsetY = 0;
+					this.openOrderDragFrozenTotals = null;
+					this.openOrderDragFrozenLimitTotal = null;
+					this.releaseOpenOrderPointerCapture();
+				}
+
+				const nextDrag = replaceLocal ? null : prev.openOrderDrag;
+				if (replaceLocal) {
+					this.noteDragOwnerIfChanged("loadAllOrders.replaceLocal", nextDrag, prev.openOrderDrag);
+				}
+
+				return {
+					allOrders: adopted.allOrders,
+					openOrderDrag: nextDrag,
+					orderStats: {
+						openTotal: response.data?.open_total,
+						applicableTotal: chartOrders.length,
+						drawableTotal: chartOrders.length,
+						skippedTotal: response.data?.skipped_total,
+					},
+					allOrdersError: "",
+					orderError: "",
+					isOrdersLoading: false,
+				};
+			}, () => {
+				this.showMergeNotices(notices);
+				if (this.isOpenOrderPriceDragging) {
+					this.schedulePriceOverlayUpdate();
+				} else {
+					this.scheduleOverlayUpdate();
+				}
+			});
 		}).catch(error => {
+			this.allOrdersRequest = null;
 			this.setState({
 				allOrdersError: error.response?.data?.detail || error.message || "Unable to load Coinbase orders.",
 				isOrdersLoading: false,
 			});
 		});
+
+		return this.allOrdersRequest;
 	};
 
 	forceRefreshAccount = () => {
 		if (this.state.isAccountRefreshing) return;
 
-		this.setState({ isAccountRefreshing: true });
+		this.isOpenOrderPriceDragging = false;
+		this.openOrderPriceDragGrabOffsetY = 0;
+		this.openOrderDragFrozenTotals = null;
+		this.openOrderDragFrozenLimitTotal = null;
+		this.releaseOpenOrderPointerCapture();
+		this.setOrderLineDisplayPlace("forceRefreshAccount");
+		this.noteDragOwnerIfChanged("forceRefreshAccount", null);
+		this.setState({ isAccountRefreshing: true, openOrderDrag: null });
 
 		Promise.allSettled([
-			this.loadOrders(),
-			this.loadAllOrders(),
-			this.loadProfile(),
+			this.loadAllOrders({ force: true, replaceLocal: true }),
+			this.loadProfile({ forcePrices: true, forceAvgEntry: true }),
 			this.refreshDepthRangeFromFirstLoad(),
 		]).finally(() => {
 			this.setState({ isAccountRefreshing: false });
@@ -3907,7 +5396,7 @@ class Home extends React.Component {
 		if (this.state.isBalanceRefreshing) return;
 
 		this.setState({ isBalanceRefreshing: true });
-		this.loadProfile({ reason }).finally(() => {
+		this.loadProfile({ reason, forcePrices: true }).finally(() => {
 			this.setState({ isBalanceRefreshing: false });
 		});
 	};
@@ -3962,7 +5451,7 @@ class Home extends React.Component {
 			};
 		}
 
-		const quote = this.getBuyQuoteBalance(0, profile);
+		const quote = this.getBuyQuoteBalance(profile);
 
 		return {
 			currency: quote.currency,
@@ -3985,30 +5474,23 @@ class Home extends React.Component {
 			};
 		}
 
-		const usd = balances.find(item => item.currency === "USD");
 		const usdc = balances.find(item => item.currency === "USDC");
-		const usdAvailable = Number(usd?.available) || 0;
-		const usdcAvailable = Number(usdc?.available) || 0;
-		const useUsdc = usdcAvailable >= usdAvailable;
+		const usdcAvailable = Number(usdc?.available);
 
 		return {
-			currency: useUsdc ? "USDC" : "USD",
-			amount: useUsdc ? usdcAvailable : usdAvailable,
+			currency: "USDC",
+			amount: Number.isFinite(usdcAvailable) ? usdcAvailable : 0,
 		};
 	};
 
-	getBuyQuoteBalance = (requiredAmount = 0, profile = this.state.profile) => {
+	getBuyQuoteBalance = (profile = this.state.profile) => {
 		const balances = Array.isArray(profile?.balances) ? profile.balances : [];
-		const usd = balances.find(item => item.currency === "USD");
 		const usdc = balances.find(item => item.currency === "USDC");
-		const options = [
-			{ currency: "USD", amount: Number(usd?.available) || 0 },
-			{ currency: "USDC", amount: Number(usdc?.available) || 0 },
-		];
-		const required = Number(requiredAmount);
-		const coveringOption = options.find(item => Number.isFinite(required) && required > 0 && item.amount >= required);
 
-		return coveringOption || options.sort((a, b) => b.amount - a.amount)[0];
+		return {
+			currency: "USDC",
+			amount: Number(usdc?.available) || 0,
+		};
 	};
 
 	getOrderPriceInputValue = (price) => {
@@ -4058,39 +5540,52 @@ class Home extends React.Component {
 
 	normalizeOrderTypeForSide = (side, orderType) => {
 		const normalizedSide = side === "SELL" ? "SELL" : "BUY";
-		const normalizedType = String(orderType || "LIMIT").toUpperCase();
+		const requestedType = String(orderType || "LIMIT").toUpperCase();
+		const normalizedType = requestedType === "TRAILING"
+			? "TRAILING_MARKET"
+			: requestedType;
 		const allowedTypes = normalizedSide === "SELL"
-			? ["LIMIT", "MARKET", "STOP_LIMIT", "BRACKET"]
+			? ["LIMIT", "MARKET", "STOP_LIMIT", "BRACKET", "TRAILING_MARKET", "TRAILING_LIMIT"]
 			: ["LIMIT", "MARKET", "STOP_LIMIT"];
 
 		return allowedTypes.includes(normalizedType) ? normalizedType : "LIMIT";
 	};
 
+	isTrailingOrderType = (orderType) => (
+		orderType === "TRAILING_MARKET" || orderType === "TRAILING_LIMIT"
+	);
+
+	getSellStopOrderType = (orderType, fallback = "BRACKET") => {
+		const normalized = this.normalizeOrderTypeForSide("SELL", orderType);
+
+		return (
+			normalized === "STOP_LIMIT"
+			|| normalized === "BRACKET"
+			|| this.isTrailingOrderType(normalized)
+		)
+			? normalized
+			: fallback;
+	};
+
 	getTicketPrimaryOrderType = (ticket) => {
 		const orderType = this.normalizeOrderTypeForSide(ticket?.side, ticket?.orderType);
 
-		return orderType === "STOP_LIMIT" || orderType === "BRACKET"
+		return orderType === "STOP_LIMIT" || orderType === "BRACKET" || this.isTrailingOrderType(orderType)
 			? "STOP"
 			: orderType;
-	};
-
-	getOrderTypeLabel = (orderType) => {
-		switch (orderType) {
-			case "MARKET":
-				return "MARKET";
-			case "STOP_LIMIT":
-				return "STOP LIMIT";
-			case "BRACKET":
-				return "BRACKET";
-			case "LIMIT":
-			default:
-				return "LIMIT";
-		}
 	};
 
 	getDefaultAmountModeForSide = (side) => (
 		side === "SELL" ? "BASE" : "USD"
 	);
+
+	getSavedTrailingPercent = () => {
+		const value = Number(getCookie(TRAILING_PERCENT_COOKIE));
+
+		return Number.isFinite(value) && value > 0 && value < 100
+			? String(value)
+			: TRAILING_DEFAULT_PERCENT;
+	};
 
 	getSavedAmountModeForSide = (side, saved = {}) => (
 		saved.amountMode === "USD" || saved.amountMode === "BASE"
@@ -4125,6 +5620,9 @@ class Home extends React.Component {
 			...saved,
 			side: normalizedSide,
 			orderType: "LIMIT",
+			lastSellStopOrderType: this.getSellStopOrderType(
+				saved.lastSellStopOrderType || saved.orderType,
+			),
 			amountMode: this.getSavedAmountModeForSide(normalizedSide, saved),
 			activePriceField: "price",
 			anchorPrice: Number.isFinite(numericPrice) ? numericPrice : null,
@@ -4134,6 +5632,9 @@ class Home extends React.Component {
 			stopPrice: Number.isFinite(Number(saved.stopPrice)) ? this.getOrderPriceInputValue(saved.stopPrice) : priceValue,
 			takeProfitPrice: Number.isFinite(Number(saved.takeProfitPrice)) ? this.getOrderPriceInputValue(saved.takeProfitPrice) : takeProfitValue,
 			stopLossPrice: Number.isFinite(Number(saved.stopLossPrice)) ? this.getOrderPriceInputValue(saved.stopLossPrice) : stopLossValue,
+			trailPercent: Number.isFinite(Number(saved.trailPercent))
+				? String(saved.trailPercent)
+				: this.getSavedTrailingPercent(),
 			amount: "0",
 			fraction: 0,
 			error: "",
@@ -4143,6 +5644,7 @@ class Home extends React.Component {
 			previewError: "",
 			previewMarketPrice: null,
 			isPreviewLoading: false,
+			previewRequestedAt: null,
 		};
 	};
 
@@ -4151,11 +5653,13 @@ class Home extends React.Component {
 			? {
 				side: ticket.side,
 				orderType: ticket.orderType,
+				lastSellStopOrderType: ticket.lastSellStopOrderType,
 				amountMode: ticket.amountMode,
 				price: ticket.price,
 				stopPrice: ticket.stopPrice,
 				takeProfitPrice: ticket.takeProfitPrice,
 				stopLossPrice: ticket.stopLossPrice,
+				trailPercent: ticket.trailPercent,
 				amount: ticket.amount,
 				fraction: ticket.fraction,
 			}
@@ -4205,6 +5709,9 @@ class Home extends React.Component {
 			...saved,
 			side: normalizedSide,
 			orderType: nextOrderType,
+			lastSellStopOrderType: this.getSellStopOrderType(
+				saved.lastSellStopOrderType || saved.orderType,
+			),
 			amountMode: this.getSavedAmountModeForSide(normalizedSide, saved),
 			activePriceField: "price",
 			anchorPrice: Number.isFinite(Number(currentTicket?.anchorPrice))
@@ -4220,6 +5727,9 @@ class Home extends React.Component {
 			stopPrice: priceValue,
 			takeProfitPrice: Number.isFinite(Number(saved.takeProfitPrice)) ? this.getOrderPriceInputValue(saved.takeProfitPrice) : takeProfitValue,
 			stopLossPrice: Number.isFinite(Number(saved.stopLossPrice)) ? this.getOrderPriceInputValue(saved.stopLossPrice) : stopLossValue,
+			trailPercent: Number.isFinite(Number(saved.trailPercent))
+				? String(saved.trailPercent)
+				: this.getSavedTrailingPercent(),
 			amount,
 			error: "",
 			isSubmitting: false,
@@ -4228,6 +5738,7 @@ class Home extends React.Component {
 			previewError: "",
 			previewMarketPrice: null,
 			isPreviewLoading: false,
+			previewRequestedAt: null,
 		};
 
 		return this.clampOrderTicketAmount({
@@ -4261,33 +5772,6 @@ class Home extends React.Component {
 		});
 	};
 
-	openOrderTicket = (event) => {
-		event.preventDefault();
-		event.stopPropagation();
-
-		if (this.state.isOrderTicketClosing || this.orderTicketCloseTimer) return;
-
-		const hover = this.state.orderScaleHover;
-		if (!hover) return;
-
-		if (this.orderTicketCloseTimer) {
-			window.clearTimeout(this.orderTicketCloseTimer);
-			this.orderTicketCloseTimer = null;
-		}
-
-		const side = this.getDefaultOrderSideForPrice(hover.price);
-
-		this.setState(prev => ({
-			savedOrderTickets: this.clearSavedOrderTicketAmounts(prev.savedOrderTickets),
-			orderTicket: this.getOrderTicketDefaults(hover.price, side),
-			isOrderTicketClosing: false,
-			lastOrderSide: side,
-		}), () => {
-			this.loadProfile();
-			this.scheduleOrderPreview();
-		});
-	};
-
 	applyOrderHoverPrice = (event) => {
 		event.preventDefault();
 		event.stopPropagation();
@@ -4308,13 +5792,15 @@ class Home extends React.Component {
 				isOrderTicketClosing: false,
 				lastOrderSide: side,
 			}), () => {
-				this.loadProfile();
+				this.refreshBalancesManually("order_overlay_open");
 				this.scheduleOrderPreview();
 			});
 			return;
 		}
 
 		const ticket = this.state.orderTicket;
+		if (this.isSellTrailingOrderTicket(ticket)) return;
+
 		const field = ticket.activePriceField || "price";
 		const allowedFields = ["price", "stopPrice", "takeProfitPrice", "stopLossPrice"];
 		const targetField = allowedFields.includes(field) ? field : "price";
@@ -4415,6 +5901,7 @@ class Home extends React.Component {
 
 	prepareOrderTicketClose = () => {
 		this.cancelOrderPreviewRequests();
+		this.stopOrderPreviewWaitTicker();
 
 		if (this.orderPreviewTimer) {
 			window.clearTimeout(this.orderPreviewTimer);
@@ -4433,6 +5920,8 @@ class Home extends React.Component {
 			this.orderTicketCloseTimer = null;
 			this.isOrderTicketPriceDragging = false;
 			this.orderTicketPriceDragField = null;
+			this.orderTicketPriceDragStartPrice = null;
+			this.orderTicketPriceDragGrabOffsetY = 0;
 			this.isOrderTicketMoveDragging = false;
 			this.orderTicketMoveDrag = null;
 			this.setState({
@@ -4501,37 +5990,82 @@ class Home extends React.Component {
 		});
 	};
 
-	setOrderType = (orderType) => {
+	setOrderType = (orderType, options = {}) => {
 		const ticket = this.state.orderTicket;
 		if (!ticket) return;
 
 		const normalizedOrderType = this.normalizeOrderTypeForSide(ticket.side, orderType);
 		const currentOrderType = this.normalizeOrderTypeForSide(ticket.side, ticket.orderType);
 
-		if (normalizedOrderType === currentOrderType) return;
+		if (normalizedOrderType === currentOrderType) {
+			if (options.closeMenu) {
+				this.setState({ isOrderTypeMenuOpen: false });
+			} else if (options.openMenu) {
+				this.setState({ isOrderTypeMenuOpen: true });
+			}
+			return;
+		}
 
 		this.cancelOrderPreviewRequests();
 
 		const patch = {
 			...this.getOrderPreviewResetPatch(),
 			orderType: normalizedOrderType,
+			...(
+				ticket.side === "SELL"
+				&& this.getTicketPrimaryOrderType({
+					...ticket,
+					orderType: normalizedOrderType,
+				}) === "STOP"
+					? { lastSellStopOrderType: normalizedOrderType }
+					: {}
+			),
 		};
 
 		if (normalizedOrderType === "BRACKET" && ticket.side === "SELL") {
-			Object.assign(patch, this.getBracketDefaultPrices(this.getBracketReferencePrice(ticket)));
+			if (currentOrderType === "LIMIT") {
+				const limitPrice = Number(ticket.price);
+				const currentPrice = Number(this.getOverlayMarketPrice());
+
+				if (Number.isFinite(limitPrice) && limitPrice > 0) {
+					patch.takeProfitPrice = this.getOrderPriceInputValue(limitPrice);
+
+					if (Number.isFinite(currentPrice) && currentPrice > 0) {
+						patch.stopLossPrice = this.getOrderPriceInputValue(
+							currentPrice - (limitPrice - currentPrice) / 5,
+						);
+					} else {
+						Object.assign(patch, this.getBracketDefaultPrices(limitPrice));
+						patch.takeProfitPrice = this.getOrderPriceInputValue(limitPrice);
+					}
+				} else {
+					Object.assign(patch, this.getBracketDefaultPrices(this.getBracketReferencePrice(ticket)));
+				}
+			} else {
+				Object.assign(patch, this.getBracketDefaultPrices(this.getBracketReferencePrice(ticket)));
+			}
+
 			patch.activePriceField = "takeProfitPrice";
+		} else if (this.isTrailingOrderType(normalizedOrderType) && ticket.side === "SELL") {
+			patch.activePriceField = "trailPercent";
+		} else if (normalizedOrderType === "LIMIT") {
+			patch.activePriceField = "price";
 		}
 
 		this.updateOrderTicket(patch, {
 			onCommitted: () => {
+				if (options.closeMenu) {
+					this.setState({ isOrderTypeMenuOpen: false });
+				} else if (options.openMenu) {
+					this.setState({ isOrderTypeMenuOpen: true });
+				}
 				this.syncMarketPreviewPoller();
 			},
 		});
 	};
 
 	setSellStopOrderType = (orderType) => {
-		this.setOrderType(orderType);
-		this.setState({ isOrderTypeMenuOpen: false });
+		this.setOrderType(orderType, { closeMenu: true });
 	};
 
 	getOrderFractionFromAmount = (ticket, amountValue = ticket?.amount, maxAmount = null) => {
@@ -4559,20 +6093,9 @@ class Home extends React.Component {
 
 		if (prevMax === nextMax) return;
 
-		const numericAmount = Number(ticket.amount);
-		let nextAmount = ticket.amount;
-
-		if (nextMax <= 0) {
-			nextAmount = "0";
-		} else if (Number.isFinite(numericAmount) && numericAmount > nextMax) {
-			nextAmount = this.getOrderAmountInputValue(ticket, nextMax);
-		}
-
-		const nextFraction = this.getOrderFractionFromAmount(
-			{ ...ticket, amount: nextAmount },
-			nextAmount,
-			nextMax,
-		);
+		const clampedTicket = this.clampOrderTicketAmount(ticket);
+		const nextAmount = clampedTicket.amount;
+		const nextFraction = clampedTicket.fraction;
 		const amountChanged = String(nextAmount) !== String(ticket.amount);
 		const fractionChanged = nextFraction !== ticket.fraction;
 
@@ -4612,7 +6135,7 @@ class Home extends React.Component {
 			return takeProfitPrice;
 		}
 
-		if (orderType !== "MARKET" && Number.isFinite(price) && price > 0) {
+		if (orderType !== "MARKET" && !this.isTrailingOrderType(orderType) && Number.isFinite(price) && price > 0) {
 			return price;
 		}
 
@@ -4627,11 +6150,15 @@ class Home extends React.Component {
 		const availableAmount = Number(available.amount) || 0;
 
 		if (ticket.side === "BUY") {
-			return ticket.amountMode === "USD"
-				? availableAmount
-				: referencePrice > 0
-					? availableAmount / referencePrice
-					: 0;
+			if (ticket.amountMode === "USD") {
+				return floorQuoteCurrencyAmount(
+					Math.max(0, availableAmount - BUY_USD_MAX_HEADROOM),
+				);
+			}
+
+			return referencePrice > 0
+				? availableAmount / referencePrice
+				: 0;
 		}
 
 		return ticket.amountMode === "USD"
@@ -4762,6 +6289,14 @@ class Home extends React.Component {
 		if (!ticket || ticket.side !== "SELL") return false;
 
 		return this.normalizeOrderTypeForSide(ticket.side, ticket.orderType) === "BRACKET";
+	};
+
+	isSellTrailingOrderTicket = (ticket = this.state.orderTicket) => {
+		if (!ticket || ticket.side !== "SELL") return false;
+
+		return this.isTrailingOrderType(
+			this.normalizeOrderTypeForSide(ticket.side, ticket.orderType)
+		);
 	};
 
 	getBracketReferencePrice = (ticket = this.state.orderTicket) => {
@@ -4916,8 +6451,70 @@ class Home extends React.Component {
 		return `${priceLabel} (${formatSignedPercent(percent)})`;
 	};
 
+	getReferenceLineMarketDelta = (linePriceValue) => {
+		const linePrice = Number(linePriceValue);
+
+		if (!Number.isFinite(linePrice) || linePrice <= 0) return null;
+
+		const livePrice = Number(this.getOverlayMarketPrice());
+
+		if (!Number.isFinite(livePrice) || livePrice <= 0) return null;
+
+		const deltaPrice = linePrice - livePrice;
+		const deltaPercent = (deltaPrice / linePrice) * 100;
+
+		if (!Number.isFinite(deltaPercent)) return null;
+
+		const deltaPriceLabel = deltaPrice >= 0
+			? `+${this.formatOverlayPriceForProduct(deltaPrice)}`
+			: `-${this.formatOverlayPriceForProduct(Math.abs(deltaPrice))}`;
+
+		return {
+			deltaPriceLabel,
+			deltaPercent,
+		};
+	};
+
+	getReferenceLinePriceLabel = (referencePrice, { prefix = "" } = {}) => {
+		const priceLabel = this.formatOverlayPriceForProduct(referencePrice);
+
+		return prefix ? `${prefix} ${priceLabel}` : priceLabel;
+	};
+
+	getReferenceLineDeltaLabel = (referencePrice) => {
+		const delta = this.getReferenceLineMarketDelta(referencePrice);
+
+		if (!delta) return null;
+
+		return `${delta.deltaPriceLabel} (${formatSignedPercent(delta.deltaPercent)})`;
+	};
+
+	getPriceFromPointerEvent = (event, grabOffsetY = 0) => {
+		const el = this.chartRef.current;
+		if (!el || !this.candleSeries) return null;
+
+		const rect = el.getBoundingClientRect();
+		const y = event.clientY - rect.top - (Number(grabOffsetY) || 0);
+		const price = this.candleSeries.coordinateToPrice(y);
+
+		return Number.isFinite(price) && price > 0 ? price : null;
+	};
+
+	getPriceDragGrabOffsetY = (event, price) => {
+		const el = this.chartRef.current;
+		const handleY = this.priceToY(price);
+
+		if (!el || !Number.isFinite(handleY)) return 0;
+
+		const rect = el.getBoundingClientRect();
+		const pointerY = event.clientY - rect.top;
+
+		return pointerY - handleY;
+	};
+
 	handleOrderTicketPriceDragStart = (event, field = "price") => {
 		if (event.button != null && event.button !== 0) return;
+		if (this.isOpenOrderPriceDragging) return;
 
 		const ticket = this.state.orderTicket;
 		if (!ticket) return;
@@ -4933,21 +6530,35 @@ class Home extends React.Component {
 		event.preventDefault();
 		event.stopPropagation();
 
+		const startPrice = Number(ticket[field]);
 		this.orderTicketPriceDragField = field;
+		this.orderTicketPriceDragStartPrice = (
+			Number.isFinite(startPrice) && startPrice > 0
+				? startPrice
+				: null
+		);
+		this.orderTicketPriceDragGrabOffsetY = (
+			Number.isFinite(startPrice) && startPrice > 0
+				? this.getPriceDragGrabOffsetY(event, startPrice)
+				: 0
+		);
 		this.isOrderTicketPriceDragging = true;
 		this.setState({ isOrderTicketPriceDragging: true });
 		this.updateOrderTicket({ activePriceField: field }, { schedulePreview: false });
 	};
 
 	handleOrderTicketPriceDragMove = (event) => {
+		if (this.isOpenOrderPriceDragging) {
+			this.handleOpenOrderPriceDragMove(event);
+			return;
+		}
+
 		if (!this.isOrderTicketPriceDragging || !this.candleSeries) return;
 
-		const el = this.chartRef.current;
-		if (!el) return;
-
-		const rect = el.getBoundingClientRect();
-		const y = event.clientY - rect.top;
-		const price = this.candleSeries.coordinateToPrice(y);
+		const price = this.getPriceFromPointerEvent(
+			event,
+			this.orderTicketPriceDragGrabOffsetY,
+		);
 
 		if (!Number.isFinite(price) || price <= 0) return;
 
@@ -4958,16 +6569,753 @@ class Home extends React.Component {
 		);
 	};
 
+	cancelOrderTicketPriceDrag = () => {
+		if (!this.isOrderTicketPriceDragging) return;
+
+		const field = this.orderTicketPriceDragField || "price";
+		const startPrice = Number(this.orderTicketPriceDragStartPrice);
+
+		this.isOrderTicketPriceDragging = false;
+		this.orderTicketPriceDragField = null;
+		this.orderTicketPriceDragStartPrice = null;
+		this.orderTicketPriceDragGrabOffsetY = 0;
+
+		this.setState({ isOrderTicketPriceDragging: false }, () => {
+			if (Number.isFinite(startPrice) && startPrice > 0) {
+				this.setOrderTicketDragPrice(field, startPrice, { schedulePreview: true });
+				return;
+			}
+
+			if (this.state.orderTicket) {
+				this.scheduleOrderPreview();
+			}
+		});
+	};
+
 	handleOrderTicketPriceDragEnd = () => {
+		if (this.isOpenOrderPriceDragging) {
+			this.handleOpenOrderPriceDragEnd();
+			return;
+		}
+
 		if (!this.isOrderTicketPriceDragging) return;
 
 		this.isOrderTicketPriceDragging = false;
 		this.orderTicketPriceDragField = null;
+		this.orderTicketPriceDragStartPrice = null;
+		this.orderTicketPriceDragGrabOffsetY = 0;
 		this.setState({ isOrderTicketPriceDragging: false }, () => {
 			if (this.state.orderTicket) {
 				this.scheduleOrderPreview();
 			}
 		});
+	};
+
+	releaseOpenOrderPointerCapture = () => {
+		const el = this.openOrderDragCaptureEl;
+		const pointerId = this.openOrderDragPointerId;
+
+		if (el && pointerId != null && el.hasPointerCapture?.(pointerId)) {
+			try {
+				el.releasePointerCapture(pointerId);
+			} catch {
+				// Element may already be gone after remount.
+			}
+		}
+
+		this.openOrderDragCaptureEl = null;
+		this.openOrderDragPointerId = null;
+	};
+
+	cancelOpenOrderPriceDrag = () => {
+		if (!this.isOpenOrderPriceDragging && !this.state.openOrderDrag) return;
+		if (this.state.openOrderDrag?.pending) return;
+
+		this.isOpenOrderPriceDragging = false;
+		this.openOrderPriceDragGrabOffsetY = 0;
+		this.openOrderDragFrozenTotals = null;
+		this.openOrderDragFrozenLimitTotal = null;
+		this.releaseOpenOrderPointerCapture();
+		this.setOrderLineDisplayPlace("cancelOpenOrderPriceDrag");
+		this.noteDragOwnerIfChanged("cancelOpenOrderPriceDrag", null);
+		this.setState({ openOrderDrag: null }, this.schedulePriceOverlayUpdate);
+	};
+
+	getOpenOrderEditHandleKey = (orderId, kind = "limit") => (
+		kind === "limit" ? `open:${orderId}` : `open:${orderId}:${kind}`
+	);
+
+	getOpenOrderEditSize = (order) => {
+		const candidates = [
+			order?.amount,
+			order?.leaves_quantity,
+			order?.base_size,
+			order?.total_base_size,
+		];
+
+		for (const candidate of candidates) {
+			const size = Number(candidate);
+			if (Number.isFinite(size) && size > 0) return size;
+		}
+
+		const legs = Array.isArray(order?.bracket_legs) ? order.bracket_legs : [];
+		for (const leg of legs) {
+			for (const candidate of [leg?.amount, leg?.base_size, leg?.total_base_size]) {
+				const size = Number(candidate);
+				if (Number.isFinite(size) && size > 0) return size;
+			}
+		}
+
+		return null;
+	};
+
+	findOpenOrderById = (orderId) => {
+		const list = Array.isArray(this.state.allOrders) ? this.state.allOrders : [];
+		const index = findOrderEditIndex(list, orderId);
+		return index >= 0 ? list[index] : null;
+	};
+
+	patchAllOrdersRow = (orders, orderId, updater) => {
+		const list = Array.isArray(orders) ? orders : [];
+		const index = findOrderEditIndex(list, orderId);
+		if (index < 0) {
+			const created = updater(null);
+			return created ? [...list, created] : list;
+		}
+
+		const patched = updater(list[index]);
+		if (!patched) return list.filter((_, itemIndex) => itemIndex !== index);
+
+		return list.map((order, itemIndex) => (
+			itemIndex === index ? patched : order
+		));
+	};
+
+	isOpenOrderMoveLocked = (order) => {
+		const status = String(order?.status || "").toUpperCase();
+		return status === "PENDING" || Boolean(order?.pending_request_id);
+	};
+
+	readPollsAfterMove = (order) => {
+		const count = Number(order?.pollsAfterMove);
+		return Number.isFinite(count) && count >= 0 ? count : POLLS_AFTER_MOVE_MAX;
+	};
+
+	applyPointerPriceToOrder = (order, drag, price) => {
+		if (!order) return null;
+
+		const next = { ...order };
+		const kind = String(drag?.kind || "limit").toLowerCase();
+
+		if (kind === "stop_loss" && Array.isArray(next.bracket_legs)) {
+			next.bracket_legs = next.bracket_legs.map(leg => (
+				String(leg?.role || "").toLowerCase() === "stop_loss"
+					? { ...leg, price }
+					: leg
+			));
+		} else if (kind === "take_profit" && Array.isArray(next.bracket_legs)) {
+			next.price = price;
+			next.bracket_legs = next.bracket_legs.map(leg => (
+				String(leg?.role || "").toLowerCase() === "take_profit"
+					? { ...leg, price }
+					: leg
+			));
+		} else if (Number.isFinite(price) && price > 0) {
+			next.price = price;
+		}
+
+		return enrichOrderForDisplay(next);
+	};
+
+	stampOpenOrderEditPending = (order, drag, price, pendingRequestId) => {
+		const next = this.applyPointerPriceToOrder(order, drag, price);
+		if (!next) return null;
+		return enrichOrderForDisplay({
+			...next,
+			status: "PENDING",
+			pending_request_id: pendingRequestId,
+		});
+	};
+
+	orderDisplayPricesDiffer = (local, incoming) => {
+		if (!local || !incoming) return false;
+		if (Number(local.price) !== Number(incoming.price)) return true;
+
+		const localLegs = Array.isArray(local.bracket_legs) ? local.bracket_legs : [];
+		const incomingLegs = Array.isArray(incoming.bracket_legs) ? incoming.bracket_legs : [];
+		for (const role of ["take_profit", "stop_loss"]) {
+			const localLeg = localLegs.find(leg => String(leg?.role || "").toLowerCase() === role);
+			const incomingLeg = incomingLegs.find(leg => String(leg?.role || "").toLowerCase() === role);
+			const localPrice = localLeg?.price;
+			const incomingPrice = incomingLeg?.price;
+			if (
+				(Number.isFinite(Number(localPrice)) || Number.isFinite(Number(incomingPrice)))
+				&& Number(localPrice) !== Number(incomingPrice)
+			) {
+				return true;
+			}
+		}
+
+		return false;
+	};
+
+	keepLocalDisplayPrices = (incoming, local) => {
+		if (!incoming || !local) return incoming;
+
+		const next = {
+			...incoming,
+			price: local.price,
+		};
+		if (local.stop_price !== undefined) {
+			next.stop_price = local.stop_price;
+		}
+
+		const localLegs = Array.isArray(local.bracket_legs) ? local.bracket_legs : [];
+		const incomingLegs = Array.isArray(incoming.bracket_legs) ? incoming.bracket_legs : [];
+		if (localLegs.length && incomingLegs.length) {
+			next.bracket_legs = incomingLegs.map(leg => {
+				const role = String(leg?.role || "").toLowerCase();
+				const localLeg = localLegs.find(item => String(item?.role || "").toLowerCase() === role);
+				if (localLeg && Number.isFinite(Number(localLeg.price))) {
+					return { ...leg, price: localLeg.price };
+				}
+				return leg;
+			});
+		} else if (localLegs.length) {
+			next.bracket_legs = localLegs;
+		}
+
+		return enrichOrderForDisplay(next);
+	};
+
+	// One merge rule for the REST orders poll and the socket orders_update: both
+	// deliver the same backend all_orders list.
+	// NOW = row in allOrders, NEW = incoming row with the same original_id.
+	mergeIncomingOrderRow = (now, incoming) => {
+		// This tab is awaiting its EDIT response: only that response may touch the row.
+		if (now?.pending_request_id) {
+			return { order: now, case: "hold_pending_request_id" };
+		}
+		if (!incoming) {
+			return { order: null, case: "drop_missing" };
+		}
+		if (!now) {
+			return { order: incoming, case: "add_new" };
+		}
+
+		const incomingStatus = String(incoming.status || "").toUpperCase();
+		if (incomingStatus === "PENDING") {
+			return { order: now, case: "ignore_incoming_pending" };
+		}
+		if (incomingStatus === "ERROR") {
+			return { order: { ...incoming, pollsAfterMove: 0 }, case: "apply_error" };
+		}
+
+		if (!this.orderDisplayPricesDiffer(now, incoming)) {
+			return {
+				order: { ...incoming, pollsAfterMove: POLLS_AFTER_MOVE_MAX },
+				case: "prices_match_accept",
+			};
+		}
+
+		const count = this.readPollsAfterMove(now);
+		if (count < POLLS_AFTER_MOVE_MAX) {
+			return {
+				order: {
+					...this.keepLocalDisplayPrices(incoming, now),
+					pollsAfterMove: count + 1,
+				},
+				case: "hold_local_prices_poll",
+			};
+		}
+
+		return {
+			order: { ...incoming, pollsAfterMove: POLLS_AFTER_MOVE_MAX },
+			case: "accept_incoming_prices",
+		};
+	};
+
+	adoptIncomingOrders = (prevAllOrders, incomingOrders, source) => {
+		this.setOrderLineDisplayPlace(source);
+
+		const prevList = Array.isArray(prevAllOrders) ? prevAllOrders : [];
+		const incomingList = uniqueOrdersByOriginalId(
+			(Array.isArray(incomingOrders) ? incomingOrders : []).map(enrichOrderForDisplay),
+		).filter(order => (
+			isDisplayableOrderStatus(order.status)
+			&& String(order?.order_type || "").toUpperCase() !== "MARKET"
+		));
+
+		const prevById = new Map();
+		prevList.forEach(order => {
+			const id = String(order?.original_id || "").trim();
+			if (id) prevById.set(id, order);
+		});
+
+		const seen = new Set();
+		const allOrders = [];
+		const notices = [];
+		const mergeCases = [];
+
+		incomingList.forEach(incoming => {
+			const id = String(incoming?.original_id || "").trim();
+			if (!id) return;
+			seen.add(id);
+			const now = prevById.get(id) || null;
+			const merged = this.mergeIncomingOrderRow(now, incoming);
+			const next = merged.order;
+			if (next) allOrders.push(next);
+
+			let rowCase = merged.case;
+			// This tab's BUY replace: the EDIT response was PENDING (pollsAfterMove = 0);
+			// the final status arrives here, so the notice is shown here.
+			const awaitingBuyReplace = (
+				String(now?.status || "").toUpperCase() === "PENDING"
+				&& !now?.pending_request_id
+				&& Number(now?.pollsAfterMove) === 0
+			);
+			if (awaitingBuyReplace) {
+				const incomingStatus = String(incoming?.status || "").toUpperCase();
+				if (incomingStatus === "OPEN") {
+					rowCase = "buy_replace_resolve_open";
+					notices.push({ tone: "success", message: "Order successfully updated" });
+				} else if (incomingStatus === "ERROR") {
+					rowCase = "buy_replace_resolve_error";
+					notices.push({ tone: "error", message: "Unable to update order." });
+				}
+			}
+
+			mergeCases.push({
+				original_id: id,
+				case: rowCase,
+				from_status: now ? String(now.status || "").toUpperCase() : null,
+				to_status: String(incoming?.status || "").toUpperCase(),
+				from_price: now ? Number(now.price) : null,
+				to_price: Number(incoming?.price),
+				pollsAfterMove: next ? this.readPollsAfterMove(next) : null,
+			});
+		});
+
+		prevList.forEach(now => {
+			const id = String(now?.original_id || "").trim();
+			if (!id || seen.has(id)) return;
+			const merged = this.mergeIncomingOrderRow(now, null);
+			const next = merged.order;
+			if (next) allOrders.push(next);
+			mergeCases.push({
+				original_id: id,
+				case: merged.case,
+				from_status: String(now.status || "").toUpperCase(),
+				to_status: null,
+				from_price: Number(now.price),
+				to_price: null,
+				pollsAfterMove: next ? this.readPollsAfterMove(next) : null,
+			});
+		});
+
+		this.diffChartOrderLines(prevList, allOrders, source);
+
+		return { allOrders, notices, mergeCases };
+	};
+
+	showMergeNotices = (notices) => {
+		(Array.isArray(notices) ? notices : []).forEach(notice => {
+			this.showChartNotice(notice.message, { tone: notice.tone });
+		});
+	};
+
+	orderIsActiveDragTarget = (order, drag) => {
+		if (!drag || !order) return false;
+
+		const dragId = String(drag.orderId || "");
+		if (!dragId) return false;
+
+		const hits = (
+			String(order.original_id || "") === dragId
+		);
+		if (!hits) return false;
+
+		const kind = String(drag.kind || "limit").toLowerCase();
+		const role = String(order.role || "").toLowerCase();
+
+		if (kind === "take_profit") return role === "take_profit";
+		if (kind === "stop_loss") return role === "stop_loss";
+		return !role;
+	};
+
+	getLiveDragLinePrice = (order, drag = this.state.openOrderDrag) => {
+		const rowPrice = Number(order?.price);
+		if (
+			drag
+			&& !drag.pending
+			&& this.orderIsActiveDragTarget(order, drag)
+		) {
+			const pointerPrice = Number(drag.pointerPrice);
+			if (Number.isFinite(pointerPrice) && pointerPrice > 0) return pointerPrice;
+		}
+		return rowPrice;
+	};
+
+	flashOpenOrderEditError = (handleKey) => {
+		if (this.openOrderEditErrorFlashTimer) {
+			window.clearTimeout(this.openOrderEditErrorFlashTimer);
+			this.openOrderEditErrorFlashTimer = null;
+		}
+
+		this.setState({ openOrderEditErrorFlashKey: handleKey || "" });
+		this.openOrderEditErrorFlashTimer = window.setTimeout(() => {
+			this.openOrderEditErrorFlashTimer = null;
+			this.setState(prev => (
+				prev.openOrderEditErrorFlashKey === handleKey
+					? { openOrderEditErrorFlashKey: "" }
+					: null
+			));
+		}, OPEN_ORDER_EDIT_ERROR_FLASH_MS);
+	};
+
+	handleOpenOrderPriceDragStart = (event, handle) => {
+		if (event.button != null && event.button !== 0) return;
+		if (this.state.orderTicket || this.state.isOrderTicketClosing) return;
+		if (this.isOrderTicketPriceDragging || this.isOpenOrderPriceDragging) return;
+		if (!handle?.orderId || !handle?.kind) return;
+
+		const order = this.findOpenOrderById(handle.orderId);
+		if (!order || this.isOpenOrderMoveLocked(order)) return;
+		if (!isOpenOrderStatus(order.status) || isErrorOrderStatus(order.status)) return;
+
+		const size = this.getOpenOrderEditSize(order);
+		if (!Number.isFinite(size) || size <= 0) return;
+
+		const startPrice = Number(handle.price);
+		if (!Number.isFinite(startPrice) || startPrice <= 0) return;
+
+		event.preventDefault();
+		event.stopPropagation();
+
+		if (event.currentTarget?.setPointerCapture && event.pointerId != null) {
+			try {
+				event.currentTarget.setPointerCapture(event.pointerId);
+				this.openOrderDragCaptureEl = event.currentTarget;
+				this.openOrderDragPointerId = event.pointerId;
+			} catch {
+				this.openOrderDragCaptureEl = null;
+				this.openOrderDragPointerId = null;
+			}
+		}
+
+		const takeProfitPrice = Number(
+			order.bracket_legs?.find(leg => leg.role === "take_profit")?.price
+			?? order.price
+		);
+		const stopLossPrice = Number(
+			order.bracket_legs?.find(leg => leg.role === "stop_loss")?.price
+		);
+
+		this.isOpenOrderPriceDragging = true;
+		this.openOrderPriceDragGrabOffsetY = this.getPriceDragGrabOffsetY(event, startPrice);
+		this.openOrderDragFrozenTotals = null;
+		this.openOrderDragFrozenLimitTotal = null;
+		const side = String(order.side || "").toUpperCase() === "SELL" ? "SELL" : "BUY";
+		const confirmedUsd = this.getOrderConfirmedUsdNotional(order);
+		const nextDrag = {
+			orderId: handle.orderId,
+			productId: order.product_id,
+			kind: handle.kind,
+			handleKey: handle.key,
+			size,
+			startPrice,
+			pointerPrice: startPrice,
+			takeProfitPrice: Number.isFinite(takeProfitPrice) ? takeProfitPrice : startPrice,
+			stopLossPrice: Number.isFinite(stopLossPrice) ? stopLossPrice : null,
+			orderType: String(order.order_type || "").toUpperCase(),
+			side,
+			confirmedUsd: (
+				side === "BUY" && handle.kind === "limit" && confirmedUsd != null
+					? confirmedUsd
+					: null
+			),
+		};
+		this.setOrderLineDisplayPlace("handleOpenOrderPriceDragStart");
+		this.noteDragOwnerIfChanged("handleOpenOrderPriceDragStart", nextDrag);
+		this.setState({
+			openOrderDrag: nextDrag,
+			openOrderEditErrorFlashKey: "",
+		});
+	};
+
+	handleOpenOrderPriceDragMove = (event) => {
+		if (!this.isOpenOrderPriceDragging || !this.candleSeries) return;
+
+		const price = this.getPriceFromPointerEvent(
+			event,
+			this.openOrderPriceDragGrabOffsetY,
+		);
+
+		if (!Number.isFinite(price) || price <= 0) return;
+
+		this.setState(prev => {
+			if (!prev.openOrderDrag || prev.openOrderDrag.pending) return null;
+
+			const fromPrice = Number(prev.openOrderDrag.pointerPrice);
+			if (
+				!Number.isFinite(fromPrice)
+				|| fromPrice !== price
+			) {
+				this.setOrderLineDisplayPlace("handleOpenOrderPriceDragMove");
+				this.logChartOrderLine("move", "handleOpenOrderPriceDragMove", {
+					orderId: prev.openOrderDrag.orderId,
+					originalId: prev.openOrderDrag.orderId,
+					role: prev.openOrderDrag.kind || "limit",
+					price,
+				}, {
+					fromPrice: Number.isFinite(fromPrice) ? fromPrice : null,
+					toPrice: price,
+				});
+			}
+
+			return {
+				openOrderDrag: {
+					...prev.openOrderDrag,
+					pointerPrice: price,
+				},
+			};
+		});
+	};
+
+	handleOpenOrderPriceDragEnd = () => {
+		if (!this.isOpenOrderPriceDragging) return;
+
+		const drag = this.state.openOrderDrag;
+		this.isOpenOrderPriceDragging = false;
+		this.openOrderPriceDragGrabOffsetY = 0;
+		this.releaseOpenOrderPointerCapture();
+
+		if (!drag || drag.pending) {
+			this.openOrderDragFrozenTotals = null;
+			this.openOrderDragFrozenLimitTotal = null;
+			if (!drag?.pending) {
+				this.setOrderLineDisplayPlace("handleOpenOrderPriceDragEnd.empty");
+				this.noteDragOwnerIfChanged("handleOpenOrderPriceDragEnd.empty", null);
+				this.setState({ openOrderDrag: null });
+			}
+			return;
+		}
+
+		const roundOrderPrice = (price) => {
+			const rounded = Number(this.getOrderPriceInputValue(price));
+
+			return Number.isFinite(rounded) && rounded > 0 ? rounded : NaN;
+		};
+
+		const pointerPrice = roundOrderPrice(drag.pointerPrice);
+		const startPrice = roundOrderPrice(drag.startPrice);
+		const unchanged = (
+			!Number.isFinite(pointerPrice)
+			|| (
+				Number.isFinite(startPrice)
+				&& pointerPrice === startPrice
+			)
+		);
+
+		if (unchanged) {
+			this.openOrderDragFrozenTotals = null;
+			this.openOrderDragFrozenLimitTotal = null;
+			this.setOrderLineDisplayPlace("handleOpenOrderPriceDragEnd.unchanged");
+			this.noteDragOwnerIfChanged("handleOpenOrderPriceDragEnd.unchanged", null);
+			this.setState({ openOrderDrag: null }, this.schedulePriceOverlayUpdate);
+			return;
+		}
+
+		const body = {
+			original_id: drag.orderId,
+		};
+
+		if (drag.kind === "limit") {
+			body.price = pointerPrice;
+		} else if (drag.kind === "take_profit") {
+			body.price = pointerPrice;
+			const stopLossPrice = roundOrderPrice(drag.stopLossPrice);
+			if (!Number.isFinite(stopLossPrice)) {
+				this.openOrderDragFrozenTotals = null;
+				this.openOrderDragFrozenLimitTotal = null;
+				this.setOrderLineDisplayPlace("handleOpenOrderPriceDragEnd.missingStop");
+				this.noteDragOwnerIfChanged("handleOpenOrderPriceDragEnd.missingStop", null);
+				this.setState({ openOrderDrag: null }, () => {
+					this.schedulePriceOverlayUpdate();
+					this.flashOpenOrderEditError(drag.handleKey);
+					this.showChartNotice("Stop loss price missing for bracket edit.", { tone: "error" });
+				});
+				return;
+			}
+			body.stop_price = stopLossPrice;
+		} else if (drag.kind === "stop_loss") {
+			const takeProfitPrice = roundOrderPrice(drag.takeProfitPrice);
+			if (!Number.isFinite(takeProfitPrice)) {
+				this.openOrderDragFrozenTotals = null;
+				this.openOrderDragFrozenLimitTotal = null;
+				this.setOrderLineDisplayPlace("handleOpenOrderPriceDragEnd.missingTakeProfit");
+				this.noteDragOwnerIfChanged("handleOpenOrderPriceDragEnd.missingTakeProfit", null);
+				this.setState({ openOrderDrag: null }, () => {
+					this.schedulePriceOverlayUpdate();
+					this.flashOpenOrderEditError(drag.handleKey);
+					this.showChartNotice("Take profit price missing for bracket edit.", { tone: "error" });
+				});
+				return;
+			}
+			body.price = takeProfitPrice;
+			body.stop_price = pointerPrice;
+		} else {
+			this.setOrderLineDisplayPlace("handleOpenOrderPriceDragEnd.unknownKind");
+			this.noteDragOwnerIfChanged("handleOpenOrderPriceDragEnd.unknownKind", null);
+			this.setState({ openOrderDrag: null }, this.schedulePriceOverlayUpdate);
+			return;
+		}
+
+		const pendingRequestId = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+		const previousPrice = startPrice;
+
+		this.setState(prev => {
+			const allOrders = this.patchAllOrdersRow(
+				prev.allOrders,
+				drag.orderId,
+				(order) => this.stampOpenOrderEditPending(
+					order,
+					drag,
+					pointerPrice,
+					pendingRequestId,
+				) || order,
+			);
+
+			this.setOrderLineDisplayPlace("handleOpenOrderPriceDragEnd.send");
+			this.diffChartOrderLines(
+				prev.allOrders,
+				allOrders,
+				"handleOpenOrderPriceDragEnd.send",
+			);
+
+			this.noteDragOwnerIfChanged("handleOpenOrderPriceDragEnd.send", null, prev.openOrderDrag);
+
+			return {
+				openOrderDrag: null,
+				allOrders,
+			};
+		}, this.schedulePriceOverlayUpdate);
+
+		// Row as it was before the drop: moved leg back at previousPrice, no pending request.
+		const restoreRow = (order, status) => enrichOrderForDisplay({
+			...this.applyPointerPriceToOrder(order, drag, previousPrice),
+			status,
+			pending_request_id: null,
+			pollsAfterMove: 0,
+		});
+
+		// The EDIT response is the only thing that settles a row carrying pending_request_id.
+		const settleRow = (place, updater, notice) => {
+			this.setState(prev => {
+				const allOrders = this.patchAllOrdersRow(
+					prev.allOrders,
+					drag.orderId,
+					(order) => (order ? updater(order) : order),
+				);
+
+				this.setOrderLineDisplayPlace(place);
+				this.diffChartOrderLines(prev.allOrders, allOrders, place);
+
+				return { allOrders };
+			}, () => {
+				this.schedulePriceOverlayUpdate();
+				if (!notice) return;
+				if (notice.tone === "error") this.flashOpenOrderEditError(drag.handleKey);
+				this.showChartNotice(notice.message, { tone: notice.tone });
+			});
+		};
+
+		api.editOrder(body)
+			.then(response => {
+				const updatedOrder = response.data?.order
+					? enrichOrderForDisplay(response.data.order)
+					: null;
+				const updatedStatus = String(updatedOrder?.status || "").toUpperCase();
+
+				if (updatedStatus === "OPEN") {
+					settleRow(
+						"handleOpenOrderPriceDragEnd.response.open",
+						() => enrichOrderForDisplay({
+							...updatedOrder,
+							pending_request_id: null,
+							pollsAfterMove: 0,
+						}),
+						{ tone: "success", message: "Order successfully updated" },
+					);
+					return;
+				}
+
+				if (updatedStatus === "PENDING") {
+					settleRow(
+						"handleOpenOrderPriceDragEnd.response.pending",
+						(order) => enrichOrderForDisplay({
+							...(updatedOrder || order),
+							status: "PENDING",
+							pending_request_id: null,
+							pollsAfterMove: 0,
+						}),
+						null,
+					);
+					return;
+				}
+
+				if (updatedStatus === "ERROR") {
+					settleRow(
+						"handleOpenOrderPriceDragEnd.response.error",
+						() => enrichOrderForDisplay({
+							...updatedOrder,
+							pending_request_id: null,
+							pollsAfterMove: 0,
+						}),
+						{ tone: "error", message: "Unable to update order." },
+					);
+					return;
+				}
+
+				settleRow(
+					"handleOpenOrderPriceDragEnd.response.unknown",
+					(order) => restoreRow(order, "OPEN"),
+					{
+						tone: "error",
+						message: `Unable to update order (unexpected response${updatedStatus ? ` ${updatedStatus}` : ""})`,
+					},
+				);
+			})
+			.catch((error) => {
+				const httpStatus = Number(error?.response?.status);
+				const detail = error?.response?.data?.detail;
+				const code = Number.isFinite(httpStatus) && httpStatus > 0
+					? `HTTP ${httpStatus}`
+					: error?.code === "ECONNABORTED"
+						? "ECONNABORTED (timeout 15s)"
+						: error?.code === "ERR_NETWORK"
+							? "ERR_NETWORK"
+							: (error?.code || "NO_RESPONSE");
+
+				if (httpStatus === 409) {
+					settleRow(
+						"handleOpenOrderPriceDragEnd.catch.409",
+						(order) => restoreRow(order, "PENDING"),
+						{
+							tone: "error",
+							message: "Move failed: a move for this order is already in progress (HTTP 409)",
+						},
+					);
+					return;
+				}
+
+				const label = getOrderErrorLabel(detail || error?.message, "Unable to update order.");
+				settleRow(
+					"handleOpenOrderPriceDragEnd.catch",
+					(order) => restoreRow(order, "OPEN"),
+					{ tone: "error", message: `${label} (${code})` },
+				);
+			});
 	};
 
 	handleOrderTicketMoveDragStart = (event) => {
@@ -5040,8 +7388,6 @@ class Home extends React.Component {
 	};
 
 	getLiveMarketPrice = () => this.getOverlayMarketPrice(this.state);
-
-	getLiveMarketPriceFromState = (state = this.state) => this.getOverlayMarketPrice(state);
 
 	getMarketPriceTickSize = () => {
 		const increment = Number(this.state.product?.quote_increment);
@@ -5126,6 +7472,7 @@ class Home extends React.Component {
 		const stopPrice = Number(ticket.stopPrice);
 		const takeProfitPrice = Number(ticket.takeProfitPrice);
 		const stopLossPrice = Number(ticket.stopLossPrice);
+		const trailPercent = Number(ticket.trailPercent);
 
 		if (!Number.isFinite(amount) || amount <= 0) {
 			return {
@@ -5134,27 +7481,16 @@ class Home extends React.Component {
 			};
 		}
 
-		if (orderType !== "MARKET" && orderType !== "BRACKET" && (!Number.isFinite(price) || price <= 0)) {
+		if (
+			orderType !== "MARKET"
+			&& orderType !== "BRACKET"
+			&& !this.isTrailingOrderType(orderType)
+			&& (!Number.isFinite(price) || price <= 0)
+		) {
 			return {
 				isValid: false,
 				error: "Enter a valid limit price.",
 			};
-		}
-
-		if (
-			side === "BUY"
-			&& orderType === "LIMIT"
-			&& Number.isFinite(price)
-			&& price > 0
-		) {
-			const currentPrice = this.getLiveMarketPrice();
-
-			if (Number.isFinite(currentPrice) && price > currentPrice) {
-				return {
-					isValid: false,
-					error: "Limit price cannot exceed current price.",
-				};
-			}
 		}
 
 		if (orderType === "STOP_LIMIT" && (!Number.isFinite(stopPrice) || stopPrice <= 0)) {
@@ -5203,8 +7539,24 @@ class Home extends React.Component {
 			}
 		}
 
+		if (this.isTrailingOrderType(orderType)) {
+			if (side !== "SELL") {
+				return {
+					isValid: false,
+					error: "Trailing is only available for sell.",
+				};
+			}
+
+			if (!Number.isFinite(trailPercent) || trailPercent <= 0 || trailPercent >= 100) {
+				return {
+					isValid: false,
+					error: "Trail percent must be greater than 0 and below 100.",
+				};
+			}
+		}
+
 		const sourceBalance = side === "BUY"
-			? this.getBuyQuoteBalance(0)
+			? this.getBuyQuoteBalance()
 			: this.getAvailableBalanceForSide(side);
 
 		return {
@@ -5329,26 +7681,19 @@ class Home extends React.Component {
 		const stopPrice = Number(ticket.stopPrice);
 		const takeProfitPrice = Number(ticket.takeProfitPrice);
 		const stopLossPrice = Number(ticket.stopLossPrice);
+		const trailPercent = Number(ticket.trailPercent);
 
 		if (!Number.isFinite(amount) || amount <= 0) {
 			return "";
 		}
 
-		if (orderType !== "MARKET" && orderType !== "BRACKET" && (!Number.isFinite(price) || price <= 0)) {
-			return "Enter a valid limit price.";
-		}
-
 		if (
-			side === "BUY"
-			&& orderType === "LIMIT"
-			&& Number.isFinite(price)
-			&& price > 0
+			orderType !== "MARKET"
+			&& orderType !== "BRACKET"
+			&& !this.isTrailingOrderType(orderType)
+			&& (!Number.isFinite(price) || price <= 0)
 		) {
-			const currentPrice = this.getLiveMarketPrice();
-
-			if (Number.isFinite(currentPrice) && price > currentPrice) {
-				return "Limit price cannot exceed current price.";
-			}
+			return "Enter a valid limit price.";
 		}
 
 		if (orderType === "STOP_LIMIT" && (!Number.isFinite(stopPrice) || stopPrice <= 0)) {
@@ -5376,6 +7721,16 @@ class Home extends React.Component {
 
 			if (takeProfitPrice < stopLossPrice) {
 				return "TP must be at or above SL.";
+			}
+		}
+
+		if (this.isTrailingOrderType(orderType)) {
+			if (side !== "SELL") {
+				return "Trailing is only available for sell.";
+			}
+
+			if (!Number.isFinite(trailPercent) || trailPercent <= 0 || trailPercent >= 100) {
+				return "Trail percent must be greater than 0 and below 100.";
 			}
 		}
 
@@ -5499,8 +7854,43 @@ class Home extends React.Component {
 		previewError: "",
 		previewMarketPrice: null,
 		previewEnteredAmount: null,
+		previewRequestedAt: null,
 		isPreviewLoading: false,
 	});
+
+	stopOrderPreviewWaitTicker = () => {
+		if (this.orderPreviewWaitTimer) {
+			window.clearInterval(this.orderPreviewWaitTimer);
+			this.orderPreviewWaitTimer = null;
+		}
+	};
+
+	ensureOrderPreviewWaitTicker = () => {
+		if (this.orderPreviewWaitTimer) return;
+
+		this.orderPreviewWaitTimer = window.setInterval(() => {
+			const ticket = this.state.orderTicket;
+
+			if (!ticket?.isPreviewLoading || !ticket?.previewRequestedAt) {
+				this.stopOrderPreviewWaitTicker();
+				return;
+			}
+
+			this.setState(prev => ({
+				overlayTick: prev.overlayTick + 1,
+			}));
+		}, 1000);
+	};
+
+	getOrderPreviewWaitSeconds = (ticket = this.state.orderTicket) => {
+		const requestedAt = Number(ticket?.previewRequestedAt);
+
+		if (!ticket?.isPreviewLoading || !Number.isFinite(requestedAt) || requestedAt <= 0) {
+			return null;
+		}
+
+		return Math.max(0, Math.floor((Date.now() - requestedAt) / 1000));
+	};
 
 	getOrderTicketPreviewBodyKey = (ticket, responseData) => {
 		if (!ticket || !responseData) return "";
@@ -5527,8 +7917,12 @@ class Home extends React.Component {
 
 		if (!acceptedBodyKey) {
 			this.updateOrderTicket({
+				previewRequestedAt: null,
 				isPreviewLoading: false,
-			}, { schedulePreview: false });
+			}, {
+				schedulePreview: false,
+				onCommitted: () => this.stopOrderPreviewWaitTicker(),
+			});
 			return false;
 		}
 
@@ -5552,10 +7946,12 @@ class Home extends React.Component {
 			previewError,
 			previewMarketPrice: this.isMarketOrderTicket(currentTicket) ? previewMarketPrice : null,
 			previewEnteredAmount: currentTicket.amount,
+			previewRequestedAt: null,
 			isPreviewLoading: false,
 		}, {
 			schedulePreview: false,
 			onCommitted: () => {
+				this.stopOrderPreviewWaitTicker();
 				if (this.isMarketOrderTicket(this.state.orderTicket)) {
 					this.stopMarketPreviewPoller();
 					this.ensureMarketPreviewPoller();
@@ -5589,8 +7985,12 @@ class Home extends React.Component {
 				previewBodyKey: "",
 				previewError: stopLimitError,
 				previewMarketPrice: null,
+				previewRequestedAt: null,
 				isPreviewLoading: false,
-			}, { schedulePreview: false });
+			}, {
+				schedulePreview: false,
+				onCommitted: () => this.stopOrderPreviewWaitTicker(),
+			});
 			return;
 		}
 
@@ -5602,8 +8002,12 @@ class Home extends React.Component {
 				previewBodyKey: "",
 				previewError: previewError === "" ? "" : previewError,
 				previewMarketPrice: null,
+				previewRequestedAt: null,
 				isPreviewLoading: false,
-			}, { schedulePreview: false });
+			}, {
+				schedulePreview: false,
+				onCommitted: () => this.stopOrderPreviewWaitTicker(),
+			});
 			return;
 		}
 
@@ -5650,8 +8054,12 @@ class Home extends React.Component {
 				previewBodyKey: "",
 				previewError: "",
 				previewMarketPrice: null,
+				previewRequestedAt: null,
 				isPreviewLoading: false,
-			}, { schedulePreview: false });
+			}, {
+				schedulePreview: false,
+				onCommitted: () => this.stopOrderPreviewWaitTicker(),
+			});
 			return;
 		}
 
@@ -5669,8 +8077,12 @@ class Home extends React.Component {
 
 		this.updateOrderTicket({
 			isPreviewLoading: true,
+			previewRequestedAt: Date.now(),
 			previewError: "",
-		}, { schedulePreview: false });
+		}, {
+			schedulePreview: false,
+			onCommitted: () => this.ensureOrderPreviewWaitTicker(),
+		});
 
 		api.previewOrder(body)
 			.then(response => {
@@ -5701,8 +8113,12 @@ class Home extends React.Component {
 						},
 					),
 					previewMarketPrice: null,
+					previewRequestedAt: null,
 					isPreviewLoading: false,
-				}, { schedulePreview: false });
+				}, {
+					schedulePreview: false,
+					onCommitted: () => this.stopOrderPreviewWaitTicker(),
+				});
 			});
 	};
 
@@ -5738,7 +8154,7 @@ class Home extends React.Component {
 			};
 		}
 
-		let quoteCurrency = side === "BUY" ? "USD" : "USDC";
+		let quoteCurrency = "USDC";
 
 		if (forPreview) {
 			const previewError = this.getOrderTicketPreviewError(ticket);
@@ -5751,7 +8167,7 @@ class Home extends React.Component {
 			}
 
 			if (side === "BUY") {
-				quoteCurrency = this.getBuyQuoteBalance(0).currency || "USD";
+				quoteCurrency = this.getBuyQuoteBalance().currency || "USDC";
 			}
 		} else {
 			const validation = this.getOrderTicketValidation(ticket);
@@ -5764,7 +8180,7 @@ class Home extends React.Component {
 			}
 
 			quoteCurrency = side === "BUY"
-				? validation.sourceCurrency || "USD"
+				? validation.sourceCurrency || "USDC"
 				: "USDC";
 		}
 
@@ -5798,6 +8214,10 @@ class Home extends React.Component {
 			body.stop_loss_price = Number(ticket.stopLossPrice);
 		}
 
+		if (this.isTrailingOrderType(orderType)) {
+			body.trail_percent = Number(ticket.trailPercent);
+		}
+
 		if (orderType === "BRACKET" && ticket.amountMode === "USD") {
 			delete body.quote_size;
 			body.base_size = amount / Number(ticket.takeProfitPrice);
@@ -5811,7 +8231,7 @@ class Home extends React.Component {
 
 	submitOrderTicket = () => {
 		const ticket = this.state.orderTicket;
-		if (!ticket || ticket.isSubmitting || ticket.isPreviewLoading) return;
+		if (!ticket || ticket.isSubmitting) return;
 
 		const orderBuild = this.buildOrderTicketBody(ticket);
 
@@ -5829,57 +8249,87 @@ class Home extends React.Component {
 		const previewId = preview?.preview_id;
 		const hasValidPreview = preview && ticket.previewBodyKey === bodyKey && !ticket.previewError;
 
-		if (!hasValidPreview) {
-			this.refreshOrderPreview({ fromAmountChange: true });
-			return;
+		const placeBody = { ...body };
+		const orderType = String(placeBody.order_type || "").toUpperCase();
+		const isBuy = String(placeBody.side || "").toUpperCase() === "BUY";
+		const previewQuoteSize = Number(preview?.quote_size);
+
+		if (
+			hasValidPreview
+			&& isBuy
+			&& (orderType === "LIMIT" || orderType === "STOP_LIMIT")
+			&& Number.isFinite(previewQuoteSize)
+			&& previewQuoteSize > 0
+		) {
+			placeBody.quote_size = previewQuoteSize;
+			delete placeBody.base_size;
 		}
 
 		this.updateOrderTicket({ isSubmitting: true, error: "" }, { schedulePreview: false });
 
 		api.placeOrder({
-			...body,
-			preview_id: previewId,
-			preview_base_size: preview?.base_size,
-			preview_order_total: preview?.order_total,
-			preview_commission_total: preview?.commission_total,
-			preview_quote_size: preview?.quote_size,
+			...placeBody,
+			...(hasValidPreview
+				? {
+					preview_id: previewId,
+					preview_base_size: preview?.base_size,
+					preview_order_total: preview?.order_total,
+					preview_commission_total: preview?.commission_total,
+					preview_quote_size: preview?.quote_size,
+				}
+				: {}),
 		})
 			.then((response) => {
-				const optimisticOrder = buildOptimisticOrderFromPlacement({ body, preview, response });
 				const closingTicket = this.state.orderTicket;
+				const placedOrder = response?.data?.order
+					? enrichOrderForDisplay(response.data.order)
+					: null;
+
+				if (
+					this.isTrailingOrderType(orderType)
+					&& Number.isFinite(Number(placeBody.trail_percent))
+					&& Number(placeBody.trail_percent) > 0
+					&& Number(placeBody.trail_percent) < 100
+				) {
+					setCookieValue(TRAILING_PERCENT_COOKIE, String(placeBody.trail_percent));
+				}
 
 				this.prepareOrderTicketClose();
 
 				this.setState(prev => {
 					const ticket = prev.orderTicket;
-					const nextState = {};
+					const next = {};
 
-					if (optimisticOrder) {
-						nextState.allOrders = this.mergeOrderUpdates(prev.allOrders, [optimisticOrder], new Set());
-						nextState.orders = this.mergeOrderUpdates(prev.orders, [optimisticOrder], new Set());
+					if (placedOrder) {
+						next.allOrders = uniqueOrdersByOriginalId(
+							this.mergeOrderUpdates(prev.allOrders, [placedOrder]),
+						);
+						this.diffChartOrderLines(
+							prev.allOrders,
+							next.allOrders,
+							"submitOrderTicket.placed",
+						);
 					}
 
-					if (!ticket) {
-						return Object.keys(nextState).length ? nextState : null;
-					}
-
-					return {
-						...nextState,
-						isOrderTicketClosing: true,
-						lastOrderSide: ticket.side === "SELL" ? "SELL" : "BUY",
-						savedOrderTickets: {
+					if (ticket) {
+						next.isOrderTicketClosing = true;
+						next.lastOrderSide = ticket.side === "SELL" ? "SELL" : "BUY";
+						next.savedOrderTickets = {
 							...prev.savedOrderTickets,
 							[ticket.side]: this.getSavedOrderSnapshot(ticket),
-						},
-						orderScaleHover: null,
-					};
+						};
+						next.orderScaleHover = null;
+					}
+
+					return Object.keys(next).length ? next : null;
 				}, () => {
 					if (closingTicket) {
 						this.scheduleOrderTicketCloseEnd();
 					}
 
-					this.loadOrders();
-					this.loadAllOrders();
+					this.scheduleOverlayUpdate();
+					this.showChartNotice("Order successfully placed", { tone: "success" });
+					this.loadAllOrders({ force: true });
 				});
 			})
 			.catch(error => {
@@ -5899,7 +8349,7 @@ class Home extends React.Component {
 		event.preventDefault();
 		event.stopPropagation();
 
-		const orderId = order?.cancel_id || order?.parent_id || order?.id;
+		const orderId = order?.original_id;
 
 		if (!orderId) {
 			this.setState({ orderError: "Unable to cancel order: missing order id." });
@@ -5909,8 +8359,19 @@ class Home extends React.Component {
 		this.setState({ orderError: "" });
 
 		api.cancelOrder(orderId).then(() => {
-			this.loadOrders();
-			this.loadAllOrders();
+			this.setState(prev => {
+				const allOrders = (prev.allOrders || []).filter(item => (
+					String(item?.original_id || "") !== String(orderId)
+				));
+
+				this.diffChartOrderLines(prev.allOrders, allOrders, "cancelOrder");
+
+				return {
+					allOrders,
+					orderError: "",
+				};
+			}, this.scheduleOverlayUpdate);
+			this.loadAllOrders({ force: true });
 		}).catch(error => {
 			this.setState({
 				orderError: error.response?.data?.detail || error.message || "Unable to cancel Coinbase order.",
@@ -5928,12 +8389,15 @@ class Home extends React.Component {
 
 	toggleIndicator = (key) => {
 		const stateKeyByIndicator = {
+			depth: "showDepthIndicator",
 			td: "showTdIndicator",
 			vwap: "showVwapIndicator",
-			histogram: "showHistogramIndicator",
+			volh: "showVolhIndicator",
+			prch: "showPrchIndicator",
 			macd: "showMacdIndicator",
 			pvt: "showPvtIndicator",
 			lims24: "showLims24Indicator",
+			bag: "showBagValueIndicator",
 		};
 		const stateKey = stateKeyByIndicator[key];
 		const cookieName = INDICATOR_COOKIES[key];
@@ -5946,6 +8410,14 @@ class Home extends React.Component {
 			setCookieBoolean(cookieName, nextValue);
 
 			return { [stateKey]: nextValue };
+		});
+	};
+
+	toggleHud = () => {
+		this.setState(prev => {
+			const nextValue = !prev.showHud;
+			setCookieBoolean(HUD_COOKIE, nextValue);
+			return { showHud: nextValue };
 		});
 	};
 
@@ -5994,14 +8466,101 @@ class Home extends React.Component {
 		};
 	};
 
+	getPriceViewportRange = () => {
+		const range = this.getMainPriceScale()?.getVisibleRange?.();
+		const from = Number(range?.from);
+		const to = Number(range?.to);
+
+		if (Number.isFinite(from) && Number.isFinite(to)) {
+			const min = Math.min(from, to);
+			const max = Math.max(from, to);
+
+			if (max > min) {
+				this.lastPriceViewportRange = { min, max };
+				return this.lastPriceViewportRange;
+			}
+		}
+
+		const last = this.lastPriceViewportRange;
+
+		if (last && last.max > last.min) return last;
+
+		return null;
+	};
+
+	syncPriceScaleMinMoveFromViewport = () => {
+		if (this.priceScaleMinMoveSyncFrame) return;
+
+		this.priceScaleMinMoveSyncFrame = requestAnimationFrame(() => {
+			this.priceScaleMinMoveSyncFrame = null;
+			this.applyPriceSeriesFormat();
+		});
+	};
+
+	getPriceScaleMinMoveDebug = () => {
+		const viewport = this.getPriceViewportRange();
+		const visible = this.getMainPriceScale()?.getVisibleRange?.();
+		const quoteIncrement = Number(this.state.product?.quote_increment);
+		const floor = 1e-9;
+		const span = viewport ? (viewport.max - viewport.min) : NaN;
+		const raw = Number.isFinite(span) && span > 0 ? span / 2000 : NaN;
+		const fallback = !Number.isFinite(raw) || !(raw > 0);
+		let snapped = null;
+		let exp = null;
+		let minMove;
+
+		if (fallback) {
+			// Never fall back to PRICE_MIN_MOVE (1e-6) — that locks PEPE to two labels.
+			const kept = Number(this.lastPriceScaleMinMove);
+			minMove = Number.isFinite(kept) && kept > 0 ? kept : floor;
+		} else {
+			exp = Math.floor(Math.log10(raw));
+			snapped = exp >= 0 ? 10 ** exp : 1 / (10 ** (-exp));
+			minMove = Math.max(snapped, floor);
+		}
+
+		return {
+			minMove,
+			raw,
+			snapped,
+			exp,
+			floor,
+			fallback,
+			kept_minMove: Number.isFinite(Number(this.lastPriceScaleMinMove))
+				? Number(this.lastPriceScaleMinMove)
+				: null,
+			PRICE_MIN_MOVE,
+			quote_increment: Number.isFinite(quoteIncrement) ? quoteIncrement : null,
+			viewport_min: viewport?.min ?? null,
+			viewport_max: viewport?.max ?? null,
+			viewport_span: Number.isFinite(span) ? span : null,
+			getVisibleRange_from: Number.isFinite(Number(visible?.from)) ? Number(visible.from) : null,
+			getVisibleRange_to: Number.isFinite(Number(visible?.to)) ? Number(visible.to) : null,
+			lastPriceViewportRange: this.lastPriceViewportRange
+				? { ...this.lastPriceViewportRange }
+				: null,
+		};
+	};
+
+	getPriceScaleMinMove = () => this.getPriceScaleMinMoveDebug().minMove;
+
 	getPriceSeriesFormat = () => ({
 		type: 'custom',
-		minMove: Number(this.state.product?.quote_increment) || PRICE_MIN_MOVE,
+		minMove: this.getPriceScaleMinMove(),
 		formatter: this.formatChartPrice,
 	});
 
 	applyPriceSeriesFormat = () => {
-		const priceFormat = this.getPriceSeriesFormat();
+		const minMoveDebug = this.getPriceScaleMinMoveDebug();
+		const priceFormat = {
+			type: 'custom',
+			minMove: minMoveDebug.minMove,
+			formatter: this.formatChartPrice,
+		};
+
+		if (Number.isFinite(minMoveDebug.minMove) && minMoveDebug.minMove > 0) {
+			this.lastPriceScaleMinMove = minMoveDebug.minMove;
+		}
 
 		this.candleSeries?.applyOptions({ priceFormat });
 		this.tdSequentialSeries?.applyOptions({ priceFormat });
@@ -6027,22 +8586,42 @@ class Home extends React.Component {
 		));
 	};
 
-	buildDistribution = () => {
-		const { candles } = this.state;
-
+	buildDistribution = (candles = this.state.candles) => {
 		if (!candles.length) {
 			return {
 				bins: [],
-				peaks: [],
 				maxValue: 0,
+				maxCountValue: 0,
 			};
 		}
 
 		const minPrice = Math.min(...candles.map(candle => candle.low));
 		const maxPrice = Math.max(...candles.map(candle => candle.high));
+
+		if (!Number.isFinite(minPrice) || !Number.isFinite(maxPrice)) {
+			return {
+				bins: [],
+				maxValue: 0,
+				maxCountValue: 0,
+			};
+		}
+
 		const step = (maxPrice - minPrice) / DISTRIBUTION_BINS || 1;
-		const bins = Array.from({ length: DISTRIBUTION_BINS }, (_, index) => ({
-			price: minPrice + step * (index + 0.5),
+		const quoteIncrement = Number(this.state.product?.quote_increment);
+		const hasIncrement = hasPriceIncrement(quoteIncrement) && quoteIncrement > 0;
+		const precision = hasIncrement
+			? getPrecisionFromIncrement(quoteIncrement)
+			: null;
+
+		const snapToTick = (price) => {
+			if (!hasIncrement) return price;
+
+			const tick = Math.round(price / quoteIncrement);
+			return Number((tick * quoteIncrement).toFixed(precision));
+		};
+
+		const rawBins = Array.from({ length: DISTRIBUTION_BINS }, (_, index) => ({
+			price: snapToTick(minPrice + step * (index + 0.5)),
 			volumeValue: 0,
 			countValue: 0,
 		}));
@@ -6052,35 +8631,70 @@ class Home extends React.Component {
 			const candleHigh = Math.max(candle.low, candle.high);
 			const startIndex = Math.max(
 				0,
-				Math.min(DISTRIBUTION_BINS - 1, Math.floor((candleLow - minPrice) / step))
+				Math.min(DISTRIBUTION_BINS - 1, Math.floor((candleLow - minPrice) / step)),
 			);
 			const endIndex = Math.max(
 				startIndex,
-				Math.min(DISTRIBUTION_BINS - 1, Math.floor((candleHigh - minPrice) / step))
+				Math.min(DISTRIBUTION_BINS - 1, Math.floor((candleHigh - minPrice) / step)),
 			);
 			const touchedBins = endIndex - startIndex + 1;
 			const volumeValuePerBin = (candle.volume || 1) / touchedBins;
 			const countValuePerBin = 1 / touchedBins;
 
-			for (let index = startIndex; index <= endIndex; index++) {
-				bins[index].volumeValue += volumeValuePerBin;
-				bins[index].countValue += countValuePerBin;
+			for (let index = startIndex; index <= endIndex; index += 1) {
+				rawBins[index].volumeValue += volumeValuePerBin;
+				rawBins[index].countValue += countValuePerBin;
 			}
+		});
+
+		// Merge adjacent bins that snapped to the same valid tick.
+		const bins = [];
+
+		rawBins.forEach((bin) => {
+			const previous = bins[bins.length - 1];
+
+			if (previous && previous.price === bin.price) {
+				previous.volumeValue += bin.volumeValue;
+				previous.countValue += bin.countValue;
+				return;
+			}
+
+			bins.push({ ...bin });
 		});
 
 		const maxValue = Math.max(...bins.map(bin => bin.volumeValue), 0);
 		const maxCountValue = Math.max(...bins.map(bin => bin.countValue), 0);
-		const peaks = bins.filter((bin, index) => {
-			const previous = bins[index - 1]?.volumeValue ?? -Infinity;
-			const next = bins[index + 1]?.volumeValue ?? -Infinity;
 
-			return maxValue > 0
-				&& bin.volumeValue >= maxValue * PEAK_THRESHOLD
-				&& bin.volumeValue >= previous
-				&& bin.volumeValue >= next;
-		});
+		return { bins, maxValue, maxCountValue };
+	};
 
-		return { bins, peaks, maxValue, maxCountValue };
+	getCachedDistribution = () => {
+		const candles = this.state.historicalCandles;
+		const increment = this.state.product?.quote_increment;
+
+		if (!Array.isArray(candles) || !candles.length) {
+			return { bins: [], maxValue: 0, maxCountValue: 0 };
+		}
+
+		// Wait for tick size — never build once without it, then rebuild after product loads.
+		if (!hasPriceIncrement(increment)) {
+			return { bins: [], maxValue: 0, maxCountValue: 0 };
+		}
+
+		const key = [
+			candles.length,
+			candles[0]?.time,
+			candles[candles.length - 1]?.time,
+			String(increment),
+		].join("|");
+
+		if (this.cachedDistribution && this.cachedDistributionKey === key) {
+			return this.cachedDistribution;
+		}
+
+		this.cachedDistributionKey = key;
+		this.cachedDistribution = this.buildDistribution(candles);
+		return this.cachedDistribution;
 	};
 
 	priceToY = (price) => {
@@ -6245,57 +8859,145 @@ class Home extends React.Component {
 		return lowerTime + (upperTime - lowerTime) * (logical - lowerIndex);
 	};
 
-	getVisibleTimeRange = () => {
-		if (!this.chart) return this.getLoadedTimeRange();
+	measurementCandleScreenX = (index) => {
+		const candles = this.plottedCandles;
+		const candle = Array.isArray(candles) ? candles[index] : null;
 
-		const timeScale = this.chart.timeScale();
-		const visibleTimeRange = timeScale.getVisibleRange?.();
-		let range = null;
+		if (!candle || !this.chart) return null;
 
-		if (
-			visibleTimeRange
-			&& Number.isFinite(Number(visibleTimeRange.from))
-			&& Number.isFinite(Number(visibleTimeRange.to))
-		) {
-			const from = Number(visibleTimeRange.from);
-			const to = Number(visibleTimeRange.to);
+		const coordinate = this.chart.timeScale().timeToCoordinate(toChartTime(candle.time));
+		return Number.isFinite(coordinate) ? coordinate : null;
+	};
 
-			if (from !== to) {
-				range = {
-					from: Math.min(from, to),
-					to: Math.max(from, to),
-				};
+	// Project saved MT time → screen X from candle times (not logical bar indexes).
+	measurementTimeToX = (time) => {
+		if (!this.chart) return null;
+
+		const candles = this.plottedCandles;
+		const numericTime = Number(time);
+
+		if (!Array.isArray(candles) || !candles.length || !Number.isFinite(numericTime)) {
+			return null;
+		}
+
+		const direct = this.chart.timeScale().timeToCoordinate(toChartTime(numericTime));
+		if (Number.isFinite(direct)) return direct;
+
+		const xAtCandle = (index) => this.measurementCandleScreenX(index);
+
+		if (candles.length === 1) {
+			return xAtCandle(0);
+		}
+
+		const firstTime = Number(candles[0].time);
+		const lastIndex = candles.length - 1;
+		const lastTime = Number(candles[lastIndex].time);
+
+		if (numericTime <= firstTime) {
+			const x0 = xAtCandle(0);
+			const x1 = xAtCandle(1);
+			if (!Number.isFinite(x0)) return null;
+			if (!Number.isFinite(x1)) return x0;
+			const step = Number(candles[1].time) - firstTime;
+			if (!(step > 0)) return x0;
+			return x0 + (x1 - x0) * ((numericTime - firstTime) / step);
+		}
+
+		if (numericTime >= lastTime) {
+			const xPrev = xAtCandle(lastIndex - 1);
+			const xLast = xAtCandle(lastIndex);
+			if (!Number.isFinite(xLast)) return null;
+			if (!Number.isFinite(xPrev)) return xLast;
+			const step = lastTime - Number(candles[lastIndex - 1].time);
+			if (!(step > 0)) return xLast;
+			return xLast + (xLast - xPrev) * ((numericTime - lastTime) / step);
+		}
+
+		let low = 1;
+		let high = lastIndex;
+
+		while (low < high) {
+			const middle = Math.floor((low + high) / 2);
+			if (Number(candles[middle].time) < numericTime) {
+				low = middle + 1;
+			} else {
+				high = middle;
 			}
 		}
 
-		if (!range) {
-			const visibleLogicalRange = timeScale.getVisibleLogicalRange?.();
+		const upperIndex = low;
+		const prevIndex = upperIndex - 1;
+		const time0 = Number(candles[prevIndex].time);
+		const time1 = Number(candles[upperIndex].time);
+		const x0 = xAtCandle(prevIndex);
+		const x1 = xAtCandle(upperIndex);
 
-			if (visibleLogicalRange) {
-				const from = this.logicalToTime(visibleLogicalRange.from);
-				const to = this.logicalToTime(visibleLogicalRange.to);
+		if (!Number.isFinite(x0)) return null;
+		if (!Number.isFinite(x1) || !(time1 > time0)) return x0;
 
-				if (Number.isFinite(from) && Number.isFinite(to)) {
-					range = {
-						from: Math.min(from, to),
-						to: Math.max(from, to),
-					};
-				}
+		return x0 + (x1 - x0) * ((numericTime - time0) / (time1 - time0));
+	};
+
+	// Inverse of measurementTimeToX: screen X → time between neighboring candle pixels.
+	measurementXToTime = (x) => {
+		if (!this.chart || !Number.isFinite(x)) return null;
+
+		const candles = this.plottedCandles;
+
+		if (!Array.isArray(candles) || !candles.length) return null;
+
+		const xAtCandle = (index) => this.measurementCandleScreenX(index);
+
+		if (candles.length === 1) {
+			return Number(candles[0].time);
+		}
+
+		const firstX = xAtCandle(0);
+		const lastIndex = candles.length - 1;
+		const lastX = xAtCandle(lastIndex);
+
+		if (!Number.isFinite(firstX) || !Number.isFinite(lastX)) return null;
+
+		if (x <= firstX) {
+			const x1 = xAtCandle(1);
+			const time0 = Number(candles[0].time);
+			const time1 = Number(candles[1].time);
+			if (!Number.isFinite(x1) || x1 === firstX) return time0;
+			return time0 + (time1 - time0) * ((x - firstX) / (x1 - firstX));
+		}
+
+		if (x >= lastX) {
+			const xPrev = xAtCandle(lastIndex - 1);
+			const timePrev = Number(candles[lastIndex - 1].time);
+			const timeLast = Number(candles[lastIndex].time);
+			if (!Number.isFinite(xPrev) || xPrev === lastX) return timeLast;
+			return timeLast + (timeLast - timePrev) * ((x - lastX) / (lastX - xPrev));
+		}
+
+		let low = 1;
+		let high = lastIndex;
+
+		while (low < high) {
+			const middle = Math.floor((low + high) / 2);
+			const middleX = xAtCandle(middle);
+
+			if (!Number.isFinite(middleX) || middleX < x) {
+				low = middle + 1;
+			} else {
+				high = middle;
 			}
 		}
 
-		if (!range) return this.getLoadedTimeRange();
+		const upperIndex = low;
+		const prevIndex = upperIndex - 1;
+		const x0 = xAtCandle(prevIndex);
+		const x1 = xAtCandle(upperIndex);
+		const time0 = Number(candles[prevIndex].time);
+		const time1 = Number(candles[upperIndex].time);
 
-		const loadedRange = this.getLoadedTimeRange();
+		if (!Number.isFinite(x0) || !Number.isFinite(x1) || x1 === x0) return time0;
 
-		if (!loadedRange) return range;
-
-		const margin = 6 * 3600;
-
-		return {
-			from: Math.max(range.from, loadedRange.from - margin),
-			to: Math.min(range.to, loadedRange.to + margin),
-		};
+		return time0 + (time1 - time0) * ((x - x0) / (x1 - x0));
 	};
 
 	getAutoscaleInfo = (original) => {
@@ -6467,6 +9169,55 @@ class Home extends React.Component {
 		return Number.isFinite(volume) && Number.isFinite(typicalPrice)
 			? Math.max(0, volume * typicalPrice)
 			: 0;
+	};
+
+	getMeasurementAreaVolumeBreakdown = (start, end, candles = this.state.candles) => {
+		const startTime = Number(start?.time);
+		const endTime = Number(end?.time);
+
+		if (!Number.isFinite(startTime) || !Number.isFinite(endTime)) {
+			return {
+				upUsd: NaN,
+				downUsd: NaN,
+				totalUsd: NaN,
+				deltaUsd: NaN,
+				deltaPercent: NaN,
+			};
+		}
+
+		const timeMin = Math.min(startTime, endTime);
+		const timeMax = Math.max(startTime, endTime);
+		let upUsd = 0;
+		let downUsd = 0;
+
+		(Array.isArray(candles) ? candles : []).forEach((candle) => {
+			const candleTime = Number(candle?.time);
+
+			if (!Number.isFinite(candleTime) || candleTime < timeMin || candleTime > timeMax) {
+				return;
+			}
+
+			const usd = this.getCandleVolumeUsd(candle);
+			if (!(usd > 0)) return;
+
+			if (Number(candle?.close) >= Number(candle?.open)) {
+				upUsd += usd;
+			} else {
+				downUsd += usd;
+			}
+		});
+
+		const totalUsd = upUsd + downUsd;
+		const deltaUsd = upUsd - downUsd;
+		const deltaPercent = totalUsd > 0 ? (deltaUsd / totalUsd) * 100 : 0;
+
+		return {
+			upUsd,
+			downUsd,
+			totalUsd,
+			deltaUsd,
+			deltaPercent,
+		};
 	};
 
 	getVolumeBarColor = (candle, isHighlighted = false) => {
@@ -6934,13 +9685,6 @@ class Home extends React.Component {
 		return { positivePaths, negativePaths };
 	};
 
-	buildVolumeOverlayAreaPath = (plotPoints, xForTime, yForValue, baselineY) => (
-		this.buildVolumeOverlayAreaPathFromCoords(
-			this.buildVolumeOverlayCoords(plotPoints, xForTime, yForValue),
-			baselineY,
-		)
-	);
-
 	getVwapSeriesOptions = () => ({
 		color: '#28d7d7',
 		lineWidth: 2,
@@ -7027,6 +9771,87 @@ class Home extends React.Component {
 			});
 			this.vwapSeries[index].setData(toChartData(session.data));
 		});
+
+		const currentCandle = candles[candles.length - 1];
+		if (!currentCandle || !sessions.length) {
+			this.liveVwapContext = null;
+			return;
+		}
+
+		const sessionKey = getVwapSessionKey(currentCandle.time);
+		let cumulativePriceVolume = 0;
+		let cumulativeVolume = 0;
+
+		for (let index = candles.length - 2; index >= 0; index -= 1) {
+			const candle = candles[index];
+			if (getVwapSessionKey(candle.time) !== sessionKey) break;
+
+			const high = Number(candle.high);
+			const low = Number(candle.low);
+			const close = Number(candle.close);
+			const volume = Number(candle.volume);
+
+			if (
+				Number.isFinite(high)
+				&& Number.isFinite(low)
+				&& Number.isFinite(close)
+				&& Number.isFinite(volume)
+				&& volume > 0
+			) {
+				cumulativePriceVolume += ((high + low + close) / 3) * volume;
+				cumulativeVolume += volume;
+			}
+		}
+
+		this.liveVwapContext = {
+			cumulativePriceVolume,
+			cumulativeVolume,
+			seriesIndex: sessions.length - 1,
+			sessionKey,
+		};
+	};
+
+	updateCurrentVwapPoint = (currentCandle) => {
+		const context = this.liveVwapContext;
+		if (
+			!currentCandle
+			|| !context
+			|| getVwapSessionKey(currentCandle.time) !== context.sessionKey
+		) {
+			return;
+		}
+
+		const series = this.vwapSeries[context.seriesIndex];
+		if (!series) return;
+
+		const high = Number(currentCandle.high);
+		const low = Number(currentCandle.low);
+		const close = Number(currentCandle.close);
+		const volume = Number(currentCandle.volume);
+		let cumulativePriceVolume = context.cumulativePriceVolume;
+		let cumulativeVolume = context.cumulativeVolume;
+
+		if (
+			Number.isFinite(high)
+			&& Number.isFinite(low)
+			&& Number.isFinite(close)
+			&& Number.isFinite(volume)
+			&& volume > 0
+		) {
+			cumulativePriceVolume += ((high + low + close) / 3) * volume;
+			cumulativeVolume += volume;
+		}
+
+		const value = cumulativeVolume > 0
+			? cumulativePriceVolume / cumulativeVolume
+			: close;
+
+		if (!Number.isFinite(value)) return;
+
+		series.update(toChartPoint({
+			time: currentCandle.time,
+			value,
+		}));
 	};
 
 	getLoadedTimeRange = (candles = this.state.candles) => {
@@ -7085,6 +9910,11 @@ class Home extends React.Component {
 		if (!this.tdSequentialSeries) return;
 
 		this.tdSequentialSeries.applyOptions({ visible: this.state.showTdIndicator });
+		const candleTimes = new Set(
+			(Array.isArray(candles) ? candles : [])
+				.map(candle => Number(candle.time))
+				.filter(Number.isFinite),
+		);
 
 		const data = (Array.isArray(tdSequential?.candles) ? tdSequential.candles : [])
 			.map(candle => ({
@@ -7092,15 +9922,17 @@ class Home extends React.Component {
 				value: Number(candle.close),
 			}))
 			.filter(point => Number.isFinite(point.time) && Number.isFinite(point.value))
-			.filter(point => this.isTimeInLoadedRange(point.time, candles));
+			.filter(point => (
+				this.isTimeInLoadedRange(point.time, candles)
+				&& candleTimes.has(point.time)
+			));
 
 		this.tdSequentialSeries.setData(toChartData(data));
+		this.syncBullseyeViewIfActive();
 	};
 
 	getMacdOverlayModel = () => {
 		const { candles, chartSize, overlayTick, showMacdIndicator, showPvtIndicator } = this.state;
-
-		void overlayTick;
 
 		if (
 			(!showMacdIndicator && !showPvtIndicator)
@@ -7108,7 +9940,26 @@ class Home extends React.Component {
 			|| !chartSize.width
 			|| !chartSize.height
 		) {
+			this.cachedMacdOverlayModel = null;
+			this.cachedMacdOverlayKey = null;
 			return null;
+		}
+
+		// MACD/PVT sit in the volume pane — independent of main Y price scale.
+		// Reuse cache on priceOverlayTick-only updates (Y-wheel).
+		const cacheKey = [
+			overlayTick,
+			chartSize.width,
+			chartSize.height,
+			showMacdIndicator,
+			showPvtIndicator,
+			candles.length,
+			this.cachedMacdPoints?.length || 0,
+			this.cachedPvtPoints?.length || 0,
+		].join("|");
+
+		if (this.cachedMacdOverlayKey === cacheKey) {
+			return this.cachedMacdOverlayModel;
 		}
 
 		const seriesPaneHeight = chartSize.height - CHART_TIME_SCALE_HEIGHT;
@@ -7166,10 +10017,12 @@ class Home extends React.Component {
 			(!positivePaths.length && !negativePaths.length && !macdPath && !signalPath)
 			&& !pvtPath
 		) {
+			this.cachedMacdOverlayModel = null;
+			this.cachedMacdOverlayKey = cacheKey;
 			return null;
 		}
 
-		return {
+		const model = {
 			width: priceScaleLeft,
 			height: chartSize.height,
 			transform: `translate(0 ${macdOffsetY}) translate(0 ${volumePaneTop}) scale(1 ${macdScaleY}) translate(0 ${-volumePaneTop})`,
@@ -7180,6 +10033,10 @@ class Home extends React.Component {
 			pvtPath,
 			zeroY: macdZeroY,
 		};
+
+		this.cachedMacdOverlayModel = model;
+		this.cachedMacdOverlayKey = cacheKey;
+		return model;
 	};
 
 	renderMacdOverlay = () => {
@@ -7245,10 +10102,12 @@ class Home extends React.Component {
 	};
 
 	renderOverlay = () => {
+		this.overlayReferenceLabels = [];
+
 		const {
 			candles,
 			depth,
-			orders,
+			allOrders,
 			tdSequential,
 			chartSize,
 			freeCrosshairX,
@@ -7258,28 +10117,59 @@ class Home extends React.Component {
 			measurementEnd,
 			orderTicket,
 			overlayTick,
+			priceOverlayTick,
+			showDepthIndicator,
 			showTdIndicator,
-			showHistogramIndicator,
+			showVolhIndicator,
+			showPrchIndicator,
 			showLims24Indicator,
+			showBagValueIndicator,
 		} = this.state;
 
+		const orders = this.getChartOrders(allOrders);
+
 		void overlayTick;
+		void priceOverlayTick;
 
 		if (!candles.length || !chartSize.width || !chartSize.height) {
 			return null;
 		}
 
-		const distribution = showHistogramIndicator
-			? this.buildDistribution()
-			: { bins: [], peaks: [], maxValue: 0, maxCountValue: 0 };
+		const distribution = (showVolhIndicator || showPrchIndicator)
+			? this.getCachedDistribution()
+			: { bins: [], maxValue: 0, maxCountValue: 0 };
 		const currentPrice = Number(candles[candles.length - 1].close);
 		const currentY = this.priceToY(currentPrice);
-		const currentX = this.timeToX(candles[candles.length - 1].time);
+		const bagUsdNotional = showBagValueIndicator
+			? this.getSelectedCoinBagUsdNotional()
+			: null;
+		const mappedCurrentX = this.timeToX(candles[candles.length - 1].time);
+		if (Number.isFinite(mappedCurrentX)) {
+			this.lastDepthStartX = mappedCurrentX;
+		}
+		const currentX = Number.isFinite(mappedCurrentX)
+			? mappedCurrentX
+			: (Number.isFinite(this.lastDepthStartX) ? this.lastDepthStartX : null);
 		const bids = Array.isArray(depth?.bids) ? depth.bids : [];
 		const asks = Array.isArray(depth?.asks) ? depth.asks : [];
 		const profileLeft = 12;
 		const priceScaleWidth = Math.max(this.chart?.priceScale("right")?.width?.() || 0, 76);
 		const priceScaleLeft = Math.max(120, chartSize.width - priceScaleWidth);
+		const bagUsdLabel = (
+			Number.isFinite(bagUsdNotional)
+			&& bagUsdNotional > 0
+			&& currentY !== null
+		)
+			? Math.round(bagUsdNotional).toLocaleString(undefined, {
+				style: "currency",
+				currency: "USD",
+				minimumFractionDigits: 0,
+				maximumFractionDigits: 0,
+			})
+			: null;
+		const bagUsdLabelLayout = bagUsdLabel
+			? this.getOverlayLabelLayout(bagUsdLabel, priceScaleLeft)
+			: null;
 		const maxProfileWidth = Math.min(178, chartSize.width * 0.18);
 		const buildDistributionPoints = (valueKey, maxValue) => (
 			distribution.bins.map(bin => {
@@ -7297,10 +10187,16 @@ class Home extends React.Component {
 		const buildPolyline = (points) => points
 			.map(point => `${point.x.toFixed(1)},${point.y.toFixed(1)}`)
 			.join(" ");
-		const distributionPoints = buildDistributionPoints("volumeValue", distribution.maxValue);
-		const countDistributionPoints = buildDistributionPoints("countValue", distribution.maxCountValue);
-		const distributionLine = buildPolyline(distributionPoints);
-		const countDistributionLine = buildPolyline(countDistributionPoints);
+		const distributionPoints = showVolhIndicator
+			? buildDistributionPoints("volumeValue", distribution.maxValue)
+			: [];
+		const countDistributionPoints = showPrchIndicator
+			? buildDistributionPoints("countValue", distribution.maxCountValue)
+			: [];
+		const distributionLine = showVolhIndicator ? buildPolyline(distributionPoints) : "";
+		const countDistributionLine = showPrchIndicator
+			? buildPolyline(countDistributionPoints)
+			: "";
 		const depthStartX = currentX ?? Math.max(80, chartSize.width - 150);
 		const depthRightLimit = Math.max(depthStartX + 24, chartSize.width - 76);
 		const availableDepthWidth = Math.max(24, depthRightLimit - depthStartX);
@@ -7410,83 +10306,234 @@ class Home extends React.Component {
 			return nearest.distance <= 28 ? nearest.point : null;
 		};
 		const depthHoverPoint = findDepthHoverPoint();
-		const depthHoverLabel = depthHoverPoint ? getTrailLabelPosition(depthHoverPoint, depthHoverPoint.side === "ask" ? -14 : 18) : null;
+		const depthHoverLabel = depthHoverPoint
+			? {
+				x: depthHoverPoint.x - 8,
+				y: Math.min(
+					chartSize.height - 10,
+					Math.max(12, depthHoverPoint.y + (depthHoverPoint.side === "ask" ? -14 : 18)),
+				),
+				anchor: "end",
+			}
+			: null;
 		const orderLineRight = priceScaleLeft;
-		const drawableOrders = (Array.isArray(orders) ? orders : [])
-			.filter(order => isOpenOrderStatus(order.status))
+		const drag = this.state.openOrderDrag;
+		let drawableOrders = uniqueOrdersByOriginalId(
+			(Array.isArray(orders) ? orders : []).filter(order => isDisplayableOrderStatus(order.status)),
+		)
 			.flatMap(order => (
 				Array.isArray(order.bracket_legs) && order.bracket_legs.length
 					? order.bracket_legs.map(leg => ({
 						...order,
 						...leg,
-						parent_id: order.id,
 						order_type: order.order_type,
+						// Leg confirmed $ only — never parent BUY / parent order_total.
+						original_value_usd: undefined,
+						used_value_usd: undefined,
+						used_percent: undefined,
+						remaining_value_usd: undefined,
+						used_before_current_order_usd: undefined,
+						quote_size: undefined,
+						order_total: leg.order_total,
+						total_value: leg.total_value,
 					}))
 					: [order]
 			));
+
 		const orderLines = drawableOrders
 			.map(order => {
-				const price = Number(order.price);
+				const orderType = String(order.order_type || "").toUpperCase();
+				const price = this.getLiveDragLinePrice(order, drag);
 				const y = this.priceToY(price);
+				const rolePrefix = order.role === "take_profit"
+					? "TP "
+					: order.role === "stop_loss"
+						? "SL "
+						: this.isTrailingOrderType(orderType)
+							? `TRAIL ${Number(order.trail_percent).toFixed(2)}% `
+							: "";
 
 				if (y === null || !Number.isFinite(price) || price <= 0) return null;
 
+				const isDraggedOrder = this.orderIsActiveDragTarget(order, drag);
+
+				// While dragging: BUY limit keeps confirmed $; SELL/TP/SL = size × price.
+				let valueLabel;
+				if (isDraggedOrder) {
+					const role = String(order.role || "").toLowerCase();
+					const dragKind = String(drag.kind || "limit").toLowerCase();
+					const dragSide = String(drag.side || order.side || "").toUpperCase();
+					const isBuyLimitDrag = dragKind === "limit" && dragSide === "BUY" && !role;
+
+					if (isBuyLimitDrag) {
+						const buyNotional = this.getDragDisplayNotionalUsd(drag, order);
+						valueLabel = buyNotional != null
+							? formatOrderDisplayTotal({
+								order_total: buyNotional,
+								total_value: buyNotional,
+								original_value_usd: buyNotional,
+							})
+							: "--";
+					} else {
+						const liveSize = Number(
+							drag.size ?? order.amount ?? order.base_size
+						);
+						const liveNotional = this.getLiveDragNotionalUsd(liveSize, price);
+						valueLabel = liveNotional != null
+							? formatOrderDisplayTotal({
+								role: order.role,
+								amount: liveSize,
+								price: price,
+								order_total: liveNotional,
+								total_value: liveNotional,
+							})
+							: "--";
+					}
+				} else {
+					valueLabel = formatOrderDisplayTotal({
+						...order,
+						price,
+						...(order.role
+							? {
+								original_value_usd: undefined,
+								quote_size: undefined,
+								order_total: order.order_total,
+								total_value: order.total_value,
+								amount: order.amount ?? order.base_size,
+							}
+							: {}),
+					});
+				}
+
 				return {
 					...order,
+					orderType,
 					price,
 					y,
-					label: `${order.role === "take_profit" ? "TP " : order.role === "stop_loss" ? "SL " : ""}${this.formatOverlayPriceForProduct(price)} / ${formatOrderValue(order.total_value, order.amount, price, order.quote_size, order.order_total)}`,
+					label: `${rolePrefix}${this.formatOverlayPriceForProduct(price)} / ${valueLabel}`,
 				};
 			})
 			.filter(Boolean);
-		const orderedLabelRows = [...orderLines]
-			.sort((a, b) => a.y - b.y)
-			.reduce((rows, order) => {
-				const minGap = 16;
-				const preferredY = Math.max(12, order.y - 5);
-				const previousY = rows[rows.length - 1]?.labelY ?? -Infinity;
-
-				rows.push({
-					id: order.id,
-					labelY: Math.min(
-						chartSize.height - 8,
-						Math.max(preferredY, previousY + minGap)
-					),
-				});
-
-				return rows;
-			}, []);
-		const orderLabelYById = new Map(orderedLabelRows.map(row => [row.id, row.labelY]));
+		const orderLinesByOriginalId = new Map();
+		orderLines.forEach(line => {
+			const identity = String(line.original_id || "");
+			if (!identity) return;
+			orderLinesByOriginalId.set(`${identity}:${line.role || "limit"}`, line);
+		});
+		const uniqueOrderLines = Array.from(orderLinesByOriginalId.values());
+		this.logChartOrderDisplayIfChanged(uniqueOrderLines);
 		const bookmarkedPriceValue = this.getBookmarkedPriceForCurrency(
 			this.state.baseCurrency
 		);
 		const bookmarkedCoordinate = bookmarkedPriceValue === null
 			? null
 			: this.priceToY(bookmarkedPriceValue);
-		const bookmarkedY = (
-			Number.isFinite(bookmarkedCoordinate)
-			&& bookmarkedCoordinate >= 0
-			&& bookmarkedCoordinate <= chartSize.height
-		)
+		// Match open orders: keep drawing when off-pane (SVG clips at top/bottom).
+		const bookmarkedY = Number.isFinite(bookmarkedCoordinate)
 			? bookmarkedCoordinate
 			: null;
+		const bookmarkedLineRight = priceScaleLeft;
+		const bookmarkedPriceLabel = bookmarkedY === null
+			? ""
+			: this.getReferenceLinePriceLabel(bookmarkedPriceValue);
+		const bookmarkedDeltaLabel = bookmarkedY === null
+			? null
+			: this.getReferenceLineDeltaLabel(bookmarkedPriceValue);
+		const bookmarkedPriceLabelLayout = bookmarkedY === null
+			? null
+			: this.getOverlayLabelLayout(bookmarkedPriceLabel, bookmarkedLineRight);
+		const avgEntryPriceValue = Number(
+			this.getAvgEntryPriceForDisplay(this.state.baseCurrency),
+		);
+		const avgEntryCoordinate = (
+			Number.isFinite(avgEntryPriceValue) && avgEntryPriceValue > 0
+				? this.priceToY(avgEntryPriceValue)
+				: null
+		);
+		// Match open orders: keep drawing when off-pane (SVG clips at top/bottom).
+		const avgEntryY = Number.isFinite(avgEntryCoordinate)
+			? avgEntryCoordinate
+			: null;
+		const avgEntryLineRight = priceScaleLeft;
+		const avgEntryPriceLabel = avgEntryY === null
+			? ""
+			: this.getReferenceLinePriceLabel(avgEntryPriceValue, { prefix: "AVG" });
+		const avgEntryDeltaLabel = avgEntryY === null
+			? null
+			: this.getReferenceLineDeltaLabel(avgEntryPriceValue);
+		const avgEntryPriceLabelLayout = avgEntryY === null
+			? null
+			: this.getOverlayLabelLayout(avgEntryPriceLabel, avgEntryLineRight);
+		const overlayLabelCandidates = [
+			...uniqueOrderLines.map(order => ({
+				id: `order:${order.original_id}:${order.role || "limit"}`,
+				y: order.y,
+			})),
+			...(bookmarkedY !== null
+				? [{ id: "bookmark", y: bookmarkedY }]
+				: []),
+			...(avgEntryY !== null
+				? [{ id: "avg-entry", y: avgEntryY }]
+				: []),
+		];
+		const overlayLabelYById = new Map(
+			[...overlayLabelCandidates]
+				.sort((a, b) => a.y - b.y)
+				.reduce((rows, item) => {
+					const minGap = 16;
+					const preferredY = Math.max(12, item.y - 5);
+					const previousY = rows[rows.length - 1]?.labelY ?? -Infinity;
+
+					rows.push({
+						id: item.id,
+						labelY: Math.min(
+							chartSize.height - 8,
+							Math.max(preferredY, previousY + minGap)
+						),
+					});
+
+					return rows;
+				}, [])
+				.map(row => [row.id, row.labelY])
+		);
 		const bookmarkedLabelY = bookmarkedY === null
 			? null
-			: Math.min(chartSize.height - 8, Math.max(12, bookmarkedY - 5));
-		const bookmarkedLineRight = priceScaleLeft;
-		const bookmarkedLabel = bookmarkedY === null
-			? ""
-			: this.formatOverlayPriceForProduct(bookmarkedPriceValue);
-		const bookmarkedLabelLayout = this.getOverlayLabelLayout(
-			bookmarkedLabel,
-			bookmarkedLineRight,
-		);
+			: (overlayLabelYById.get("bookmark") ?? Math.min(
+				chartSize.height - 8,
+				Math.max(12, bookmarkedY - 5)
+			));
+		const avgEntryLabelY = avgEntryY === null
+			? null
+			: (overlayLabelYById.get("avg-entry") ?? Math.min(
+				chartSize.height - 8,
+				Math.max(12, avgEntryY - 5)
+			));
+
+		if (bookmarkedLabelY !== null && bookmarkedDeltaLabel) {
+			this.overlayReferenceLabels.push({
+				id: "bookmark",
+				y: bookmarkedLabelY,
+				label: bookmarkedDeltaLabel,
+				tone: "bookmark",
+			});
+		}
+
+		if (avgEntryLabelY !== null && avgEntryDeltaLabel) {
+			this.overlayReferenceLabels.push({
+				id: "avg-entry",
+				y: avgEntryLabelY,
+				label: avgEntryDeltaLabel,
+				tone: "avg",
+			});
+		}
+
 		const orderTicketSide = orderTicket?.side === "SELL" ? "SELL" : "BUY";
 		const orderTicketType = orderTicket
 			? this.normalizeOrderTypeForSide(orderTicketSide, orderTicket.orderType)
 			: null;
 		const isLimitOrderTicketMarker = orderTicketType === "LIMIT";
 		const isSellBracketTicketMarker = orderTicketType === "BRACKET" && orderTicketSide === "SELL";
+		const isSellTrailingTicketMarker = this.isTrailingOrderType(orderTicketType) && orderTicketSide === "SELL";
 		const orderTicketPriceValue = Number(orderTicket?.price);
 		const orderTicketY = (
 			orderTicket
@@ -7525,6 +10572,21 @@ class Home extends React.Component {
 				}))
 				.filter(marker => Number.isFinite(marker.y))
 			: [];
+		const trailingReferencePrice = Number(this.getOverlayMarketPrice());
+		const trailingDraftPercent = Number(orderTicket?.trailPercent);
+		const trailingDraftStopPrice = (
+			isSellTrailingTicketMarker
+			&& Number.isFinite(trailingReferencePrice)
+			&& trailingReferencePrice > 0
+			&& Number.isFinite(trailingDraftPercent)
+			&& trailingDraftPercent > 0
+			&& trailingDraftPercent < 100
+		)
+			? trailingReferencePrice * (1 - trailingDraftPercent / 100)
+			: null;
+		const orderTicketTrailingY = Number.isFinite(trailingDraftStopPrice) && trailingDraftStopPrice > 0
+			? this.priceToY(trailingDraftStopPrice)
+			: null;
 		const tdSequentialBadges = (showTdIndicator && Array.isArray(tdSequential?.setups) ? tdSequential.setups : [])
 			.filter(setup => this.isTimeInLoadedRange(setup.time, candles))
 			.map(setup => {
@@ -7583,18 +10645,43 @@ class Home extends React.Component {
 			? this.getMeasurementPointFromCoordinates(pointerPosition.x, pointerPosition.y)
 			: null;
 		const measurementTarget = measurementEnd || measurementPreview;
-		const projectMeasurementPoint = (point) => {
-			if (!point) return null;
+		const projectMeasurementPoint = (point, cursorScreen = null) => {
+			if (!point || !Number.isFinite(point.time) || !Number.isFinite(point.price)) return null;
 
-			const x = this.chart?.timeScale().logicalToCoordinate?.(point.logical);
+			// Second point while placing / dragging: exact cursor pixel.
+			if (cursorScreen && Number.isFinite(cursorScreen.x) && Number.isFinite(cursorScreen.y)) {
+				return {
+					...point,
+					x: cursorScreen.x,
+					y: cursorScreen.y,
+				};
+			}
+
+			const x = this.measurementTimeToX(point.time);
 			const y = this.priceToY(point.price);
 
 			return Number.isFinite(x) && Number.isFinite(y)
 				? { ...point, x, y }
 				: null;
 		};
-		const measurementA = projectMeasurementPoint(measurementStart);
-		const measurementB = projectMeasurementPoint(measurementTarget);
+		const endFollowsCursor = Boolean(
+			pointerPosition
+			&& (
+				(measurementStart && !measurementEnd)
+				|| this.state.measurementDrag === "end"
+			),
+		);
+		const startFollowsCursor = Boolean(
+			pointerPosition && this.state.measurementDrag === "start",
+		);
+		const measurementA = projectMeasurementPoint(
+			measurementStart,
+			startFollowsCursor ? pointerPosition : null,
+		);
+		const measurementB = projectMeasurementPoint(
+			measurementTarget,
+			endFollowsCursor ? pointerPosition : null,
+		);
 		const measurement = measurementA && measurementB
 			? {
 				start: measurementA,
@@ -7614,7 +10701,35 @@ class Home extends React.Component {
 				const percent = measurement.start.price
 					? (delta / measurement.start.price) * 100
 					: 0;
-				const duration = formatMeasurementDuration((measurement.end.time ?? 0) - (measurement.start.time ?? 0));
+				const duration = formatMeasurementDuration(
+					(measurement.end.time ?? 0) - (measurement.start.time ?? 0),
+				);
+				const percentText = `(${formatSignedPercent(percent)})`;
+				const volumeBreakdown = this.getMeasurementAreaVolumeBreakdown(
+					measurement.start,
+					measurement.end,
+					candles,
+				);
+				const volumeUsd = volumeBreakdown.totalUsd;
+				const volumeText = Number.isFinite(volumeUsd)
+					? `Vol . ${formatUsdValue(volumeUsd)}`
+					: "Vol . --";
+				const beforePercent = `${duration}  /  ${formatPrice(delta)}  `;
+				const afterPercent = `  /  ${volumeText}`;
+				const text = `${beforePercent}${percentText}${afterPercent}`;
+				const volumeDeltaUsd = volumeBreakdown.deltaUsd;
+				const volumeDeltaPercent = volumeBreakdown.deltaPercent;
+				const hasVolumeDelta = (
+					Number.isFinite(volumeDeltaUsd)
+					&& Number.isFinite(volumeDeltaPercent)
+				);
+				const volumeDeltaUsdText = hasVolumeDelta
+					? `${volumeDeltaUsd >= 0 ? "" : "-"}${formatUsdValue(Math.abs(volumeDeltaUsd))} `
+					: "-- ";
+				const volumeDeltaPercentText = hasVolumeDelta
+					? `(${formatSignedPercent(volumeDeltaPercent)})`
+					: "";
+				const volumeDeltaText = `${volumeDeltaUsdText}${volumeDeltaPercentText}`.trim();
 				const x = Math.min(
 					chartSize.width - 10,
 					Math.max(10, (measurement.start.x + measurement.end.x) / 2)
@@ -7623,12 +10738,45 @@ class Home extends React.Component {
 					chartSize.height - 12,
 					Math.max(18, measurement.rect.y - 8)
 				);
+				// Volume delta sits under the measurement rectangle, not under the top label.
+				const volumeDeltaY = Math.min(
+					chartSize.height - 4,
+					Math.max(14, measurement.rect.y + measurement.rect.height + 14),
+				);
+				let textWidth = text.length * 7;
+				let volumeDeltaWidth = volumeDeltaText.length * 7;
+
+				if (!this.overlayTextMeasureContext && typeof document !== "undefined") {
+					this.overlayTextMeasureContext = document.createElement("canvas").getContext("2d");
+				}
+
+				if (this.overlayTextMeasureContext) {
+					this.overlayTextMeasureContext.font = "800 12px Inter";
+					textWidth = this.overlayTextMeasureContext.measureText(text).width;
+					this.overlayTextMeasureContext.font = "700 11px Inter";
+					volumeDeltaWidth = this.overlayTextMeasureContext.measureText(volumeDeltaText).width;
+				}
+
+				const labelWidth = Math.max(textWidth, volumeDeltaWidth);
 
 				return {
 					x,
 					y,
-					text: `${duration} / ${formatPrice(delta)} / ${formatSignedPercent(percent)}`,
-					isPositive: delta >= 0,
+					volumeDeltaY,
+					beforePercent,
+					percentText,
+					afterPercent,
+					text,
+					volumeDeltaUsdText,
+					volumeDeltaPercentText,
+					volumeDeltaText,
+					isPercentPositive: percent >= 0,
+					isVolumeDeltaPositive: Number.isFinite(volumeDeltaUsd) ? volumeDeltaUsd >= 0 : true,
+					clearX: Math.min(
+						chartSize.width - 10,
+						Math.max(10, x - (labelWidth / 2) - 14),
+					),
+					clearY: Math.min(chartSize.height - 10, Math.max(10, y - 4)),
 				};
 			})()
 			: null;
@@ -7781,11 +10929,41 @@ class Home extends React.Component {
 				{measurement && (
 					<g className={`e__measurement ${measurement.locked ? "e__measurement--locked" : "e__measurement--preview"}`}>
 						<rect
+							className="e__measurement-fill"
 							x={measurement.rect.x}
 							y={measurement.rect.y}
 							width={measurement.rect.width}
 							height={measurement.rect.height}
+							onPointerDown={
+								measurement.locked
+									? this.handleMeasurementMoveDragStart
+									: undefined
+							}
+							onClick={event => event.stopPropagation()}
 						/>
+						{(() => {
+							const midX = measurement.rect.x + (measurement.rect.width / 2);
+							const midY = measurement.rect.y + (measurement.rect.height / 2);
+
+							return (
+								<>
+									<line
+										className="e__measurement-cross"
+										x1={midX}
+										x2={midX}
+										y1={measurement.rect.y}
+										y2={measurement.rect.y + measurement.rect.height}
+									/>
+									<line
+										className="e__measurement-cross"
+										x1={measurement.rect.x}
+										x2={measurement.rect.x + measurement.rect.width}
+										y1={midY}
+										y2={midY}
+									/>
+								</>
+							);
+						})()}
 						<circle
 							className="e__measurement-handle"
 							cx={measurement.start.x}
@@ -7803,20 +10981,70 @@ class Home extends React.Component {
 							onClick={event => event.stopPropagation()}
 						/>
 						{measurementLabel && (
-							<text
-								className={measurementLabel.isPositive ? "e__measurement-label--up" : "e__measurement-label--down"}
-								x={measurementLabel.x}
-								y={measurementLabel.y}
-								textAnchor="middle"
-							>
-								{measurementLabel.text}
-							</text>
+							<>
+								<g
+									className="e__measurement-clear"
+									transform={`translate(${measurementLabel.clearX}, ${measurementLabel.clearY})`}
+									role="button"
+									tabIndex={0}
+									aria-label="Clear measurement"
+									onClick={this.handleMeasurementClear}
+									onPointerDown={event => event.stopPropagation()}
+									onKeyDown={(event) => {
+										if (event.key === "Enter" || event.key === " ") {
+											this.handleMeasurementClear(event);
+										}
+									}}
+								>
+									<circle r={7} />
+									<path d="M -2.24 -2.24 L 2.24 2.24 M 2.24 -2.24 L -2.24 2.24" />
+								</g>
+								<text
+									className="e__measurement-label"
+									x={measurementLabel.x}
+									y={measurementLabel.y}
+									textAnchor="middle"
+								>
+									<tspan>{measurementLabel.beforePercent}</tspan>
+									<tspan
+										className={
+											measurementLabel.isPercentPositive
+												? "e__measurement-label__percent--up"
+												: "e__measurement-label__percent--down"
+										}
+									>
+										{measurementLabel.percentText}
+									</tspan>
+									<tspan>{measurementLabel.afterPercent}</tspan>
+								</text>
+								{measurementLabel.volumeDeltaText && (
+									<text
+										className="e__measurement-label e__measurement-label__volume-delta"
+										x={measurementLabel.x}
+										y={measurementLabel.volumeDeltaY}
+										textAnchor="middle"
+									>
+										<tspan>{measurementLabel.volumeDeltaUsdText}</tspan>
+										{measurementLabel.volumeDeltaPercentText && (
+											<tspan
+												className={
+													measurementLabel.isVolumeDeltaPositive
+														? "e__measurement-label__percent--up"
+														: "e__measurement-label__percent--down"
+												}
+											>
+												{measurementLabel.volumeDeltaPercentText}
+											</tspan>
+										)}
+									</text>
+								)}
+							</>
 						)}
 					</g>
 				)}
 
 				<g className="e__distribution">
-					{distributionLine && (
+					{(distributionLine || countDistributionLine) && (
 						<>
 							<line
 								className="e__distribution-axis"
@@ -7825,26 +11053,17 @@ class Home extends React.Component {
 								y1={0}
 								y2={chartSize.height}
 							/>
-							<polyline className="e__distribution-line" points={distributionLine} />
+							{distributionLine && (
+								<polyline className="e__distribution-line" points={distributionLine} />
+							)}
 							{countDistributionLine && (
 								<polyline className="e__distribution-line e__distribution-line--count" points={countDistributionLine} />
 							)}
 						</>
 					)}
-
-					{distribution.peaks.map((peak, index) => {
-						const point = distributionPoints.find(item => item.price === peak.price);
-						if (!point) return null;
-
-						return (
-							<g key={`peak-${index}`}>
-								<circle cx={point.x} cy={point.y} r={4} />
-							</g>
-						);
-					})}
 				</g>
 
-				{currentY !== null && currentX !== null && (
+				{showDepthIndicator && currentY !== null && currentX !== null && (
 					<g className="e__depth">
 						{askLine && <polyline className="e__depth-ask" points={askLine} />}
 						{bidLine && <polyline className="e__depth-bid" points={bidLine} />}
@@ -7880,19 +11099,53 @@ class Home extends React.Component {
 						<g className="e__price-bookmark">
 							<line x1={0} x2={bookmarkedLineRight} y1={bookmarkedY} y2={bookmarkedY} />
 							<circle cx={bookmarkedLineRight} cy={bookmarkedY} r={3.5} />
-							<text x={bookmarkedLabelLayout.textX} y={bookmarkedLabelY} textAnchor="start">
-								{bookmarkedLabel}
-							</text>
-							<g
-								className="e__price-bookmark__delete"
-								transform={`translate(${bookmarkedLabelLayout.actionX}, ${bookmarkedLabelY - 4})`}
-								role="button"
-								tabIndex={0}
-								onClick={this.clearBookmarkedPrice}
+							{bookmarkedPriceLabelLayout && bookmarkedLabelY !== null && (
+								<text
+									x={bookmarkedPriceLabelLayout.textX}
+									y={bookmarkedLabelY}
+									textAnchor="start"
+								>
+									{bookmarkedPriceLabel}
+								</text>
+							)}
+							{bookmarkedPriceLabelLayout && bookmarkedLabelY !== null && (
+								<g
+									className="e__price-bookmark__delete"
+									transform={`translate(${bookmarkedPriceLabelLayout.actionX}, ${bookmarkedLabelY - 4})`}
+									role="button"
+									tabIndex={0}
+									onClick={this.clearBookmarkedPrice}
+								>
+									<circle r={7} />
+									<path d="M -2.24 -2.24 L 2.24 2.24 M 2.24 -2.24 L -2.24 2.24" />
+								</g>
+							)}
+						</g>
+					)}
+					{avgEntryY !== null && (
+						<g className="e__avg-entry">
+							<line x1={0} x2={avgEntryLineRight} y1={avgEntryY} y2={avgEntryY} />
+							<circle cx={avgEntryLineRight} cy={avgEntryY} r={3.5} />
+							{avgEntryPriceLabelLayout && avgEntryLabelY !== null && (
+								<text
+									x={avgEntryPriceLabelLayout.textX}
+									y={avgEntryLabelY}
+									textAnchor="start"
+								>
+									{avgEntryPriceLabel}
+								</text>
+							)}
+						</g>
+					)}
+					{bagUsdLabelLayout && (
+						<g className="e__bag-value">
+							<text
+								x={bagUsdLabelLayout.textX}
+								y={Math.min(chartSize.height - 8, Math.max(12, currentY - 5))}
+								textAnchor="start"
 							>
-								<circle r={7} />
-								<path d="M -2.24 -2.24 L 2.24 2.24 M 2.24 -2.24 L -2.24 2.24" />
-							</g>
+								{bagUsdLabel}
+							</text>
 						</g>
 					)}
 					{orderTicketY !== null && (
@@ -7926,14 +11179,21 @@ class Home extends React.Component {
 							<line x1={0} x2={orderTicketLineRight} y1={marker.y} y2={marker.y} />
 						</g>
 					))}
-					{orderLines.map(order => {
-						const labelY = orderLabelYById.get(order.id) ?? Math.max(12, order.y - 5);
+					{orderTicketTrailingY !== null && (
+						<g className="e__order-ticket-marker e__order-ticket-marker--trailing">
+							<line x1={0} x2={orderTicketLineRight} y1={orderTicketTrailingY} y2={orderTicketTrailingY} />
+						</g>
+					)}
+					{uniqueOrderLines.map(order => {
+						const orderLabelId = `order:${order.original_id}:${order.role || "limit"}`;
+						const labelY = overlayLabelYById.get(orderLabelId)
+							?? Math.max(12, order.y - 5);
 						const labelLayout = this.getOverlayLabelLayout(order.label, orderLineRight);
 
 						return (
 							<g
-								key={order.id || `${order.side}-${order.price}-${order.amount}`}
-								className={`e__order e__order--${order.side === "sell" ? "sell" : "buy"} ${order.role ? `e__order--${order.role.replace("_", "-")}` : ""}`}
+								key={orderLabelId}
+								className={`e__order e__order--${order.side === "sell" ? "sell" : "buy"} ${order.role ? `e__order--${order.role.replace("_", "-")}` : ""} ${this.isTrailingOrderType(order.orderType) ? "e__order--trailing" : ""} ${isErrorOrderStatus(order.status) ? "e__order--error" : ""}`}
 							>
 								<line x1={0} x2={orderLineRight} y1={order.y} y2={order.y} />
 								<circle cx={orderLineRight} cy={order.y} r={3.5} />
@@ -7995,7 +11255,10 @@ class Home extends React.Component {
 			rightPriceScale: {
 				visible: true,
 				autoScale: true,
-				mode: this.state.isLogPriceScale ? PriceScaleMode.Logarithmic : PriceScaleMode.Normal,
+				// !IMPORTANT DO NOT TOUCH. DO NOT OPTIMIZE UNLESS REQUESTED BY USER.
+				// Always start Normal. Log cookie is applied after candle data has a
+				// visible time range (armLogPriceScaleResyncAfterData).
+				mode: PriceScaleMode.Normal,
 				invertScale: this.state.isInvertedPriceScale,
 				minimumWidth: 76,
 				scaleMargins: { ...DEFAULT_PRICE_SCALE_MARGINS },
@@ -8005,6 +11268,7 @@ class Home extends React.Component {
 				secondsVisible: false,
 				borderColor: '#111820',
 				rightOffset: 0,
+				shiftVisibleRangeOnNewBar: true,
 				...this.getTimeScaleBarSpacingOptions(el.clientWidth),
 			},
 			...this.getChartInteractionOptions(false),
@@ -8030,12 +11294,12 @@ class Home extends React.Component {
 				priceFormat: this.getPriceSeriesFormat(),
 			}
 		);
+		// !IMPORTANT DO NOT TOUCH. DO NOT OPTIMIZE UNLESS REQUESTED BY USER.
 		this.getMainPriceScale()?.applyOptions({
-			mode: this.state.isLogPriceScale ? PriceScaleMode.Logarithmic : PriceScaleMode.Normal,
+			mode: PriceScaleMode.Normal,
 			invertScale: this.state.isInvertedPriceScale,
 			autoScale: true,
 		});
-		this.lockedLogFormula = null;
 
 		this.tdSequentialSeries = this.chart.addSeries(
 			LineSeries,
@@ -8099,7 +11363,7 @@ class Home extends React.Component {
 			: change24h.value >= 0
 				? "e__price-overlay__change--up"
 				: "e__price-overlay__change--down";
-		const profileTotal = this.state.profile?.total_usd;
+		const profileTotal = this.getProfileTotalUsdForDisplay();
 		const profileBalances = Array.isArray(this.state.profile?.balances)
 			? this.state.profile.balances
 			: [];
@@ -8113,6 +11377,11 @@ class Home extends React.Component {
 		const ticketPrimaryOrderType = orderTicket
 			? this.getTicketPrimaryOrderType({ ...orderTicket, orderType: ticketOrderType })
 			: "LIMIT";
+		const ticketStopOrderType = this.getSellStopOrderType(
+			ticketPrimaryOrderType === "STOP"
+				? ticketOrderType
+				: orderTicket?.lastSellStopOrderType,
+		);
 		const ticketPriceValue = Number(orderTicket?.price);
 		const ticketAmountValue = Number(orderTicket?.amount);
 		const ticketSummaryPrice = ticketOrderType === "BRACKET"
@@ -8275,19 +11544,26 @@ class Home extends React.Component {
 						? ticketPreviewBaseSize
 						: NaN
 			: NaN;
+		const ticketBracketFee = ticketHasValidPreview
+			? Number(ticketPreview?.commission_total)
+			: NaN;
 		const ticketBracketProfit = isSellBracketTicket
-			&& Number.isFinite(ticketBracketCoinAmount)
-			&& ticketBracketCoinAmount > 0
-			&& Number.isFinite(ticketTakeProfitPrice)
-			&& ticketTakeProfitPrice > 0
-			? ticketBracketCoinAmount * ticketTakeProfitPrice
+			? getBracketExitUsdValue({
+				amount: ticketBracketCoinAmount,
+				price: ticketTakeProfitPrice,
+				referencePrice: ticketTakeProfitPrice,
+				commissionTotal: ticketBracketFee,
+				side: "sell",
+			})
 			: NaN;
 		const ticketBracketLoss = isSellBracketTicket
-			&& Number.isFinite(ticketBracketCoinAmount)
-			&& ticketBracketCoinAmount > 0
-			&& Number.isFinite(ticketStopLossPrice)
-			&& ticketStopLossPrice > 0
-			? ticketBracketCoinAmount * ticketStopLossPrice
+			? getBracketExitUsdValue({
+				amount: ticketBracketCoinAmount,
+				price: ticketStopLossPrice,
+				referencePrice: ticketTakeProfitPrice,
+				commissionTotal: ticketBracketFee,
+				side: "sell",
+			})
 			: NaN;
 		const ticketBracketProfitLabel = isSellBracketTicket
 			? Number.isFinite(ticketBracketProfit) && ticketBracketProfit > 0
@@ -8304,13 +11580,16 @@ class Home extends React.Component {
 			? this.getOrderFractionFromAmount(orderTicket)
 			: 0;
 		const ticketAmountUnitLabel = orderTicket?.amountMode === "USD" ? "USD" : ticketBaseCurrency;
+		const ticketPreviewWaitSeconds = this.getOrderPreviewWaitSeconds(orderTicket);
 		const ticketActionLabel = orderTicket?.isSubmitting
 			? "Placing..."
-			: orderTicket?.isPreviewLoading
-				? "Updating..."
-				: ticketHasValidPreview
-					? `Place ${ticketActionSideLabel}`
-					: `Preview ${ticketActionSideLabel}`;
+			: (
+				`Place ${ticketActionSideLabel}${
+					Number.isFinite(ticketPreviewWaitSeconds)
+						? ` (${ticketPreviewWaitSeconds}s)`
+						: ""
+				}`
+			);
 		const ticketValidation = this.getOrderTicketValidation(orderTicket);
 		const ticketVisibleError = ticketSliderDisabled
 			? orderTicket?.error || ticketValidation.error
@@ -8322,7 +11601,8 @@ class Home extends React.Component {
 		const draggingPriceField = this.state.isOrderTicketPriceDragging
 			? this.orderTicketPriceDragField
 			: null;
-		const orderPriceHandles = [];
+		const draggingOpenOrderKey = this.state.openOrderDrag?.handleKey || "";
+		let orderPriceHandles = [];
 
 		if (
 			orderTicket
@@ -8334,12 +11614,14 @@ class Home extends React.Component {
 
 			if (Number.isFinite(limitHandleY)) {
 				orderPriceHandles.push({
+					key: "ticket:price",
 					field: "price",
 					tone: "limit",
 					y: limitHandleY,
 					label: this.getOrderPriceHandleLabel(ticketPriceValue, { showPercent: true }),
 					ariaLabel: "Drag limit price",
 					title: "Drag to change limit price",
+					onPointerDown: event => this.handleOrderTicketPriceDragStart(event, "price"),
 				});
 			}
 		}
@@ -8354,12 +11636,14 @@ class Home extends React.Component {
 
 				if (Number.isFinite(takeProfitHandleY)) {
 					orderPriceHandles.push({
+						key: "ticket:takeProfitPrice",
 						field: "takeProfitPrice",
 						tone: "take-profit",
 						y: takeProfitHandleY,
 						label: this.getOrderPriceHandleLabel(ticketTakeProfitPrice, { showPercent: true }),
 						ariaLabel: "Drag take profit price",
 						title: "Drag to change take profit",
+						onPointerDown: event => this.handleOrderTicketPriceDragStart(event, "takeProfitPrice"),
 					});
 				}
 			}
@@ -8369,16 +11653,142 @@ class Home extends React.Component {
 
 				if (Number.isFinite(stopLossHandleY)) {
 					orderPriceHandles.push({
+						key: "ticket:stopLossPrice",
 						field: "stopLossPrice",
 						tone: "stop-loss",
 						y: stopLossHandleY,
 						label: this.getOrderPriceHandleLabel(ticketStopLossPrice, { showPercent: true }),
 						ariaLabel: "Drag stop loss price",
 						title: "Drag to change stop loss",
+						onPointerDown: event => this.handleOrderTicketPriceDragStart(event, "stopLossPrice"),
 					});
 				}
 			}
 		}
+
+		const hideOpenOrderHandles = Boolean(orderTicket || this.state.isOrderTicketClosing);
+
+		uniqueOrdersByOriginalId(this.getChartOrders())
+			.filter(order => isOpenOrderStatus(order.status))
+			.forEach(order => {
+					const orderType = String(order.order_type || "").toUpperCase();
+					const orderId = order.original_id;
+					const size = this.getOpenOrderEditSize(order);
+					const orderStatus = String(order.status || "").toUpperCase();
+					const isErrorRow = orderStatus === "ERROR";
+					const isMoveLocked = isErrorRow || this.isOpenOrderMoveLocked(order);
+					const isPendingReplace = orderStatus === "PENDING" || isMoveLocked;
+
+					if (!orderId) return;
+
+					if (orderType === "LIMIT") {
+						if ((!Number.isFinite(size) || size <= 0) && !isPendingReplace) return;
+
+						const price = this.getLiveDragLinePrice(order, this.state.openOrderDrag);
+						const y = this.priceToY(price);
+						const handleKeyId = order.original_id;
+
+						if (!Number.isFinite(price) || price <= 0 || !Number.isFinite(y)) return;
+
+						orderPriceHandles.push({
+							key: this.getOpenOrderEditHandleKey(handleKeyId, "limit"),
+							orderId,
+							kind: "limit",
+							price,
+							tone: "limit",
+							y,
+							label: this.getOrderPriceHandleLabel(price, { showPercent: true }),
+							ariaLabel: isMoveLocked
+								? (orderStatus === "ERROR"
+									? "Limit price cannot be edited"
+									: "Limit price edit pending")
+								: "Drag open limit price",
+							title: isMoveLocked
+								? (orderStatus === "ERROR"
+									? "Order cannot be edited"
+									: "Order update in progress")
+								: "Drag to edit limit price",
+							disabled: isMoveLocked,
+							hideHandle: hideOpenOrderHandles,
+							omitHandle: isErrorRow,
+							onPointerDown: null,
+						});
+						return;
+					}
+
+					if (orderType !== "BRACKET" || !Array.isArray(order.bracket_legs)) return;
+
+					order.bracket_legs.forEach(leg => {
+						const kind = leg.role === "take_profit"
+							? "take_profit"
+							: leg.role === "stop_loss"
+								? "stop_loss"
+								: null;
+
+						if (!kind) return;
+
+						const legSizeCandidates = [
+							leg.amount,
+							leg.base_size,
+							leg.total_base_size,
+							size,
+						];
+						let legSize = null;
+						for (const candidate of legSizeCandidates) {
+							const value = Number(candidate);
+							if (Number.isFinite(value) && value > 0) {
+								legSize = value;
+								break;
+							}
+						}
+						const hasLegSize = legSize != null || isPendingReplace;
+
+						if (!hasLegSize) return;
+
+						const price = this.getLiveDragLinePrice(
+							{ ...order, role: kind, price: Number(leg.price) },
+							this.state.openOrderDrag,
+						);
+						const y = this.priceToY(price);
+
+						if (!Number.isFinite(price) || price <= 0 || !Number.isFinite(y)) return;
+
+						orderPriceHandles.push({
+							key: this.getOpenOrderEditHandleKey(
+								order.original_id,
+								kind,
+							),
+							orderId: order.original_id,
+							kind,
+							price,
+							tone: kind === "take_profit" ? "take-profit" : "stop-loss",
+							y,
+							label: this.getOrderPriceHandleLabel(price, { showPercent: true }),
+							ariaLabel: isMoveLocked
+								? (orderStatus === "ERROR"
+									? (kind === "take_profit" ? "Take profit cannot be edited" : "Stop loss cannot be edited")
+									: (kind === "take_profit" ? "Take profit edit pending" : "Stop loss edit pending"))
+								: (kind === "take_profit" ? "Drag open take profit price" : "Drag open stop loss price"),
+							title: isMoveLocked
+								? (orderStatus === "ERROR"
+									? "Order cannot be edited"
+									: "Order update in progress")
+								: (kind === "take_profit" ? "Drag to edit take profit" : "Drag to edit stop loss"),
+							disabled: isMoveLocked,
+							hideHandle: hideOpenOrderHandles,
+							omitHandle: isErrorRow,
+							onPointerDown: null,
+						});
+					});
+				});
+
+		const uniqueHandles = new Map();
+		orderPriceHandles.forEach(handle => {
+			if (!handle?.key) return;
+			uniqueHandles.set(handle.key, handle);
+		});
+		orderPriceHandles = Array.from(uniqueHandles.values());
+
 		return (
 			<div className={classnames} ref={this.container}>
 				<header className="e__toolbar">
@@ -8430,6 +11840,16 @@ class Home extends React.Component {
 							>
 								Apply
 							</button>
+							<button
+								type="button"
+								className={this.state.showHud ? "e__hud-toggle is-active" : "e__hud-toggle"}
+								onClick={this.toggleHud}
+								title={this.state.showHud ? "Hide HUD overlays" : "Show HUD overlays"}
+								aria-label={this.state.showHud ? "Hide HUD overlays" : "Show HUD overlays"}
+								aria-pressed={this.state.showHud}
+							>
+								HUD
+							</button>
 						</div>
 					</form>
 
@@ -8448,6 +11868,7 @@ class Home extends React.Component {
 						</button>
 						<OrdersDropdown
 							error={this.state.allOrdersError}
+							getSellOrderCoinsUsdValue={this.getSellOrderCoinsUsdValue}
 							isClosing={this.state.closingDropdowns.orders}
 							isLoading={this.state.isOrdersLoading}
 							isOpen={this.state.isOrdersOpen}
@@ -8457,7 +11878,7 @@ class Home extends React.Component {
 								close: ["profile"],
 								onOpen: this.loadAllOrders,
 							})}
-							orders={this.state.allOrders}
+							orders={this.getOrdersForListDisplay(this.state.allOrders)}
 						/>
 						<BalanceDropdown
 							balanceHistory={this.state.balanceHistory}
@@ -8469,6 +11890,7 @@ class Home extends React.Component {
 							balances={profileBalances}
 							error={this.state.profileError}
 							getBookmarkDelta={this.getBalanceBookmarkDelta}
+							getBalanceUsdValue={this.getBalanceUsdValueForDisplay}
 							getBookmarkedPrice={this.getBookmarkedPriceForCurrency}
 							isClosing={this.state.closingDropdowns.profile}
 							isLoading={this.state.isProfileLoading}
@@ -8484,7 +11906,10 @@ class Home extends React.Component {
 							onRefresh={this.refreshBalanceDropdown}
 							onToggle={() => this.setAnimatedDropdown("profile", !this.state.isProfileOpen, {
 								close: ["orders"],
-								onOpen: this.loadBalanceHistory,
+								onOpen: () => {
+									this.loadBalanceHistory();
+									this.refreshBalanceDropdown();
+								},
 							})}
 							total={profileTotal}
 						/>
@@ -8496,34 +11921,80 @@ class Home extends React.Component {
 					onPointerMove={this.handleFreeCrosshairMove}
 					onPointerLeave={this.handleChartShellLeave}
 				>
-					{(this.state.showBullseyeLockNotice || this.state.isBullseyeLockNoticeClosing) && (
+					{this.state.chartNotice && (
 						<div
-							className={`e__bullseye-lock-notice ${this.state.isBullseyeLockNoticeClosing ? "is-closing" : "is-open"}`}
+							className={classNames(
+								"e__chart-notice",
+								`e__chart-notice--${this.state.chartNotice.tone || "info"}`,
+								this.state.chartNotice.closing ? "is-closing" : "is-open",
+							)}
 							role="status"
 							aria-live="polite"
 						>
-							Pan and zoom disabled in Bullseye view
+							{this.state.chartNotice.message}
 						</div>
 					)}
 					<div className="e__chart" ref={this.chartRef} />
 					{this.renderMacdOverlay()}
 					{this.renderOverlay()}
+					{(this.overlayReferenceLabels || []).map(item => (
+						<div
+							key={item.id}
+							className={`e__reference-line-label-wrap e__reference-line-label-wrap--${item.tone}`}
+							style={{ top: item.y }}
+						>
+							<span className="e__reference-line-label">{item.label}</span>
+						</div>
+					))}
 					{orderPriceHandles.map(handle => (
 						<div
-							key={handle.field}
+							key={handle.key || handle.field}
 							className={`e__order-price-handle-wrap e__order-price-handle-wrap--${handle.tone}`}
 							style={{ top: handle.y }}
 						>
-							<div
-								className={`e__order-price-handle ${draggingPriceField === handle.field ? "is-dragging" : ""}`}
-								onPointerDown={event => this.handleOrderTicketPriceDragStart(event, handle.field)}
+							{!handle.omitHandle && <div
+								className={`e__order-price-handle ${
+									(
+										!handle.disabled
+										&& !handle.hideHandle
+										&& (
+											draggingPriceField === handle.field
+											|| draggingOpenOrderKey === handle.key
+										)
+									) ? "is-dragging" : ""
+								} ${
+									this.state.openOrderEditErrorFlashKey === handle.key
+										? "is-error-flash"
+										: ""
+								} ${
+									handle.disabled ? "is-disabled" : ""
+								}`}
+								style={handle.hideHandle
+									? { visibility: "hidden", pointerEvents: "none" }
+									: undefined}
+								onPointerDown={event => {
+									if (handle.hideHandle || handle.disabled) {
+										event.preventDefault();
+										event.stopPropagation();
+										return;
+									}
+
+									if (handle.onPointerDown) {
+										handle.onPointerDown(event);
+										return;
+									}
+
+									this.handleOpenOrderPriceDragStart(event, handle);
+								}}
 								role="group"
 								aria-label={handle.ariaLabel}
-								title={handle.title}
+								aria-disabled={handle.disabled || handle.hideHandle ? "true" : undefined}
+								aria-hidden={handle.hideHandle ? "true" : undefined}
+								title={handle.hideHandle ? undefined : handle.title}
 							>
 								<span className="e__order-price-handle__arrow" aria-hidden="true">▲</span>
 								<span className="e__order-price-handle__arrow" aria-hidden="true">▼</span>
-							</div>
+							</div>}
 							<span className="e__order-price-handle__label">
 								{handle.label}
 							</span>
@@ -8577,7 +12048,8 @@ class Home extends React.Component {
 						onMoveDragStart={this.handleOrderTicketMoveDragStart}
 						onOrderTypeMenuToggle={() => {
 							if (ticketPrimaryOrderType !== "STOP") {
-								this.setOrderType("STOP_LIMIT");
+								this.setOrderType(ticketStopOrderType, { openMenu: true });
+								return;
 							}
 
 							this.setState(prev => ({ isOrderTypeMenuOpen: !prev.isOrderTypeMenuOpen }));
@@ -8585,6 +12057,9 @@ class Home extends React.Component {
 						onPriceFieldChange={this.updateOrderPriceField}
 						onPriceFieldFocus={field => this.updateOrderTicket({ activePriceField: field })}
 						onSellStopOrderTypeChange={this.setSellStopOrderType}
+						onSellStopOrderTypeSelect={() => {
+							this.setOrderType(ticketStopOrderType, { closeMenu: true });
+						}}
 						onSideChange={this.switchOrderSide}
 						onSubmit={this.submitOrderTicket}
 						onTypeChange={this.setOrderType}
@@ -8605,10 +12080,11 @@ class Home extends React.Component {
 						ticketMarketPriceLabel={ticketMarketPriceLabel}
 						ticketOrderType={ticketOrderType}
 						ticketPrimaryOrderType={ticketPrimaryOrderType}
+						ticketStopOrderType={ticketStopOrderType}
 						ticketSide={ticketSide}
 						visibleError={ticketVisibleError}
 					/>
-					<div className="e__price-overlay">
+					<div className={this.state.showHud ? "e__price-overlay" : "e__price-overlay is-hud-hidden"}>
 						<div className="e__price-overlay__meta">
 							<span className={`e__live-dot ${this.state.isLive ? "e__live-dot--live" : "e__live-dot--offline"}`} />
 							<span className="e__price-overlay__label">
@@ -8632,7 +12108,22 @@ class Home extends React.Component {
 						</div>
 					</div>
 
-					<div className="e__indicator-toggles" ref={this.indicatorTogglesRef} aria-label="Chart indicators">
+					<div
+						className={this.state.showHud ? "e__indicator-toggles" : "e__indicator-toggles is-hud-hidden"}
+						ref={this.indicatorTogglesRef}
+						aria-label="Chart indicators"
+						aria-hidden={this.state.showHud ? undefined : "true"}
+					>
+						<button
+							type="button"
+							className={this.state.showDepthIndicator ? "e__indicator-toggle is-active" : "e__indicator-toggle"}
+							onClick={() => this.toggleIndicator("depth")}
+							title="Toggle depth overlay"
+							aria-label="Toggle depth overlay"
+							aria-pressed={this.state.showDepthIndicator}
+						>
+							DEPTH
+						</button>
 						<button
 							type="button"
 							className={this.state.showTdIndicator ? "e__indicator-toggle is-active" : "e__indicator-toggle"}
@@ -8651,11 +12142,33 @@ class Home extends React.Component {
 						</button>
 						<button
 							type="button"
-							className={this.state.showHistogramIndicator ? "e__indicator-toggle is-active" : "e__indicator-toggle"}
-							onClick={() => this.toggleIndicator("histogram")}
-							aria-pressed={this.state.showHistogramIndicator}
+							className={this.state.showBagValueIndicator ? "e__indicator-toggle is-active" : "e__indicator-toggle"}
+							onClick={() => this.toggleIndicator("bag")}
+							title="Toggle bag value (coins × live price)"
+							aria-label="Toggle bag value"
+							aria-pressed={this.state.showBagValueIndicator}
 						>
-							HSTGRM
+							$$$
+						</button>
+						<button
+							type="button"
+							className={this.state.showVolhIndicator ? "e__indicator-toggle is-active" : "e__indicator-toggle"}
+							onClick={() => this.toggleIndicator("volh")}
+							title="Toggle volume-weighted price histogram"
+							aria-label="Toggle volume-weighted histogram"
+							aria-pressed={this.state.showVolhIndicator}
+						>
+							VOLH
+						</button>
+						<button
+							type="button"
+							className={this.state.showPrchIndicator ? "e__indicator-toggle is-active" : "e__indicator-toggle"}
+							onClick={() => this.toggleIndicator("prch")}
+							title="Toggle price-touch count histogram"
+							aria-label="Toggle price-count histogram"
+							aria-pressed={this.state.showPrchIndicator}
+						>
+							PRCH
 						</button>
 						<button
 							type="button"
@@ -8689,7 +12202,11 @@ class Home extends React.Component {
 						</button>
 					</div>
 
-					<div className="e__chart-bottom-controls" ref={this.chartBottomControlsRef}>
+					<div
+						className={this.state.showHud ? "e__chart-bottom-controls" : "e__chart-bottom-controls is-hud-hidden"}
+						ref={this.chartBottomControlsRef}
+						aria-hidden={this.state.showHud ? undefined : "true"}
+					>
 						<button
 							type="button"
 							className={`e__frame-24h-button ${this.state.isBullseyeViewActive ? "is-active" : ""}`}

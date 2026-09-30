@@ -1,0 +1,17 @@
+---
+description: REQUIRED after any code change - rebuild client bundle and run tests
+alwaysApply: true
+---
+
+# REQUIRED after every modification
+
+**After any code change in the same turn, ALWAYS:**
+
+1. **`npm run build` in `client/`** if anything under `client/` changed.
+2. **Run tests** (`python -m pytest tests` from the repo root). If the change is client-only, still run `npm run lint` in `client/` as well.
+
+**This is a required command, not optional, not deferred, not skipped because it was missing from the GO list.**
+
+- Do not tell the user the change is done until rebuild (when applicable) and tests have been run.
+- Never leave a stale `public/assets` bundle after a `client/` edit.
+- When asking for GO, **always include bold bullets** for rebuild and tests.

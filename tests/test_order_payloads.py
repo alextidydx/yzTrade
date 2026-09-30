@@ -132,6 +132,33 @@ class OrderPayloadTests(unittest.TestCase):
         self.assertEqual(raised.exception.status_code, 400)
         self.assertIn("Bracket is only enabled for SELL", raised.exception.detail)
 
+    def test_place_buy_limit_keeps_preview_quote_size(self):
+        with patch.object(app, "get_product_metadata", fake_product_metadata), patch.object(
+            app,
+            "coinbase_advanced_post",
+            return_value={
+                "success": True,
+                "success_response": {"order_id": "abc"},
+            },
+        ) as post, patch.object(
+            app,
+            "coinbase_advanced_get",
+            side_effect=HTTPException(status_code=404, detail="missing"),
+        ):
+            response = app.place_order.__wrapped__({
+                "product_id": "ICP-USDC",
+                "side": "BUY",
+                "order_type": "LIMIT",
+                "quote_size": 10,
+                "limit_price": 2.25,
+                "preview_base_size": 4.444444,
+            })
+
+        self.assertTrue(response["success"])
+        config = post.call_args.args[1]["order_configuration"]["limit_limit_gtc"]
+        self.assertEqual(config["quote_size"], "10.00")
+        self.assertNotIn("base_size", config)
+
 
 if __name__ == "__main__":
     unittest.main()

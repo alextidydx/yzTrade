@@ -1,0 +1,10 @@
+---
+description: Call the place-order UI ORDERING OVERLAY or order overlay, not order ticket.
+alwaysApply: true
+---
+
+# Call it ORDERING OVERLAY / order overlay
+
+- The place-order chart UI is the **ORDERING OVERLAY** or **order overlay**.
+- Prefer those names in chat, plans, GO lists, comments you add, and commit messages.
+- Do not call it an "order ticket" in agent voice (code identifiers like `orderTicket` stay as-is).

@@ -1,0 +1,13 @@
+---
+description: BUY original_value_usd is immutable; used/remaining only on fills
+alwaysApply: true
+---
+
+# Immutable BUY original dollars
+
+- BUY `original_value_usd` is set **once** when the parent order is first created.
+- That ORIGINAL dollar value **never changes** afterward — not on move, replace, edit, merge, poll, socket adopt, child `quote_size`, or remaining size.
+- Frontend always displays BUY `$` from `original_value_usd`. Never substitute child remaining quote / `order_total` / size×price for ORIGINAL.
+- `used_value_usd` and `remaining_value_usd` change **only** on fill/utilization events (`original − used`). Moves and replaces must not recompute or shrink them.
+- `used_percent` is frontend-only: `used_value_usd / original_value_usd * 100`. Do not treat backend `used_percent` as source of truth.
+- `used_before_current_order_usd` is backend-only replace bookkeeping (parent USED frozen when a new Coinbase child starts). Never send it as display truth; never let it mutate ORIGINAL.

@@ -87,7 +87,8 @@
 	color: #f2f6f8;
 }
 
-.e__market-form__row > button[type="submit"] {
+.e__market-form__row > button[type="submit"],
+.e__market-form__row > .e__hud-toggle {
 	box-sizing: border-box;
 	height: 30px;
 	padding: 0 14px;
@@ -110,6 +111,12 @@
 		background: rgba(242, 246, 248, 0.04);
 		color: #7e8b98;
 	}
+}
+
+.e__market-form__row > .e__hud-toggle.is-active {
+	border-color: rgba(242, 246, 248, 0.14);
+	background: rgba(242, 246, 248, 0.07);
+	color: #f2f6f8;
 }
 
 .e__market-form__row {
@@ -167,6 +174,13 @@
 	border-radius: 38px;
 	background: #00010500;
 	backdrop-filter: blur(2px);
+	transform: scale(1);
+	transition: opacity 0.08s ease-out, transform 0.08s ease-out;
+}
+
+.e__price-overlay.is-hud-hidden {
+	opacity: 0;
+	transform: scale(0.8);
 }
 
 .e__price-overlay__meta {
@@ -286,6 +300,14 @@
 	border-radius: 38px;
 	background: #00010522;
 	backdrop-filter: blur(2px);
+	transform: scale(1);
+	transition: opacity 0.08s ease-out, transform 0.08s ease-out;
+}
+
+.e__indicator-toggles.is-hud-hidden {
+	opacity: 0;
+	transform: scale(0.8);
+	pointer-events: none;
 }
 
 .e__indicator-toggle {
@@ -316,6 +338,14 @@
 	align-items: center;
 	gap: 10px;
 	pointer-events: auto;
+	transform: scale(1);
+	transition: opacity 0.08s ease-out, transform 0.08s ease-out;
+}
+
+.e__chart-bottom-controls.is-hud-hidden {
+	opacity: 0;
+	transform: scale(0.8);
+	pointer-events: none;
 }
 
 .e__frame-24h-button {
@@ -348,11 +378,13 @@
 	}
 }
 
+.e__chart-notice,
 .e__bullseye-lock-notice {
 	position: absolute;
 	left: 50%;
 	top: 72px;
 	z-index: 12;
+	max-width: min(72vw, 420px);
 	padding: 8px 14px;
 	border: 1px solid rgba(57, 65, 74, 0.72);
 	border-radius: 999px;
@@ -362,7 +394,8 @@
 	font-weight: 600;
 	letter-spacing: 0.01em;
 	pointer-events: none;
-	white-space: nowrap;
+	text-align: center;
+	white-space: normal;
 
 	&.is-open {
 		animation: e-bullseye-notice-fade-in 160ms ease both;
@@ -370,6 +403,16 @@
 
 	&.is-closing {
 		animation: e-bullseye-notice-fade-out 160ms ease both;
+	}
+
+	&.e__chart-notice--success {
+		border-color: rgba(54, 179, 126, 0.72);
+		color: #d8ffe9;
+	}
+
+	&.e__chart-notice--error {
+		border-color: rgba(232, 93, 117, 0.72);
+		color: #ffd6de;
 	}
 }
 
@@ -541,6 +584,33 @@
 	transform: translateY(-50%);
 }
 
+.e__reference-line-label-wrap {
+	position: absolute;
+	left: 16px;
+	z-index: 8;
+	display: flex;
+	align-items: center;
+	pointer-events: none;
+	transform: translateY(-50%);
+}
+
+.e__reference-line-label {
+	font-size: 11px;
+	font-weight: 750;
+	line-height: 1.2;
+	white-space: nowrap;
+	text-shadow: 0 0 4px #000105, 0 1px 2px #000105;
+	pointer-events: none;
+}
+
+.e__reference-line-label-wrap--bookmark .e__reference-line-label {
+	color: #f2f6f8;
+}
+
+.e__reference-line-label-wrap--avg .e__reference-line-label {
+	color: #8eb4e8;
+}
+
 .e__order-price-handle {
 	position: relative;
 	left: auto;
@@ -575,6 +645,33 @@
 
 		.e__order-price-handle__arrow {
 			color: #f2f6f8;
+		}
+	}
+
+	&.is-error-flash {
+		border-color: rgba(238, 88, 88, 0.95);
+		background: rgba(238, 88, 88, 0.28);
+		box-shadow: 0 0 0 1px rgba(238, 88, 88, 0.4);
+		transition: border-color 280ms ease, background-color 280ms ease, box-shadow 280ms ease;
+
+		.e__order-price-handle__arrow {
+			color: #ff9a9a;
+			transition: color 280ms ease;
+		}
+	}
+
+	&.is-disabled {
+		cursor: default;
+		opacity: 0.72;
+
+		&:hover,
+		&.is-dragging {
+			border-color: rgba(57, 65, 74, 0.62);
+			background: #00010522;
+
+			.e__order-price-handle__arrow {
+				color: #7e8b98;
+			}
 		}
 	}
 }
@@ -808,10 +905,17 @@
 }
 
 .e__measurement {
-	rect {
+	.e__measurement-fill {
 		fill: rgba(57, 148, 255, 0.2);
+		stroke: none;
+		pointer-events: none;
+	}
+
+	.e__measurement-cross {
 		stroke: rgba(97, 177, 255, 0.72);
 		stroke-width: 1;
+		fill: none;
+		pointer-events: none;
 	}
 
 	circle {
@@ -836,6 +940,45 @@
 		paint-order: stroke;
 		stroke: #000105;
 		stroke-width: 4px;
+		pointer-events: none;
+	}
+
+	.e__measurement-clear {
+		pointer-events: all;
+		cursor: pointer;
+
+		circle {
+			fill: rgba(0, 1, 5, 0.55);
+			stroke: rgba(242, 246, 248, 0.95);
+			stroke-width: 1.5;
+			transition: fill 140ms ease, stroke 140ms ease;
+		}
+
+		path {
+			stroke: #f2f6f8;
+			stroke-width: 1.8;
+			stroke-linecap: round;
+			transition: stroke 140ms ease;
+		}
+
+		&:hover,
+		&:focus-visible {
+			circle {
+				fill: #f2f6f8;
+				stroke: #f2f6f8;
+			}
+
+			path {
+				stroke: #000105;
+			}
+		}
+	}
+}
+
+.e__measurement--locked {
+	.e__measurement-fill {
+		pointer-events: all;
+		cursor: move;
 	}
 }
 
@@ -851,6 +994,19 @@
 
 .e__measurement-label--down {
 	fill: #f2f6f8;
+}
+
+.e__measurement-label__percent--up {
+	fill: #20b28f;
+}
+
+.e__measurement-label__percent--down {
+	fill: #ee5858;
+}
+
+.e__measurement-label__volume-delta {
+	font-size: 11px;
+	font-weight: 700;
 }
 
 .e__distribution {
@@ -973,6 +1129,44 @@
 .e__depth-hover--bid {
 	circle {
 		stroke: #20b28f;
+	}
+}
+
+.e__avg-entry {
+	pointer-events: none;
+
+	line {
+		stroke: #1a3a6b;
+		stroke-width: 1.25;
+		stroke-dasharray: 5 4;
+	}
+
+	circle {
+		fill: #1a3a6b;
+		stroke: #000105;
+		stroke-width: 2;
+	}
+
+	text {
+		fill: #8eb4e8;
+		font-size: 11px;
+		font-weight: 750;
+		paint-order: stroke;
+		stroke: #000105;
+		stroke-width: 3px;
+	}
+}
+
+.e__bag-value {
+	pointer-events: none;
+
+	text {
+		fill: #d7e4f5;
+		font-size: 11px;
+		font-weight: 750;
+		paint-order: stroke;
+		stroke: #000105;
+		stroke-width: 3px;
 	}
 }
 
@@ -1101,6 +1295,12 @@
 	}
 }
 
+.e__order-ticket-marker--trailing {
+	line {
+		stroke: rgba(242, 246, 248, 0.95);
+	}
+}
+
 .e__order {
 	line {
 		stroke-width: 1;
@@ -1193,6 +1393,20 @@
 	}
 }
 
+.e__order--error {
+	line {
+		stroke: rgba(224, 85, 85, 0.95);
+	}
+
+	circle {
+		fill: #e05555;
+	}
+
+	text {
+		fill: #ffb3b3;
+	}
+}
+
 .e__order--take-profit {
 	line {
 		stroke: rgba(32, 178, 143, 0.95);
@@ -1208,6 +1422,20 @@
 }
 
 .e__order--stop-loss {
+	line {
+		stroke: rgba(244, 147, 45, 0.95);
+	}
+
+	circle {
+		fill: #f4932d;
+	}
+
+	text {
+		fill: #ffc078;
+	}
+}
+
+.e__order--trailing {
 	line {
 		stroke: rgba(244, 147, 45, 0.95);
 	}

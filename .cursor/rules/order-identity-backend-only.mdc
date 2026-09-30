@@ -1,0 +1,17 @@
+---
+description: Order identity is immutable locally; Coinbase ids never reach frontend
+alwaysApply: true
+---
+
+# Immutable order identity
+
+- Every order has exactly one immutable `original_id`.
+- `original_id` is assigned once and never changes or gets reminted.
+- Frontend order state, keys, chart lines, edit requests, and cancel requests use only `original_id`.
+- **No Coinbase ids on the frontend at all.** Not in REST, WebSocket, React state, chart keys, or requests.
+- Coinbase order ids and Coinbase client order ids are backend-only. After cancel/create, update only the private Coinbase-id field on that same row.
+- A move/edit/cancel operation carries its exact `original_id` throughout the operation.
+- Never infer order identity from product, side, price, size, list position, or similarity.
+- LIMIT and TRAILING orders have one line keyed by `original_id`.
+- BRACKET orders have exactly two lines keyed by `original_id:take_profit` and `original_id:stop_loss`.
+- Moving one order must never modify, merge, remove, or recreate another order.

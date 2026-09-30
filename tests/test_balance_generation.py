@@ -40,21 +40,15 @@ class BalanceGenerationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(app.get_balance_refresh_mode_for_order_status("FILLED"), "immediate")
         self.assertEqual(app.get_balance_refresh_mode_for_order_status("CANCELLED"), "immediate")
 
-    async def test_same_generation_requests_fetch_separately(self):
+    async def test_same_generation_requests_share_inflight_fetch(self):
         calls = 0
         release = asyncio.Event()
         first_started = asyncio.Event()
-        second_started = asyncio.Event()
 
-        async def fake_run_coinbase_call(*_args):
+        async def fake_run_coinbase_call(*_args, **_kwargs):
             nonlocal calls
             calls += 1
-
-            if calls == 1:
-                first_started.set()
-            elif calls == 2:
-                second_started.set()
-
+            first_started.set()
             await release.wait()
             return {"balances": []}
 
@@ -64,9 +58,9 @@ class BalanceGenerationTests(unittest.IsolatedAsyncioTestCase):
         first_request = asyncio.create_task(app.get_balances(generation=1))
         second_request = asyncio.create_task(app.get_balances(generation=1))
         await first_started.wait()
-        await second_started.wait()
+        await asyncio.sleep(0)
 
-        self.assertEqual(calls, 2)
+        self.assertEqual(calls, 1)
 
         release.set()
         first_result, second_result = await asyncio.gather(

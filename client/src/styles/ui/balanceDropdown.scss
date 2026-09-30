@@ -426,6 +426,16 @@
 	font-weight: 750;
 	line-height: 13px;
 	white-space: nowrap;
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+}
+
+.e__profile-row__bookmark-icon {
+	width: 9px;
+	height: 11px;
+	flex: 0 0 auto;
+	fill: currentColor;
 }
 
 .e__profile-row__bookmark--up {

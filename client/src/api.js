@@ -54,14 +54,26 @@ export const getMonitorConfig = () => get("/api/monitor-config", { _: Date.now()
 
 export const getMonitorTickers = () => get("/api/monitor-tickers", { _: Date.now() });
 
-export const getBalances = (generation = 0) => get("/api/balances", {
-	generation,
-	_: Date.now(),
-});
+export const getBalances = (generation = 0, options = {}) => {
+	const params = {
+		generation,
+		_: Date.now(),
+	};
+
+	if (options.forcePrices) {
+		params.force_prices = true;
+	}
+
+	return get("/api/balances", params);
+};
 
 export const getBalanceHistory = (params) => get("/api/balance-history", params);
 
 export const getOrders = (params) => get("/api/orders", params);
+
+export const getAvgEntry = (currency, params) => (
+	get(`/api/avg-entry/${encodeURIComponent(currency)}`, params)
+);
 
 export const setBookmark = (currency, price) => (
 	put(`/api/app-state/bookmarks/${encodeURIComponent(currency)}`, { price })
@@ -79,10 +91,12 @@ export const previewOrder = (body) => post("/api/orders/preview", body);
 
 export const placeOrder = (body) => post("/api/orders/place", body);
 
-export const cancelOrder = (orderId) => (
+export const editOrder = (body) => post("/api/orders/edit", body);
+
+export const cancelOrder = (originalId) => (
 	post("/api/orders/cancel", null, {
 		params: {
-			order_id: orderId,
+			original_id: originalId,
 		},
 	})
 );

@@ -221,7 +221,26 @@
 		display: inline-flex;
 		align-items: center;
 		justify-content: center;
-		gap: 5px;
+		gap: 2px;
+		min-width: 0;
+	}
+
+	.e__order-ticket__type-label {
+		min-width: 0;
+		flex: 1 1 auto;
+		padding: 0 2px;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+
+	.e__order-ticket__type-caret-btn {
+		flex: 0 0 auto;
+		width: 18px;
+		height: 30px;
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
 	}
 
 	.e__order-ticket__type-caret {
@@ -233,12 +252,17 @@
 		transform: rotate(45deg);
 	}
 
+	.e__order-ticket__type-select.is-active .e__order-ticket__type-label,
+	.e__order-ticket__type-select.is-active .e__order-ticket__type-caret-btn {
+		color: #f2f6f8;
+	}
+
 	.e__order-ticket__type-menu {
 		position: absolute;
 		left: 50%;
 		top: calc(100% + 6px);
 		z-index: 30;
-		width: 112px;
+		width: 120px;
 		display: flex;
 		flex-direction: column;
 		overflow: hidden;

@@ -236,36 +236,60 @@ export const isOpenOrderStatus = (status) => {
 		return true;
 	}
 
-	const closedMarkers = ["CANCEL", "FILLED", "EXPIRED", "FAILED", "REJECTED"];
+	const closedMarkers = ["CANCEL", "FILLED", "EXPIRED", "FAILED", "REJECTED", "ERROR"];
 
 	return !closedMarkers.some(marker => normalized.includes(marker));
 };
+
+export const isErrorOrderStatus = (status) => (
+	String(status || "").toUpperCase() === "ERROR"
+);
+
+export const isDisplayableOrderStatus = (status) => (
+	isOpenOrderStatus(status) || isErrorOrderStatus(status)
+);
 
 export const filterOrdersForChartProduct = (orders, productId) => {
 	const normalizedProductId = String(productId || "").trim().toUpperCase();
 	const selectedBaseCurrency = getCurrencyFromProductId(normalizedProductId);
 	const normalizedOrders = Array.isArray(orders) ? orders : [];
-	const exactMatches = normalizedOrders.filter(
-		order => String(order?.product_id || "").trim().toUpperCase() === normalizedProductId,
-	);
 
-	if (exactMatches.length) {
-		return exactMatches;
-	}
+	if (!selectedBaseCurrency) return [];
 
 	return normalizedOrders.filter(
 		order => getCurrencyFromProductId(order?.product_id) === selectedBaseCurrency,
 	);
 };
 
-export const isRemovedLiveOrder = (order, removedOrderIds) => {
-	if (!order?.id) return true;
+export const getOrderIdentityKey = (order) => {
+	return String(order?.original_id || "").trim();
+};
 
-	if (removedOrderIds.has(order.id)) return true;
-	if (order.cancel_id && removedOrderIds.has(order.cancel_id)) return true;
-	if (order.parent_id && removedOrderIds.has(order.parent_id)) return true;
+export const findOrderEditIndex = (orders, orderId) => {
+	const id = String(orderId || "");
+	const list = Array.isArray(orders) ? orders : [];
 
-	return false;
+	if (!id) return -1;
+
+	return list.findIndex(order => String(order?.original_id || "") === id);
+};
+
+export const uniqueOrdersByOriginalId = (orders) => {
+	const byOriginalId = new Map();
+
+	(Array.isArray(orders) ? orders : []).forEach(order => {
+		if (!order) return;
+
+		const originalId = String(order.original_id || "").trim();
+		if (!originalId) return;
+
+		byOriginalId.set(originalId, {
+			...order,
+			original_id: originalId,
+		});
+	});
+
+	return Array.from(byOriginalId.values());
 };
 
 export const formatPrice = (price) => (
@@ -381,33 +405,93 @@ export const formatUsdFullValue = (value) => {
 	});
 };
 
-export const formatOrderValue = (totalValue, amount, price, quoteSize, orderTotal) => {
-	const numericOrderTotal = Number(orderTotal);
+/** Single dollar total for dropdown + chart line (same field source). */
+export const getOrderDisplayTotalUsd = (order) => {
+	if (!order || typeof order !== "object") return NaN;
 
-	if (Number.isFinite(numericOrderTotal) && numericOrderTotal > 0) {
-		return formatUsdFullValue(numericOrderTotal);
+	const role = String(order.role || "").toLowerCase();
+	const isBracketLeg = role === "take_profit" || role === "stop_loss";
+	const orderType = String(order.order_type || "").toUpperCase();
+	const side = String(order.side || "").toLowerCase();
+
+	// Bracket parent (orders list): same $ as chart TP line — TP leg total only.
+	if (!isBracketLeg && orderType === "BRACKET") {
+		const legs = Array.isArray(order.bracket_legs) ? order.bracket_legs : [];
+		const tpLeg = legs.find((leg) => String(leg?.role || "").toLowerCase() === "take_profit");
+		const tpTotal = Number(tpLeg?.total_value ?? tpLeg?.order_total);
+		if (Number.isFinite(tpTotal) && tpTotal > 0) return tpTotal;
+		const tpAmount = Number(tpLeg?.amount ?? tpLeg?.base_size);
+		const tpPrice = Number(tpLeg?.price);
+		if (Number.isFinite(tpAmount) && tpAmount > 0 && Number.isFinite(tpPrice) && tpPrice > 0) {
+			return tpAmount * tpPrice;
+		}
 	}
 
-	const numericTotalValue = Number(totalValue);
-
-	if (Number.isFinite(numericTotalValue) && numericTotalValue > 0) {
-		return formatUsdFullValue(numericTotalValue);
+	// Tracked BUY: always show ORIGINAL $ — never remaining / leftover order_total.
+	if (!isBracketLeg && side === "buy") {
+		const original = Number(order.original_value_usd);
+		if (Number.isFinite(original) && original > 0) return original;
 	}
 
-	const numericQuoteSize = Number(quoteSize);
+	// Explicit stamped / live totals (SELL, untracked BUY, drag size × draft).
+	const orderTotal = Number(order.order_total);
+	if (Number.isFinite(orderTotal) && orderTotal > 0) return orderTotal;
 
-	if (Number.isFinite(numericQuoteSize) && numericQuoteSize > 0) {
-		return formatUsdFullValue(numericQuoteSize);
+	const totalValue = Number(order.total_value);
+	if (Number.isFinite(totalValue) && totalValue > 0) return totalValue;
+
+	const quoteSize = Number(order.quote_size);
+	if (Number.isFinite(quoteSize) && quoteSize > 0) return quoteSize;
+
+	// Limit + TP/SL: size × price (live drag and resting fallback).
+	const amount = Number(order.amount ?? order.base_size ?? order.total_base_size);
+	const price = Number(order.price);
+
+	if (Number.isFinite(amount) && amount > 0 && Number.isFinite(price) && price > 0) {
+		return amount * price;
 	}
 
-	const numericAmount = Number(amount);
-	const numericPrice = Number(price);
+	return NaN;
+};
 
-	if (Number.isFinite(numericAmount) && numericAmount > 0 && Number.isFinite(numericPrice) && numericPrice > 0) {
-		return formatUsdFullValue(numericAmount * numericPrice);
+export const formatOrderDisplayTotal = (order) => {
+	const value = getOrderDisplayTotalUsd(order);
+
+	return Number.isFinite(value) && value > 0 ? formatUsdFullValue(value) : "--";
+};
+
+// Bracket TP/SL $ after fee. Fee is scaled from the TP preview fee by exit price / TP price.
+export const getBracketExitUsdValue = ({
+	amount,
+	price,
+	referencePrice,
+	commissionTotal,
+	side = "sell",
+} = {}) => {
+	const size = Number(amount);
+	const exitPrice = Number(price);
+
+	if (!Number.isFinite(size) || size <= 0 || !Number.isFinite(exitPrice) || exitPrice <= 0) {
+		return NaN;
 	}
 
-	return "--";
+	const gross = size * exitPrice;
+	const fee = Number(commissionTotal);
+
+	if (!Number.isFinite(fee) || fee < 0) {
+		return gross;
+	}
+
+	const tpPrice = Number(referencePrice);
+	const scaledFee = Number.isFinite(tpPrice) && tpPrice > 0
+		? fee * (exitPrice / tpPrice)
+		: fee;
+
+	if (String(side || "").toLowerCase() === "buy") {
+		return gross + scaledFee;
+	}
+
+	return Math.max(0, gross - scaledFee);
 };
 
 export const resolveOrderTotalBaseSize = (order) => {
@@ -464,19 +548,17 @@ export const resolveOrderTotalBaseSize = (order) => {
 	return null;
 };
 
-export const getOrderTotalBaseSize = (order) => resolveOrderTotalBaseSize(order);
-
 export const getOrderDisplayAmount = (order) => {
-	const remaining = Number(order?.amount);
-
-	if (Number.isFinite(remaining) && remaining > 0) {
-		return remaining;
-	}
-
 	const totalBaseSize = resolveOrderTotalBaseSize(order);
 
 	if (Number.isFinite(totalBaseSize) && totalBaseSize > 0) {
 		return totalBaseSize;
+	}
+
+	const amount = Number(order?.amount);
+
+	if (Number.isFinite(amount) && amount > 0) {
+		return amount;
 	}
 
 	return null;
@@ -547,6 +629,39 @@ export const enrichOrderForDisplay = (order) => {
 export const mergeOrderFields = (existing, incoming) => {
 	const merged = { ...(existing || {}), ...(incoming || {}) };
 
+	if (!merged.original_id && existing?.original_id) {
+		merged.original_id = existing.original_id;
+	}
+
+	const trackingFields = [
+		"original_value_usd",
+		"used_value_usd",
+		"remaining_value_usd",
+		"used_percent",
+		"used_before_current_order_usd",
+	];
+
+	trackingFields.forEach((key) => {
+		const nextValue = Number(merged[key]);
+		const prevValue = Number(existing?.[key]);
+
+		if ((!Number.isFinite(nextValue) || nextValue < 0) && Number.isFinite(prevValue) && prevValue >= 0) {
+			merged[key] = existing[key];
+			return;
+		}
+
+		// Parent USED/ORIGINAL must not be wiped to 0 by an empty child leg snapshot.
+		if (
+			(key === "used_value_usd" || key === "used_percent" || key === "original_value_usd")
+			&& Number.isFinite(prevValue)
+			&& prevValue > 0
+			&& Number.isFinite(nextValue)
+			&& nextValue === 0
+		) {
+			merged[key] = existing[key];
+		}
+	});
+
 	ORDER_VALUE_FIELDS.forEach((key) => {
 		const nextValue = Number(merged[key]);
 		const prevValue = Number(existing?.[key]);
@@ -601,46 +716,36 @@ export const mergeOrderFields = (existing, incoming) => {
 		merged.bracket_legs = existing.bracket_legs;
 	}
 
-	return enrichOrderForDisplay(merged);
-};
-
-export const buildOptimisticOrderFromPlacement = ({ body, preview, response } = {}) => {
-	if (!preview) return null;
-
-	const price = Number(body?.limit_price ?? body?.stop_price ?? preview?.limit_price);
-	const baseSize = Number(preview?.base_size);
-	const quoteSize = Number(preview?.quote_size);
-	const orderTotal = Number(preview?.order_total);
-	const commissionTotal = Number(preview?.commission_total);
-
-	if (!Number.isFinite(baseSize) || baseSize <= 0) return null;
-
-	const orderId = response?.data?.order?.id
-		|| response?.data?.success_response?.order_id
-		|| response?.data?.order_id
-		|| `pending-${Date.now()}`;
-
-	const placedOrder = response?.data?.order;
-
-	if (placedOrder) {
-		return enrichOrderForDisplay(placedOrder);
+	const existingType = String(existing?.order_type || "").toUpperCase();
+	const incomingType = String(incoming?.order_type || "").toUpperCase();
+	if (
+		existingType
+		&& existingType !== "UNKNOWN"
+		&& (
+			!incomingType
+			|| (
+				existingType === "BRACKET"
+				&& incomingType !== "BRACKET"
+				&& (!Array.isArray(incoming?.bracket_legs) || !incoming.bracket_legs.length)
+			)
+		)
+	) {
+		merged.order_type = existing.order_type;
 	}
 
-	return enrichOrderForDisplay({
-		id: orderId,
-		product_id: body?.product_id,
-		side: String(body?.side || preview?.side || "").toLowerCase(),
-		price: Number.isFinite(price) ? price : null,
-		amount: baseSize,
-		base_size: baseSize,
-		quote_size: Number.isFinite(quoteSize) && quoteSize > 0 ? quoteSize : null,
-		order_total: Number.isFinite(orderTotal) && orderTotal > 0 ? orderTotal : null,
-		total_value: Number.isFinite(orderTotal) && orderTotal > 0 ? orderTotal : null,
-		commission_total: Number.isFinite(commissionTotal) ? commissionTotal : null,
-		filled_percent: 0,
-		bracket_legs: [],
-		status: "OPEN",
-	});
+	const nextPrice = Number(incoming?.price);
+	const prevPrice = Number(existing?.price);
+	if (
+		(!Number.isFinite(nextPrice) || nextPrice <= 0)
+		&& Number.isFinite(prevPrice)
+		&& prevPrice > 0
+	) {
+		merged.price = existing.price;
+	}
+
+	delete merged.ui_price_lock;
+
+	return enrichOrderForDisplay(merged);
 };
 
 export const formatSignedPercent = (value) => {
@@ -752,14 +857,6 @@ export const getSellPreviewTicketSummary = (preview, enteredAmount = null) => {
 	};
 };
 
-export const getSellUsdOrderTicketSummary = (enteredAmount, preview) => (
-	getSellPreviewTicketSummary(preview, enteredAmount)
-);
-
-export const getSellOrderTicketSummary = (preview) => (
-	getSellPreviewTicketSummary(preview)
-);
-
 export const getBuyUsdPreviewQuoteSize = (enteredAmount) => floorQuoteCurrencyAmount(enteredAmount);
 
 export const getOrderPreviewBaseSize = (preview) => {
@@ -811,10 +908,60 @@ const COINBASE_ORDER_ERROR_LABELS = {
 	PREVIEW_INSUFFICIENT_FUND: "Insufficient balance. Lower the amount or leave room for the fee.",
 	PREVIEW_INSUFFICIENT_FUNDS: "Insufficient balance. Lower the amount or leave room for the fee.",
 	PREVIEW_INSUFFICIENT_FUNDS_FOR_ORDER: "Insufficient balance. Lower the amount or leave room for the fee.",
+	CANNOT_EDIT_TO_BELOW_FILLED_SIZE: "Can't edit below the filled size.",
+};
+
+const firstEditFailureReason = (detail) => {
+	if (detail == null) return "";
+
+	if (typeof detail === "string") {
+		const match = detail.match(/CANNOT_EDIT_TO_BELOW_FILLED_SIZE/);
+		if (match) return match[0];
+		try {
+			return firstEditFailureReason(JSON.parse(detail));
+		} catch {
+			return "";
+		}
+	}
+
+	if (Array.isArray(detail)) {
+		for (const item of detail) {
+			const reason = firstEditFailureReason(item);
+			if (reason) return reason;
+		}
+		return "";
+	}
+
+	if (typeof detail === "object") {
+		const direct = String(
+			detail.edit_failure_reason
+			|| detail.failure_reason
+			|| detail.error
+			|| "",
+		).trim();
+		if (direct) return direct;
+		if (detail.detail != null) return firstEditFailureReason(detail.detail);
+		if (Array.isArray(detail.errs)) return firstEditFailureReason(detail.errs);
+	}
+
+	return "";
 };
 
 export const getOrderErrorLabel = (detail, fallback = "Coinbase order error.", context = {}) => {
-	if (typeof detail === "string") return detail;
+	if (typeof detail === "string") {
+		const mapped = COINBASE_ORDER_ERROR_LABELS[detail]
+			|| COINBASE_ORDER_ERROR_LABELS[firstEditFailureReason(detail)];
+		if (typeof mapped === "function") return mapped(context);
+		if (typeof mapped === "string") return mapped;
+		return detail;
+	}
+
+	const failureReason = firstEditFailureReason(detail);
+	if (failureReason) {
+		const mapped = COINBASE_ORDER_ERROR_LABELS[failureReason];
+		if (typeof mapped === "function") return mapped(context);
+		if (typeof mapped === "string") return mapped;
+	}
 
 	const errs = Array.isArray(detail?.errs)
 		? detail.errs

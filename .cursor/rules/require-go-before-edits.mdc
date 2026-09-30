@@ -1,0 +1,44 @@
+---
+description: Never edit code until the user explicitly says GO
+alwaysApply: true
+---
+
+# Require GO before any code edits
+
+## Hard rule
+
+- **Never** create, edit, delete, rename, or patch any project file unless the user has explicitly said **GO** in the current turn (or a clearly scoped follow-up that still says GO).
+- **NEVER treat urgency, anger, clear intent, “fix it”, “add it”, “write it down”, or similar as permission to edit.** Only the word **GO** authorizes any file change.
+- Diagnosis, explanation, plans, and proposed diffs in chat are allowed **without** GO.
+- Imperative complaints (“fix this”, “you need to…”, “WTF”) are **not** GO. Only the word **GO** (case-insensitive) authorizes implementation.
+- If GO was not said: explain the cause and the intended fix, then stop and wait.
+- After GO: implement only the agreed fix; do not expand scope.
+- Do not start “preparatory” edits, partial patches, or tool writes “while waiting.” Stop means stop.
+
+## Required when asking for GO
+
+- **Always** request GO with a **bold bullet-by-bullet** list of exactly what will be done.
+- Every bullet must be concrete (file/path behavior or action), not vague (“fix it”, “clean up”).
+- Do not ask for GO without that bold step list in the same message.
+- The user must be able to approve/reject from those bullets alone.
+- **GO lists that include code changes MUST include these required bullets:**
+  - **Rebuild the client bundle** (`npm run build` in `client/`) when any `client/` file will change
+  - **Run tests** (`python -m pytest tests`; plus `npm run lint` in `client/` for client changes)
+
+## Allowed without GO
+
+- Read files, search, git status/diff/log when investigating
+- Answer questions and describe root cause / fix plan
+
+## Not allowed without GO
+
+- `Write` / `StrReplace` / `Delete` / notebook edits / formatters that change files
+- Commits, pushes, or dependency installs that change the tree (unless the user separately asked for commit/push)
+
+## After GO
+
+- Implement only the bold bullets that were listed when GO was requested
+- **REQUIRED after every modification (same turn, do not skip):**
+  - **Rebuild:** `npm run build` in `client/` if any `client/` file changed
+  - **Tests:** `python -m pytest tests` from the repo root; also `npm run lint` in `client/` for client changes
+- Still do not commit or push unless the user asks

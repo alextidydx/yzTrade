@@ -10,7 +10,7 @@ import {
 
 const getBalanceCurrency = (balance) => String(balance?.currency || "").trim().toUpperCase();
 
-const getBalanceUsdValue = (balance) => {
+const defaultGetBalanceUsdValue = (balance) => {
 	const currency = getBalanceCurrency(balance);
 
 	if (currency === "USD" || currency === "USDC") {
@@ -55,7 +55,12 @@ const listBookmarkedCurrencies = (appBookmarks, getBookmarkedPrice) => {
 	return [...currencies];
 };
 
-const getVisibleBalances = (balances, appBookmarks, getBookmarkedPrice) => {
+const getVisibleBalances = (
+	balances,
+	appBookmarks,
+	getBookmarkedPrice,
+	resolveBalanceUsdValue = defaultGetBalanceUsdValue,
+) => {
 	const list = Array.isArray(balances) ? balances : [];
 	const visible = [];
 	const seen = new Set();
@@ -71,7 +76,7 @@ const getVisibleBalances = (balances, appBookmarks, getBookmarkedPrice) => {
 			return;
 		}
 
-		const balanceValue = getBalanceUsdValue(balance);
+		const balanceValue = resolveBalanceUsdValue(balance);
 		const hasMaterialValue = Number.isFinite(balanceValue) && balanceValue >= 0.99;
 
 		if (hasMaterialValue) {
@@ -461,10 +466,21 @@ const BalanceHistoryPlot = ({
 	);
 };
 
-const isDustBookmarkBalance = (balance, appBookmarks, getBookmarkedPrice) => {
+const BookmarkMark = () => (
+	<svg className="e__profile-row__bookmark-icon" viewBox="0 0 12 14" aria-hidden="true">
+		<path d="M2 1.25h8a.75.75 0 0 1 .75.75v10.35l-4.35-2.5a.75.75 0 0 0-.8 0l-4.35 2.5V2A.75.75 0 0 1 2 1.25Z" />
+	</svg>
+);
+
+const isDustBookmarkBalance = (
+	balance,
+	appBookmarks,
+	getBookmarkedPrice,
+	resolveBalanceUsdValue = defaultGetBalanceUsdValue,
+) => {
 	const currency = getBalanceCurrency(balance);
 	const isCashBalance = currency === "USD" || currency === "USDC";
-	const balanceValue = getBalanceUsdValue(balance);
+	const balanceValue = resolveBalanceUsdValue(balance);
 	const hasMaterialValue = Number.isFinite(Number(balanceValue)) && Number(balanceValue) >= 0.99;
 
 	return !isCashBalance
@@ -476,6 +492,7 @@ const BalanceRowContent = ({
 	appBookmarks,
 	balance,
 	getBookmarkDelta,
+	getBalanceUsdValue = defaultGetBalanceUsdValue,
 	getBookmarkedPrice,
 	onClearBookmark,
 }) => {
@@ -484,7 +501,12 @@ const BalanceRowContent = ({
 	const balanceValue = getBalanceUsdValue(balance);
 	const availableBalance = Number(balance.available);
 	const bookmarkDelta = getBookmarkDelta?.(balance);
-	const isDustBookmarkRow = isDustBookmarkBalance(balance, appBookmarks, getBookmarkedPrice);
+	const isDustBookmarkRow = isDustBookmarkBalance(
+		balance,
+		appBookmarks,
+		getBookmarkedPrice,
+		getBalanceUsdValue,
+	);
 
 	if (isDustBookmarkRow) {
 		const deltaClass = bookmarkDelta
@@ -498,6 +520,7 @@ const BalanceRowContent = ({
 				<span className="e__profile-row__value e__profile-row__value--dust">
 					<small className={deltaClass}>
 						{bookmarkDelta?.percentLabel || bookmarkDelta?.label || "--"}
+						{bookmarkDelta?.fromBookmark ? <BookmarkMark /> : null}
 					</small>
 					<button
 						className="e__profile-row__clear-bookmark"
@@ -528,9 +551,25 @@ const BalanceRowContent = ({
 			<span className="e__profile-row__value">
 				<span>{Number.isFinite(Number(balanceValue)) ? formatUsdCents(balanceValue) : "--"}</span>
 				{bookmarkDelta && (
-					<small className={`e__profile-row__bookmark ${bookmarkDelta.isPositive ? "e__profile-row__bookmark--up" : "e__profile-row__bookmark--down"}`}>
-						{bookmarkDelta.label}
-					</small>
+					<span className="e__profile-row__value e__profile-row__value--dust">
+						<small className={`e__profile-row__bookmark ${bookmarkDelta.isPositive ? "e__profile-row__bookmark--up" : "e__profile-row__bookmark--down"}`}>
+							{bookmarkDelta.label}
+							{bookmarkDelta.fromBookmark ? <BookmarkMark /> : null}
+						</small>
+						{bookmarkDelta.fromBookmark && (
+							<button
+								className="e__profile-row__clear-bookmark"
+								type="button"
+								aria-label={`Remove ${currency} bookmark`}
+								onClick={event => onClearBookmark?.(currency, event)}
+							>
+								<svg viewBox="-8 -8 16 16" aria-hidden="true">
+									<circle r={7} />
+									<path d="M -2.24 -2.24 L 2.24 2.24 M 2.24 -2.24 L -2.24 2.24" />
+								</svg>
+							</button>
+						)}
+					</span>
 				)}
 			</span>
 		</>
@@ -547,6 +586,7 @@ const BalanceDropdown = ({
 	balances,
 	error,
 	getBookmarkDelta,
+	getBalanceUsdValue = defaultGetBalanceUsdValue,
 	getBookmarkedPrice,
 	isClosing,
 	isHistoryColored,
@@ -563,7 +603,12 @@ const BalanceDropdown = ({
 	onToggle,
 	total,
 }) => {
-	const visibleBalances = getVisibleBalances(balances, appBookmarks, getBookmarkedPrice);
+	const visibleBalances = getVisibleBalances(
+		balances,
+		appBookmarks,
+		getBookmarkedPrice,
+		getBalanceUsdValue,
+	);
 	const totalLabel = Number.isFinite(Number(total)) ? formatUsdCents(total) : "--";
 
 	return (
@@ -651,6 +696,7 @@ const BalanceDropdown = ({
 								balance,
 								appBookmarks,
 								getBookmarkedPrice,
+								getBalanceUsdValue,
 							);
 							const rowClassName = [
 								"e__profile-row",
@@ -662,6 +708,7 @@ const BalanceDropdown = ({
 									appBookmarks={appBookmarks}
 									balance={balance}
 									getBookmarkDelta={getBookmarkDelta}
+									getBalanceUsdValue={getBalanceUsdValue}
 									getBookmarkedPrice={getBookmarkedPrice}
 									onClearBookmark={onClearBookmark}
 								/>
